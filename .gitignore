@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Site Command Centre Data (STRICTLY IGNORE)
+Uplands_Workspace/
+*.sqlite3
+*.pdf
+*.xls
+*.xlsx
+*.json
+ingest/
