@@ -158,6 +158,84 @@ class DocumentRepository:
         self._persist_document(document)
         self._sync_related_documents_after_save(document)
 
+    def delete_document(self, doc_id: str) -> None:
+        """Delete a document and any indexed files linked to it."""
+
+        with sqlite3.connect(self.database_path) as connection:
+            document_row = connection.execute(
+                "SELECT 1 FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+            if document_row is None:
+                raise DocumentNotFoundError(f"Document {doc_id!r} was not found.")
+
+            connection.execute(
+                "DELETE FROM indexed_files WHERE related_doc_id = ?",
+                (doc_id,),
+            )
+            connection.execute(
+                "DELETE FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            )
+
+    def delete_document_and_files(self, doc_id: str) -> List[Path]:
+        """Delete a document, its indexed-file rows, and any linked physical files."""
+
+        with sqlite3.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            document_row = connection.execute(
+                "SELECT payload_json FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+            if document_row is None:
+                raise DocumentNotFoundError(f"Document {doc_id!r} was not found.")
+
+            indexed_file_rows = connection.execute(
+                "SELECT file_path FROM indexed_files WHERE related_doc_id = ?",
+                (doc_id,),
+            ).fetchall()
+            payload = json.loads(str(document_row["payload_json"]))
+
+            candidate_paths = {
+                Path(str(row["file_path"])).resolve()
+                for row in indexed_file_rows
+                if row["file_path"]
+            }
+            for payload_key in ("signature_image_path", "completed_document_path"):
+                payload_value = payload.get(payload_key)
+                if not payload_value:
+                    continue
+                candidate_paths.add(Path(str(payload_value)).resolve())
+
+            connection.execute(
+                "DELETE FROM indexed_files WHERE related_doc_id = ?",
+                (doc_id,),
+            )
+            connection.execute(
+                "DELETE FROM documents WHERE doc_id = ?",
+                (doc_id,),
+            )
+
+        deleted_paths: List[Path] = []
+        for candidate_path in sorted(candidate_paths):
+            try:
+                if candidate_path.exists():
+                    candidate_path.unlink()
+                    deleted_paths.append(candidate_path)
+            except OSError:
+                continue
+        return deleted_paths
+
+    def delete_indexed_file(self, file_path: Union[str, Path]) -> None:
+        """Delete one indexed physical file record by absolute path."""
+
+        resolved_path = str(Path(file_path).resolve())
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "DELETE FROM indexed_files WHERE file_path = ?",
+                (resolved_path,),
+            )
+
     def _persist_document(self, document: BaseDocument) -> None:
         """Write the document payload to SQLite without any follow-up sync."""
 

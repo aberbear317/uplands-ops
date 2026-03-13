@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Optional, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from uplands_site_command_centre.permits.models import (
     DocumentStatus,
@@ -43,11 +43,6 @@ class IngestionEngine:
             )
             if isinstance(document, SiteAttendanceRegister)
         ]
-        existing_keys = {
-            record.duplicate_key()
-            for register in existing_registers
-            for record in register.attendance_records
-        }
 
         target_doc_id = register_doc_id or self._default_register_doc_id(resolved_site_name)
         target_register = next(
@@ -67,6 +62,7 @@ class IngestionEngine:
                 attendance_records=[],
             )
 
+        parsed_records: List[SiteAttendanceRecord] = []
         for row_index, row in enumerate(rows, start=1):
             try:
                 attendance_record = SiteAttendanceRecord.from_json_row(row)
@@ -74,15 +70,52 @@ class IngestionEngine:
                 raise ValueError(
                     f"Invalid attendance row {row_index} in {source_path.name}: {exc}"
                 ) from exc
+            parsed_records.append(attendance_record)
 
-            if attendance_record.duplicate_key() in existing_keys:
-                continue
-
-            target_register.add_attendance_record(attendance_record)
-            existing_keys.add(attendance_record.duplicate_key())
+        for attendance_record in self._aggregate_attendance_records(parsed_records):
+            target_register.upsert_attendance_record(attendance_record)
 
         self.repository.save(target_register)
         return target_register
+
+    def _aggregate_attendance_records(
+        self,
+        records: Iterable[SiteAttendanceRecord],
+    ) -> List[SiteAttendanceRecord]:
+        """Deduplicate exact raw rows and sum split shifts by worker and date."""
+
+        seen_row_signatures = set()
+        aggregated_records: Dict[Tuple[str, str], SiteAttendanceRecord] = {}
+
+        for record in records:
+            row_signature = record.row_signature()
+            if row_signature in seen_row_signatures:
+                continue
+            seen_row_signatures.add(row_signature)
+
+            aggregate_key = record.duplicate_key()
+            existing_record = aggregated_records.get(aggregate_key)
+            if existing_record is None:
+                aggregated_records[aggregate_key] = SiteAttendanceRecord(
+                    date=record.date,
+                    company=record.company,
+                    workerName=record.workerName,
+                    timeIn=record.timeIn,
+                    timeOut=record.timeOut,
+                    totalHours=record.totalHours,
+                )
+                continue
+
+            if record.timeIn < existing_record.timeIn:
+                existing_record.timeIn = record.timeIn
+            if record.timeOut > existing_record.timeOut:
+                existing_record.timeOut = record.timeOut
+            existing_record.totalHours = round(
+                existing_record.totalHours + record.totalHours,
+                6,
+            )
+
+        return list(aggregated_records.values())
 
     def _load_json_payload(self, json_path: Path) -> Any:
         """Load and return the raw JSON payload."""
