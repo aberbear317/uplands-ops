@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import app as app_module
 from docx import Document
 import fitz
 import numpy as np
@@ -19,7 +20,9 @@ from uplands_site_command_centre.permits import (
     CarrierComplianceDocument,
     CarrierComplianceDocumentType,
     COMMON_CONSTRUCTION_EWC_CODES,
+    BroadcastDispatchDocument,
     ComplianceAlertStatus,
+    DailyAttendanceEntryDocument,
     DocumentNotFoundError,
     DocumentRepository,
     DocumentStatus,
@@ -33,6 +36,7 @@ from uplands_site_command_centre.permits import (
     PlantAssetDocument,
     RAMSDocument,
     SITE_CHECK_WEEKDAY_KEYS,
+    SiteDiaryDocument,
     SiteCheckItem,
     SiteCheckRegister,
     SiteAttendanceRegister,
@@ -41,35 +45,66 @@ from uplands_site_command_centre.permits import (
     TemplateRegistry,
     TemplateManager,
     TemplateValidationError,
+    ToolboxTalkCompletionDocument,
     ValidationError,
     VerificationStatus,
     WeeklySiteCheck,
+    WeeklySiteCheckFrequency,
     WeeklySiteCheckRowState,
     WasteRegister,
     WasteTransferNoteDocument,
     check_carrier_compliance,
 )
 from uplands_site_command_centre.workspace import (
+    _rewrite_inline_table_row_loops,
     build_site_worker_roster,
+    build_live_site_broadcast_contacts,
+    build_site_alert_sms_link,
+    build_site_alert_sms_links,
+    build_pending_toolbox_talk_contacts,
+    build_toolbox_talk_sms_message,
+    build_toolbox_talk_url,
+    calculate_haversine_distance_meters,
     check_site_inductions,
+    complete_daily_attendance_sign_out,
+    create_daily_attendance_sign_in,
     create_ladder_permit_draft,
     create_site_induction_document,
     create_site_check_checklist_draft,
     create_weekly_site_check_checklist_draft,
+    detect_public_tunnel_url_from_log,
+    generate_attendance_register_document,
+    generate_site_diary_document,
+    generate_toolbox_talk_register_document,
     extract_expiry_date_from_pdf,
     extract_tonnage_from_ticket,
+    get_latest_toolbox_talk_document,
     generate_site_induction_poster,
     generate_plant_register_document,
     generate_waste_register_document,
     generate_permit_register_document,
+    get_daily_contractor_headcount,
     get_site_induction_url,
     get_waste_kpi_sheet_metadata,
     get_valid_template_tags,
     get_weekly_site_check_row_definitions,
+    load_app_settings,
     log_uploaded_waste_transfer_note,
+    list_daily_attendance_entries,
+    list_broadcast_dispatches,
+    list_toolbox_talk_documents,
+    lookup_uk_postcode_details,
+    lookup_uk_postcode_coordinates,
+    log_toolbox_talk_completion,
+    list_toolbox_talk_completions,
+    read_toolbox_talk_document_bytes,
     run_workspace_diagnostic,
+    save_app_settings,
+    save_toolbox_talk_document,
     smart_scan_waste_transfer_note,
     sync_file_4_permit_records,
+    launch_messages_sms_broadcast,
+    log_broadcast_dispatch,
 )
 
 
@@ -701,6 +736,60 @@ class WeeklySiteCheckTests(unittest.TestCase):
         self.assertEqual(context["initials_tue"], "CE")
         self.assertEqual(context["time_tue"], "AM")
 
+    def test_weekly_site_check_context_blanks_incompatible_frequency_slots(self) -> None:
+        weekly_site_check = WeeklySiteCheck(
+            doc_id="WSC-20260309",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 11, 6, 45),
+            status=DocumentStatus.ACTIVE,
+            week_commencing=date(2026, 3, 9),
+            checked_at=datetime(2026, 3, 11, 6, 45),
+            checked_by="Ceri Edwards",
+            active_day_key="tue",
+            row_states=[
+                WeeklySiteCheckRowState(
+                    row_number=3,
+                    values={"mon": True, "weekly": True},
+                ),
+                WeeklySiteCheckRowState(
+                    row_number=6,
+                    values={"tue": False, "weekly": True},
+                ),
+            ],
+            overall_safe_to_start=False,
+        )
+
+        context = weekly_site_check.to_template_context()
+
+        self.assertEqual(context["mon_3"], "")
+        self.assertEqual(context["weekly_3"], "✔")
+        self.assertEqual(context["tue_6"], "✘")
+        self.assertEqual(context["weekly_6"], "")
+
+    def test_weekly_site_check_template_rows_include_frequency_rules(self) -> None:
+        get_weekly_site_check_row_definitions.cache_clear()
+        row_lookup = {
+            row_definition.row_number: row_definition
+            for row_definition in get_weekly_site_check_row_definitions()
+        }
+
+        self.assertEqual(
+            row_lookup[3].frequency,
+            WeeklySiteCheckFrequency.WEEKLY_ONLY,
+        )
+        self.assertEqual(
+            row_lookup[6].frequency,
+            WeeklySiteCheckFrequency.DAILY_ONLY,
+        )
+        self.assertEqual(
+            row_lookup[14].frequency,
+            WeeklySiteCheckFrequency.WEEKLY_ONLY,
+        )
+        self.assertEqual(
+            row_lookup[26].frequency,
+            WeeklySiteCheckFrequency.DAILY_ONLY,
+        )
+
     def test_weekly_site_check_template_rows_match_official_template(self) -> None:
         get_weekly_site_check_row_definitions.cache_clear()
         row_definitions = get_weekly_site_check_row_definitions()
@@ -1056,8 +1145,10 @@ class DocumentRepositoryTests(unittest.TestCase):
             repository.create_schema()
             signature_path = temp_path / "signature.png"
             completed_doc_path = temp_path / "induction.docx"
+            competency_card_path = temp_path / "cscs-card.jpg"
             signature_path.write_bytes(b"sig")
             completed_doc_path.write_bytes(b"doc")
+            competency_card_path.write_bytes(b"card")
 
             induction = InductionDocument(
                 doc_id="IND-DEL-001",
@@ -1068,6 +1159,7 @@ class DocumentRepositoryTests(unittest.TestCase):
                 individual_name="P. Lewis",
                 signature_image_path=str(signature_path),
                 completed_document_path=str(completed_doc_path),
+                competency_card_paths=str(competency_card_path),
             )
             repository.save(induction)
             repository.index_file(
@@ -1091,12 +1183,95 @@ class DocumentRepositoryTests(unittest.TestCase):
 
             self.assertEqual(
                 {path.resolve() for path in deleted_paths},
-                {signature_path.resolve(), completed_doc_path.resolve()},
+                {
+                    signature_path.resolve(),
+                    completed_doc_path.resolve(),
+                    competency_card_path.resolve(),
+                },
             )
             self.assertFalse(signature_path.exists())
             self.assertFalse(completed_doc_path.exists())
+            self.assertFalse(competency_card_path.exists())
             self.assertEqual(
                 repository.list_documents(document_type=InductionDocument.document_type),
+                [],
+            )
+
+    def test_delete_documents_and_files_removes_multiple_inductions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repository = DocumentRepository(temp_path / "documents.sqlite3")
+            repository.create_schema()
+
+            first_signature = temp_path / "first-signature.png"
+            second_signature = temp_path / "second-signature.png"
+            first_signature.write_bytes(b"sig-1")
+            second_signature.write_bytes(b"sig-2")
+
+            first_induction = InductionDocument(
+                doc_id="IND-BULK-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="Acme Interiors",
+                individual_name="First Operative",
+                signature_image_path=str(first_signature),
+            )
+            second_induction = InductionDocument(
+                doc_id="IND-BULK-002",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 5),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="Acme Interiors",
+                individual_name="Second Operative",
+                signature_image_path=str(second_signature),
+            )
+            repository.save(first_induction)
+            repository.save(second_induction)
+
+            deleted_paths = repository.delete_documents_and_files(
+                [first_induction.doc_id, second_induction.doc_id]
+            )
+
+            self.assertEqual(
+                {path.resolve() for path in deleted_paths},
+                {first_signature.resolve(), second_signature.resolve()},
+            )
+            self.assertEqual(
+                repository.list_documents(document_type=InductionDocument.document_type),
+                [],
+            )
+
+    def test_delete_document_and_files_removes_site_diary_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            repository = DocumentRepository(temp_path / "documents.sqlite3")
+            repository.create_schema()
+            generated_doc_path = temp_path / "daily-site-diary.docx"
+            generated_doc_path.write_bytes(b"doc")
+
+            diary = SiteDiaryDocument(
+                doc_id="SITE-DIARY-DEL-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 17, 0),
+                status=DocumentStatus.ACTIVE,
+                date=date(2026, 3, 15),
+                incidents_details="None",
+                area_handovers="None",
+                todays_comments="None",
+                generated_document_path=str(generated_doc_path),
+            )
+            repository.save(diary)
+
+            deleted_paths = repository.delete_document_and_files(diary.doc_id)
+
+            self.assertEqual(
+                {path.resolve() for path in deleted_paths},
+                {generated_doc_path.resolve()},
+            )
+            self.assertFalse(generated_doc_path.exists())
+            self.assertEqual(
+                repository.list_documents(document_type=SiteDiaryDocument.document_type),
                 [],
             )
 
@@ -1670,6 +1845,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
     def _build_site_induction_template(self, template_path: Path) -> None:
         template_document = Document()
         template_document.add_paragraph("{{site_name}}")
+        template_document.add_paragraph("{{date}}")
         template_document.add_paragraph("{{full_name}}")
         template_document.add_paragraph("{{company}}")
         template_document.add_paragraph("{{home_address}}")
@@ -1679,10 +1855,23 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
         template_document.add_paragraph("{{emergency_tel}}")
         template_document.add_paragraph("{{medical}}")
         template_document.add_paragraph("{{cscs_no}}")
+        template_document.add_paragraph("{{cscs_expiry}}")
+        template_document.add_paragraph("{{asbestos_cert}}")
+        template_document.add_paragraph("{{erect_scaffold}}")
+        template_document.add_paragraph("{{cisrs_no}}")
+        template_document.add_paragraph("{{cisrs_expiry}}")
+        template_document.add_paragraph("{{operate_plant}}")
+        template_document.add_paragraph("{{cpcs_no}}")
+        template_document.add_paragraph("{{cpcs_expiry}}")
+        template_document.add_paragraph("{{client_training_desc}}")
+        template_document.add_paragraph("{{client_training_date}}")
+        template_document.add_paragraph("{{client_training_expiry}}")
         template_document.add_paragraph("{{first_aider}}")
         template_document.add_paragraph("{{fire_warden}}")
         template_document.add_paragraph("{{supervisor}}")
         template_document.add_paragraph("{{smsts}}")
+        template_document.add_paragraph("{{inductor_name_date}}")
+        template_document.add_paragraph("{{inductor_title}}")
         template_document.add_paragraph("{{signature_image}}")
         template_document.save(template_path)
 
@@ -2665,6 +2854,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.INDUCTION_DIR,
                 app_config.RAMS_DESTINATION,
                 app_config.COSHH_DESTINATION,
+                app_config.FILE_3_REVIEW_DIR,
                 app_config.FILE_3_OUTPUT_DIR,
                 app_config.DATABASE_PATH,
             )
@@ -2678,6 +2868,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.ATTENDANCE_DESTINATION = attendance_destination
                 app_config.PLANT_HIRE_REGISTER_DIR = plant_hire_directory
                 app_config.INDUCTION_DIR = workspace_root / "FILE_3_Inductions"
+                app_config.FILE_3_REVIEW_DIR = workspace_root / "FILE_3_Inductions" / "Needs_Review"
                 app_config.DATABASE_PATH = database_path
 
                 repository = DocumentRepository(database_path)
@@ -2708,6 +2899,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                     app_config.INDUCTION_DIR,
                     app_config.RAMS_DESTINATION,
                     app_config.COSHH_DESTINATION,
+                    app_config.FILE_3_REVIEW_DIR,
                     app_config.FILE_3_OUTPUT_DIR,
                     app_config.DATABASE_PATH,
                 ) = original_config
@@ -2766,6 +2958,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.INDUCTION_DIR,
                 app_config.RAMS_DESTINATION,
                 app_config.COSHH_DESTINATION,
+                app_config.FILE_3_REVIEW_DIR,
                 app_config.FILE_3_OUTPUT_DIR,
                 app_config.DATABASE_PATH,
             )
@@ -2781,6 +2974,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.INDUCTION_DIR = workspace_root / "FILE_3_Inductions"
                 app_config.RAMS_DESTINATION = workspace_root / "FILE_3_Safety" / "RAMS"
                 app_config.COSHH_DESTINATION = workspace_root / "FILE_3_Safety" / "COSHH"
+                app_config.FILE_3_REVIEW_DIR = workspace_root / "FILE_3_Safety" / "Needs_Review"
                 app_config.FILE_3_OUTPUT_DIR = workspace_root / "FILE_3_Safety" / "Registers"
                 app_config.DATABASE_PATH = database_path
 
@@ -2824,6 +3018,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                     app_config.INDUCTION_DIR,
                     app_config.RAMS_DESTINATION,
                     app_config.COSHH_DESTINATION,
+                    app_config.FILE_3_REVIEW_DIR,
                     app_config.FILE_3_OUTPUT_DIR,
                     app_config.DATABASE_PATH,
                 ) = original_config
@@ -2939,6 +3134,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.INDUCTION_DIR,
                 app_config.RAMS_DESTINATION,
                 app_config.COSHH_DESTINATION,
+                app_config.FILE_3_REVIEW_DIR,
                 app_config.FILE_3_OUTPUT_DIR,
                 app_config.DATABASE_PATH,
             )
@@ -2954,6 +3150,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                 app_config.INDUCTION_DIR = workspace_root / "FILE_3_Inductions"
                 app_config.RAMS_DESTINATION = workspace_root / "FILE_3_Safety" / "RAMS"
                 app_config.COSHH_DESTINATION = workspace_root / "FILE_3_Safety" / "COSHH"
+                app_config.FILE_3_REVIEW_DIR = workspace_root / "FILE_3_Safety" / "Needs_Review"
                 app_config.FILE_3_OUTPUT_DIR = workspace_root / "FILE_3_Safety" / "Registers"
                 app_config.DATABASE_PATH = database_path
 
@@ -2971,6 +3168,7 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
                     app_config.INDUCTION_DIR,
                     app_config.RAMS_DESTINATION,
                     app_config.COSHH_DESTINATION,
+                    app_config.FILE_3_REVIEW_DIR,
                     app_config.FILE_3_OUTPUT_DIR,
                     app_config.DATABASE_PATH,
                 ) = original_config
@@ -3372,6 +3570,17 @@ class PlantRegisterAutomationTests(unittest.TestCase):
         document.add_paragraph("{{emergency_tel}}")
         document.add_paragraph("{{medical}}")
         document.add_paragraph("{{cscs_no}}")
+        document.add_paragraph("{{cscs_expiry}}")
+        document.add_paragraph("{{asbestos_cert}}")
+        document.add_paragraph("{{erect_scaffold}}")
+        document.add_paragraph("{{cisrs_no}}")
+        document.add_paragraph("{{cisrs_expiry}}")
+        document.add_paragraph("{{operate_plant}}")
+        document.add_paragraph("{{cpcs_no}}")
+        document.add_paragraph("{{cpcs_expiry}}")
+        document.add_paragraph("{{client_training_desc}}")
+        document.add_paragraph("{{client_training_date}}")
+        document.add_paragraph("{{client_training_expiry}}")
         document.add_paragraph("{{first_aider}}")
         document.add_paragraph("{{fire_warden}}")
         document.add_paragraph("{{supervisor}}")
@@ -3428,6 +3637,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                 app_config.ATTENDANCE_DESTINATION,
                 app_config.PLANT_HIRE_REGISTER_DIR,
                 app_config.INDUCTION_DIR,
+                app_config.FILE_3_REVIEW_DIR,
                 app_config.DATABASE_PATH,
             )
 
@@ -3440,6 +3650,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                 app_config.ATTENDANCE_DESTINATION = attendance_destination
                 app_config.PLANT_HIRE_REGISTER_DIR = plant_hire_directory
                 app_config.INDUCTION_DIR = induction_directory
+                app_config.FILE_3_REVIEW_DIR = induction_directory / "Needs_Review"
                 app_config.DATABASE_PATH = database_path
 
                 repository = DocumentRepository(database_path)
@@ -3457,6 +3668,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                     app_config.ATTENDANCE_DESTINATION,
                     app_config.PLANT_HIRE_REGISTER_DIR,
                     app_config.INDUCTION_DIR,
+                    app_config.FILE_3_REVIEW_DIR,
                     app_config.DATABASE_PATH,
                 ) = original_config
 
@@ -3533,11 +3745,15 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             workspace_root = Path(temp_dir) / "Uplands_Workspace"
             signatures_directory = workspace_root / "FILE_3_Safety" / "Signatures"
             completed_directory = workspace_root / "FILE_3_Safety" / "Completed_Inductions"
+            competency_cards_directory = (
+                workspace_root / "FILE_3_Safety" / "Competency_Cards"
+            )
             database_path = workspace_root / "documents.sqlite3"
             template_path = Path(temp_dir) / "site_induction_template.docx"
             original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
             original_config = (
                 app_config.BASE_DATA_DIR,
+                app_config.FILE_3_COMPETENCY_CARDS_DIR,
                 app_config.FILE_3_SIGNATURES_DIR,
                 app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
                 app_config.DATABASE_PATH,
@@ -3548,6 +3764,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             try:
                 TemplateRegistry.TEMPLATE_PATHS["site_induction"] = template_path
                 app_config.BASE_DATA_DIR = workspace_root
+                app_config.FILE_3_COMPETENCY_CARDS_DIR = competency_cards_directory
                 app_config.FILE_3_SIGNATURES_DIR = signatures_directory
                 app_config.FILE_3_COMPLETED_INDUCTIONS_DIR = completed_directory
                 app_config.DATABASE_PATH = database_path
@@ -3569,16 +3786,36 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                     emergency_tel="07999 888777",
                     medical="None declared",
                     cscs_number="CSCS-1234",
+                    cscs_expiry=date(2027, 3, 1),
+                    asbestos_cert=True,
+                    erect_scaffold=True,
+                    cisrs_no="CISRS-9981",
+                    cisrs_expiry=date(2026, 12, 31),
+                    operate_plant=True,
+                    cpcs_no="CPCS-4455",
+                    cpcs_expiry=date(2027, 1, 15),
+                    client_training_desc="National Grid substation access briefing",
+                    client_training_date=date(2026, 3, 13),
+                    client_training_expiry=date(2027, 3, 13),
                     first_aider=True,
                     fire_warden=False,
                     supervisor=True,
                     smsts=False,
+                    competency_expiry_date=date(2027, 4, 1),
+                    competency_files=[
+                        {
+                            "label": "CSCS Card",
+                            "name": "cscs-front.jpg",
+                            "bytes": b"front-card-binary",
+                        }
+                    ],
                     signature_image_data=signature_image_data,
                 )
             finally:
                 TemplateRegistry.TEMPLATE_PATHS = original_registry
                 (
                     app_config.BASE_DATA_DIR,
+                    app_config.FILE_3_COMPETENCY_CARDS_DIR,
                     app_config.FILE_3_SIGNATURES_DIR,
                     app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
                     app_config.DATABASE_PATH,
@@ -3600,6 +3837,16 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             self.assertEqual(induction_document.contractor_name, "A. Archer Electrical")
             self.assertTrue(induction_document.first_aider)
             self.assertTrue(induction_document.supervisor)
+            self.assertEqual(induction_document.competency_expiry_date, date(2027, 4, 1))
+            saved_competency_paths = [
+                Path(path_text)
+                for path_text in induction_document.competency_card_paths.split(",")
+                if path_text
+            ]
+            self.assertEqual(len(saved_competency_paths), 1)
+            self.assertTrue(saved_competency_paths[0].exists())
+            self.assertEqual(saved_competency_paths[0].parent, competency_cards_directory)
+            self.assertIn("cscs card", saved_competency_paths[0].name.casefold())
             self.assertEqual(
                 Path(induction_document.completed_document_path),
                 generated_document.output_path,
@@ -3612,9 +3859,1065 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             self.assertIn("Sean Carter", rendered_text)
             self.assertIn("A. Archer Electrical", rendered_text)
             self.assertIn("1 Test Street", rendered_text)
+            self.assertIn("01/03/2027", rendered_text)
+            self.assertIn("CISRS-9981", rendered_text)
+            self.assertIn("CPCS-4455", rendered_text)
+            self.assertIn("National Grid substation access briefing", rendered_text)
             self.assertIn("Ceri Edwards", rendered_text)
             self.assertIn("Site Manager", rendered_text)
             self.assertIn(generated_document.induction_document.created_at.strftime("%d/%m/%Y"), rendered_text)
+
+    def test_daily_attendance_entry_document_flags_live_status_and_uplands_company(
+        self,
+    ) -> None:
+        attendance_entry = DailyAttendanceEntryDocument(
+            doc_id="ATT-001",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 13, 7, 30),
+            status=DocumentStatus.ACTIVE,
+            linked_induction_doc_id="IND-001",
+            individual_name="Sean Carter",
+            contractor_name="Uplands Construction Group",
+            vehicle_registration="AB12 CDE",
+            distance_travelled="14 miles",
+            time_in=datetime(2026, 3, 13, 7, 30),
+            sign_in_signature_path="/tmp/sign-in.png",
+        )
+
+        self.assertTrue(attendance_entry.is_on_site)
+        self.assertTrue(attendance_entry.is_uplands_employee)
+        self.assertEqual(
+            attendance_entry.document_name,
+            "Site Attendance Register (UHSF16.09)",
+        )
+
+    def test_daily_attendance_entry_recognises_uplands_aliases(self) -> None:
+        for alias_company_name in ("URL", "Uplands Retail", "Uplands Retail Limited"):
+            attendance_entry = DailyAttendanceEntryDocument(
+                doc_id=f"ATT-{alias_company_name}",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 30),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name=alias_company_name,
+                time_in=datetime(2026, 3, 13, 7, 30),
+            )
+            self.assertTrue(attendance_entry.is_uplands_employee)
+
+    def test_daily_attendance_sign_in_and_sign_out_round_trip(self) -> None:
+        class SignInDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return cls(2026, 3, 13, 7, 30, tzinfo=tz)
+
+        class SignOutDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return cls(2026, 3, 13, 15, 0, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            attendance_signatures_directory = (
+                workspace_root / "FILE_2_Registers" / "Attendance" / "Signatures"
+            )
+            database_path = workspace_root / "documents.sqlite3"
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.DATABASE_PATH,
+                app_config.ATTENDANCE_DESTINATION,
+                app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR,
+            )
+
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.DATABASE_PATH = database_path
+                app_config.ATTENDANCE_DESTINATION = (
+                    workspace_root / "FILE_2_Registers" / "Attendance"
+                )
+                app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR = (
+                    attendance_signatures_directory
+                )
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                induction_document = InductionDocument(
+                    doc_id="IND-202603130700-sean-carter",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 13, 7, 0),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="A. Archer Electrical",
+                    individual_name="Sean Carter",
+                )
+                repository.save(induction_document)
+
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                with patch.object(workspace_module, "datetime", SignInDateTime):
+                    sign_in_result = create_daily_attendance_sign_in(
+                        repository,
+                        site_name="NG Lovedean Substation",
+                        induction_document=induction_document,
+                        vehicle_registration="ab12 cde",
+                        distance_travelled="14 miles",
+                        signature_image_data=signature_image_data,
+                    )
+
+                self.assertTrue(sign_in_result.signature_path.exists())
+                self.assertEqual(
+                    sign_in_result.attendance_entry.vehicle_registration,
+                    "AB12 CDE",
+                )
+                active_entries = list_daily_attendance_entries(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    on_date=date(2026, 3, 13),
+                    active_only=True,
+                )
+                self.assertEqual(len(active_entries), 1)
+                self.assertEqual(active_entries[0].individual_name, "Sean Carter")
+
+                with patch.object(workspace_module, "datetime", SignOutDateTime):
+                    sign_out_result = complete_daily_attendance_sign_out(
+                        repository,
+                        attendance_doc_id=sign_in_result.attendance_entry.doc_id,
+                        signature_image_data=signature_image_data,
+                    )
+            finally:
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.DATABASE_PATH,
+                    app_config.ATTENDANCE_DESTINATION,
+                    app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR,
+                ) = original_config
+
+            self.assertTrue(sign_out_result.signature_path.exists())
+            self.assertEqual(
+                sign_out_result.attendance_entry.status,
+                DocumentStatus.ARCHIVED,
+            )
+            self.assertEqual(sign_out_result.attendance_entry.hours_worked, 7.5)
+            self.assertIsNotNone(sign_out_result.attendance_entry.time_out)
+            self.assertFalse(
+                list_daily_attendance_entries(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    on_date=date(2026, 3, 13),
+                    active_only=True,
+                )
+            )
+
+    def test_attendance_helper_returns_latest_vehicle_registration_for_induction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+            induction_document = InductionDocument(
+                doc_id="IND-202603130700-sean-carter",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="A. Archer Electrical",
+                individual_name="Sean Carter",
+            )
+            repository.save(induction_document)
+            repository.save(
+                DailyAttendanceEntryDocument(
+                    doc_id="ATT-20260313-1",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 13, 7, 30),
+                    status=DocumentStatus.ARCHIVED,
+                    linked_induction_doc_id=induction_document.doc_id,
+                    individual_name="Sean Carter",
+                    contractor_name="A. Archer Electrical",
+                    vehicle_registration="AB12 CDE",
+                    distance_travelled="14 miles",
+                    time_in=datetime(2026, 3, 13, 7, 30),
+                    time_out=datetime(2026, 3, 13, 15, 30),
+                    hours_worked=8.0,
+                )
+            )
+            latest_entry = DailyAttendanceEntryDocument(
+                doc_id="ATT-20260314-1",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 14, 7, 20),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id=induction_document.doc_id,
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                vehicle_registration="XY34 ZZZ",
+                distance_travelled="14 miles",
+                time_in=datetime(2026, 3, 14, 7, 20),
+            )
+            repository.save(latest_entry)
+
+            resolved_entry = app_module._get_latest_daily_attendance_entry_for_induction(
+                repository,
+                induction_document,
+                site_name="NG Lovedean Substation",
+            )
+
+            self.assertIsNotNone(resolved_entry)
+            self.assertEqual(resolved_entry.doc_id, latest_entry.doc_id)
+            self.assertEqual(resolved_entry.vehicle_registration, "XY34 ZZZ")
+
+    def test_generate_attendance_register_document_writes_today_sheet_to_file_2(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            attendance_destination = workspace_root / "FILE_2_Registers" / "Attendance"
+            attendance_signatures_directory = attendance_destination / "Signatures"
+            attendance_output_directory = attendance_destination / "Registers"
+            database_path = workspace_root / "documents.sqlite3"
+
+            for directory in (
+                attendance_destination,
+                attendance_signatures_directory,
+                attendance_output_directory,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            sign_in_signature_path = attendance_signatures_directory / "sign-in.png"
+            sign_out_signature_path = attendance_signatures_directory / "sign-out.png"
+            fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 120, 40), 0).save(
+                str(sign_in_signature_path)
+            )
+            fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 120, 40), 0).save(
+                str(sign_out_signature_path)
+            )
+
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.DATABASE_PATH,
+                app_config.ATTENDANCE_DESTINATION,
+                app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR,
+                app_config.FILE_2_ATTENDANCE_OUTPUT_DIR,
+            )
+
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.DATABASE_PATH = database_path
+                app_config.ATTENDANCE_DESTINATION = attendance_destination
+                app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR = (
+                    attendance_signatures_directory
+                )
+                app_config.FILE_2_ATTENDANCE_OUTPUT_DIR = attendance_output_directory
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                repository.save(
+                    InductionDocument(
+                        doc_id="IND-001",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 13, 7, 0),
+                        status=DocumentStatus.ACTIVE,
+                        contractor_name="A. Archer Electrical",
+                        individual_name="Sean Carter",
+                        contact_number="07700111222",
+                    )
+                )
+                repository.save(
+                    InductionDocument(
+                        doc_id="IND-002",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 13, 7, 5),
+                        status=DocumentStatus.ACTIVE,
+                        contractor_name="Uplands Construction Group",
+                        individual_name="Luke Green",
+                        contact_number="07700999444",
+                    )
+                )
+                repository.save(
+                    DailyAttendanceEntryDocument(
+                        doc_id="ATT-001",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 13, 7, 30),
+                        status=DocumentStatus.ARCHIVED,
+                        linked_induction_doc_id="IND-001",
+                        individual_name="Sean Carter",
+                        contractor_name="A. Archer Electrical",
+                        vehicle_registration="AB12 CDE",
+                        distance_travelled="14 miles",
+                        time_in=datetime(2026, 3, 13, 7, 30),
+                        time_out=datetime(2026, 3, 13, 15, 0),
+                        hours_worked=7.5,
+                        sign_in_signature_path=str(sign_in_signature_path),
+                        sign_out_signature_path=str(sign_out_signature_path),
+                    )
+                )
+                repository.save(
+                    DailyAttendanceEntryDocument(
+                        doc_id="ATT-002",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 13, 8, 0),
+                        status=DocumentStatus.ACTIVE,
+                        linked_induction_doc_id="IND-002",
+                        individual_name="Luke Green",
+                        contractor_name="Uplands Construction Group",
+                        vehicle_registration="XY34 ZZZ",
+                        distance_travelled="8 miles",
+                        time_in=datetime(2026, 3, 13, 8, 0),
+                        sign_in_signature_path=str(sign_in_signature_path),
+                    )
+                )
+
+                generated_register = generate_attendance_register_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    on_date=date(2026, 3, 13),
+                )
+            finally:
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.DATABASE_PATH,
+                    app_config.ATTENDANCE_DESTINATION,
+                    app_config.FILE_2_ATTENDANCE_SIGNATURES_DIR,
+                    app_config.FILE_2_ATTENDANCE_OUTPUT_DIR,
+                ) = original_config
+
+            self.assertTrue(generated_register.output_path.exists())
+            self.assertEqual(
+                generated_register.output_path.parent,
+                attendance_output_directory,
+            )
+            self.assertEqual(generated_register.row_count, 2)
+
+            indexed_files = repository.list_indexed_files(
+                file_group=FileGroup.FILE_2,
+                file_category="attendance_register_docx",
+            )
+            self.assertEqual(len(indexed_files), 1)
+            self.assertEqual(
+                indexed_files[0].file_path.resolve(),
+                generated_register.output_path.resolve(),
+            )
+
+            rendered_document = Document(generated_register.output_path)
+            attendance_table = rendered_document.tables[1]
+            first_row = [cell.text.strip() for cell in attendance_table.rows[1].cells]
+            second_row = [cell.text.strip() for cell in attendance_table.rows[2].cells]
+            blank_row = [cell.text.strip() for cell in attendance_table.rows[3].cells]
+
+            self.assertEqual(first_row[0], "13/03/2026")
+            self.assertEqual(first_row[1], "Sean Carter")
+            self.assertEqual(first_row[2], "A. Archer Electrical")
+            self.assertEqual(first_row[3], "07700111222")
+            self.assertEqual(first_row[4], "14 miles")
+            self.assertEqual(first_row[5], "AB12 CDE")
+            self.assertEqual(first_row[6], "07:30")
+            self.assertEqual(first_row[8], "15:00")
+            self.assertEqual(first_row[9], "7.50")
+
+            self.assertEqual(second_row[1], "Luke Green")
+            self.assertEqual(second_row[2], "Uplands Construction Group")
+            self.assertEqual(second_row[3], "07700999444")
+            self.assertEqual(second_row[5], "XY34 ZZZ")
+            self.assertEqual(second_row[8], "")
+            self.assertEqual(second_row[9], "")
+            self.assertTrue(all(value == "" for value in blank_row))
+
+            summary_table = rendered_document.tables[3]
+            self.assertEqual(summary_table.rows[0].cells[1].text.strip(), "1")
+            self.assertEqual(summary_table.rows[0].cells[4].text.strip(), "1")
+
+    def test_get_daily_contractor_headcount_groups_active_entries_by_company(self) -> None:
+        repository = DocumentRepository(Path(tempfile.mkdtemp()) / "documents.sqlite3")
+        repository.create_schema()
+        repository.save(
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 30),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                vehicle_registration="AB12 CDE",
+                distance_travelled="14 miles",
+                time_in=datetime(2026, 3, 15, 7, 30),
+            )
+        )
+        repository.save(
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-002",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 40),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-002",
+                individual_name="Luke Green",
+                contractor_name="A. Archer Electrical",
+                vehicle_registration="XY34 ZZZ",
+                distance_travelled="8 miles",
+                time_in=datetime(2026, 3, 15, 7, 40),
+            )
+        )
+        repository.save(
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-003",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 8, 0),
+                status=DocumentStatus.ARCHIVED,
+                linked_induction_doc_id="IND-003",
+                individual_name="Pat Visitor",
+                contractor_name="Visitor Co",
+                vehicle_registration="",
+                distance_travelled="",
+                time_in=datetime(2026, 3, 15, 8, 0),
+                time_out=datetime(2026, 3, 15, 8, 30),
+                hours_worked=0.5,
+            )
+        )
+
+        contractor_counts = get_daily_contractor_headcount(
+            repository,
+            "NG Lovedean Substation",
+            date(2026, 3, 15),
+        )
+
+        self.assertEqual(
+            contractor_counts,
+            [{"company": "A. Archer Electrical", "days": 2, "nights": 0}],
+        )
+
+    def test_generate_site_diary_document_renders_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            output_directory = project_root / "FILE_2_Daily_Site_Diary"
+            database_path = project_root / "documents.sqlite3"
+            template_path = project_root / "UHSF15.63_Template.docx"
+            output_directory.mkdir(parents=True, exist_ok=True)
+
+            template_document = Document()
+            template_document.add_paragraph("Date: {{ date }}")
+            template_document.add_paragraph("Uplands Days: {{ uplands_days }}")
+            template_document.add_paragraph("Uplands Nights: {{ uplands_nights }}")
+            template_document.add_paragraph("Skip Exchange: {{ skip_exchange }}")
+            template_document.add_paragraph("Day On: {{ fire_day_on }}")
+            template_document.add_paragraph("Day Off: {{ fire_day_off }}")
+            template_document.add_paragraph("Night On: {{ fire_night_on }}")
+            template_document.add_paragraph("Night Off: {{ fire_night_off }}")
+            template_document.add_paragraph("Dry: {{ weather_dry }}")
+            template_document.add_paragraph("Mixed: {{ weather_mixed }}")
+            template_document.add_paragraph("Wet: {{ weather_wet }}")
+            template_document.add_paragraph(
+                "{% for c in contractors %}Contractor: {{ c.company }} | {{ c.days }} | {{ c.nights }}\n{% endfor %}"
+            )
+            template_document.add_paragraph("Incidents: {{ incidents_details }}")
+            template_document.add_paragraph("H&S: {{ hs_reported_tick }}")
+            template_document.add_paragraph(
+                "{% for v in visitors %}Visitor: {{ v.name }} | {{ v.company }}\n{% endfor %}"
+            )
+            template_document.add_paragraph("Handovers: {{ area_handovers }}")
+            template_document.add_paragraph("Comments: {{ todays_comments }}")
+            template_document.save(template_path)
+
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_output_dir = app_config.FILE_2_DIARY_OUTPUT_DIR
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["site_diary"] = template_path
+                app_config.FILE_2_DIARY_OUTPUT_DIR = output_directory
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                site_diary_document = SiteDiaryDocument(
+                    doc_id="SITE-DIARY-ng-lovedean-substation-20260315",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 15, 9, 0),
+                    status=DocumentStatus.ACTIVE,
+                    date=date(2026, 3, 15),
+                    uplands_days=3,
+                    uplands_nights=0,
+                    skip_exchange="8-yard open skip",
+                    fire_day_on=True,
+                    fire_day_off=False,
+                    fire_night_on=False,
+                    fire_night_off=True,
+                    weather_dry=True,
+                    weather_mixed=False,
+                    weather_wet=False,
+                    contractors=[
+                        {"company": "A. Archer Electrical", "days": 4, "nights": 0},
+                        {"company": "Uplands Retail", "days": 3, "nights": 0},
+                    ],
+                    visitors=[{"name": "Pat Visitor", "company": "National Grid"}],
+                    incidents_details="No incidents reported.",
+                    hs_reported_tick=True,
+                    area_handovers="Mess room handed back.",
+                    todays_comments="Progress on programme.",
+                )
+
+                generated_diary = generate_site_diary_document(
+                    repository,
+                    site_diary_document=site_diary_document,
+                )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                app_config.FILE_2_DIARY_OUTPUT_DIR = original_output_dir
+
+            self.assertTrue(generated_diary.output_path.exists())
+            self.assertEqual(generated_diary.output_path.parent, output_directory)
+            self.assertEqual(generated_diary.contractor_count, 2)
+            self.assertEqual(generated_diary.visitor_count, 1)
+            saved_diary = repository.get(site_diary_document.doc_id)
+            self.assertIsInstance(saved_diary, SiteDiaryDocument)
+            self.assertEqual(Path(saved_diary.generated_document_path), generated_diary.output_path)
+
+            rendered_diary = Document(generated_diary.output_path)
+            rendered_text = "\n".join(
+                paragraph.text.strip()
+                for paragraph in rendered_diary.paragraphs
+                if paragraph.text.strip()
+            )
+            self.assertIn("15/03/2026", rendered_text)
+            self.assertIn("A. Archer Electrical", rendered_text)
+            self.assertIn("Uplands Retail", rendered_text)
+            self.assertIn("Pat Visitor", rendered_text)
+            self.assertIn("No incidents reported.", rendered_text)
+            self.assertIn("Mess room handed back.", rendered_text)
+            self.assertIn("Progress on programme.", rendered_text)
+
+    def test_rewrite_inline_table_row_loops_supports_endtr(self) -> None:
+        original_xml = (
+            "<w:tr>"
+            "{% tr for c in contractors %}"
+            "<w:tc><w:p><w:r><w:t>{{ c.company }}</w:t></w:r></w:p></w:tc>"
+            "{% endtr %}"
+            "</w:tr>"
+        )
+
+        rewritten_xml = _rewrite_inline_table_row_loops(original_xml)
+
+        self.assertIn("{% for c in contractors %}", rewritten_xml)
+        self.assertIn("{{ c.company }}", rewritten_xml)
+        self.assertIn("{% endfor %}", rewritten_xml)
+        self.assertNotIn("{% endtr %}", rewritten_xml)
+
+    def test_build_live_site_broadcast_contacts_uses_active_mobile_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            repository.save(
+                InductionDocument(
+                    doc_id="IND-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 0),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="A. Archer Electrical",
+                    individual_name="Sean Carter",
+                    contact_number="07700 111222",
+                )
+            )
+            repository.save(
+                InductionDocument(
+                    doc_id="IND-002",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 5),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="Visitor",
+                    individual_name="Site Visitor",
+                    contact_number="02392 123456",
+                )
+            )
+            repository.save(
+                DailyAttendanceEntryDocument(
+                    doc_id="ATT-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 30),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-001",
+                    individual_name="Sean Carter",
+                    contractor_name="A. Archer Electrical",
+                    vehicle_registration="AB12 CDE",
+                    distance_travelled="14 miles",
+                    time_in=datetime(2026, 3, 14, 7, 30),
+                )
+            )
+            repository.save(
+                DailyAttendanceEntryDocument(
+                    doc_id="ATT-002",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 8, 0),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-002",
+                    individual_name="Site Visitor",
+                    contractor_name="Visitor",
+                    vehicle_registration="",
+                    distance_travelled="",
+                    time_in=datetime(2026, 3, 14, 8, 0),
+                )
+            )
+
+            contacts = build_live_site_broadcast_contacts(
+                repository,
+                site_name="NG Lovedean Substation",
+                on_date=date(2026, 3, 14),
+            )
+
+            self.assertEqual(len(contacts), 1)
+            self.assertEqual(contacts[0].individual_name, "Sean Carter")
+            self.assertEqual(contacts[0].mobile_number, "+447700111222")
+            self.assertEqual(contacts[0].vehicle_registration, "AB12 CDE")
+
+    def test_build_site_alert_sms_link_prefills_numbers_and_message(self) -> None:
+        self.assertEqual(
+            build_site_alert_sms_link(
+                ["+447700111222", "+447700999444"],
+                message="TBT in the canteen in 5 mins",
+            ),
+            "sms:+447700111222,+447700999444&body=TBT%20in%20the%20canteen%20in%205%20mins",
+        )
+
+    def test_build_site_alert_sms_links_chunks_large_audiences(self) -> None:
+        mobile_numbers = [
+            f"+44770011{index:04d}"
+            for index in range(30)
+        ]
+
+        sms_links = build_site_alert_sms_links(
+            mobile_numbers,
+            message="Stand down at welfare",
+            max_recipients_per_chunk=10,
+        )
+
+        self.assertEqual(len(sms_links), 3)
+        self.assertTrue(all(link.startswith("sms:+44770011") for link in sms_links))
+        self.assertTrue(all("&body=Stand%20down%20at%20welfare" in link for link in sms_links))
+
+    def test_build_toolbox_talk_sms_message_uses_topic_and_link(self) -> None:
+        self.assertEqual(
+            build_toolbox_talk_sms_message(
+                "High winds",
+                "https://uplands-site-induction.omegaleague.win?station=tbt&topic=High+winds",
+            ),
+            "Toolbox Talk: High winds. Please click this link to read the document and sign the register: https://uplands-site-induction.omegaleague.win?station=tbt&topic=High+winds",
+        )
+
+    def test_save_app_settings_persists_recent_site_histories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_settings_path = app_config.SETTINGS_PATH
+            try:
+                app_config.SETTINGS_PATH = Path(temp_dir) / "settings.json"
+                save_app_settings(
+                    public_tunnel_url="https://uplands-site-induction.omegaleague.win",
+                    broadcast_message_history_by_site={
+                        "NG Lovedean Substation": [
+                            "Stand down in the canteen",
+                            "Stand down in the canteen",
+                            "High winds - crane suspended",
+                        ]
+                    },
+                    tbt_topic_history_by_site={
+                        "NG Lovedean Substation": [
+                            "High winds",
+                            "Face fit refresh",
+                        ]
+                    },
+                )
+
+                loaded_settings = load_app_settings()
+            finally:
+                app_config.SETTINGS_PATH = original_settings_path
+
+        self.assertEqual(
+            loaded_settings["public_tunnel_url"],
+            "https://uplands-site-induction.omegaleague.win",
+        )
+        self.assertEqual(
+            loaded_settings["broadcast_message_history_by_site"][
+                "NG Lovedean Substation"
+            ],
+            [
+                "Stand down in the canteen",
+                "High winds - crane suspended",
+            ],
+        )
+        self.assertEqual(
+            loaded_settings["tbt_topic_history_by_site"]["NG Lovedean Substation"],
+            [
+                "High winds",
+                "Face fit refresh",
+            ],
+        )
+
+    def test_build_toolbox_talk_url_prefills_topic(self) -> None:
+        self.assertEqual(
+            build_toolbox_talk_url(
+                "Working in high winds",
+                public_url="https://uplands-site-induction.omegaleague.win",
+            ),
+            "https://uplands-site-induction.omegaleague.win?station=tbt&topic=Working+in+high+winds",
+        )
+
+    def test_calculate_haversine_distance_meters_matches_expected_site_scale(self) -> None:
+        self.assertEqual(
+            calculate_haversine_distance_meters(50.917, -1.036, 50.917, -1.036),
+            0.0,
+        )
+        self.assertGreater(
+            calculate_haversine_distance_meters(50.917, -1.036, 50.918, -1.036),
+            100.0,
+        )
+        self.assertLess(
+            calculate_haversine_distance_meters(50.917, -1.036, 50.918, -1.036),
+            120.0,
+        )
+
+    def test_build_pending_toolbox_talk_contacts_returns_only_unsigned_live_people(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            repository.save(
+                InductionDocument(
+                    doc_id="IND-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 0),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="A. Archer Electrical",
+                    individual_name="Sean Carter",
+                    contact_number="07700 111222",
+                )
+            )
+            repository.save(
+                InductionDocument(
+                    doc_id="IND-002",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 5),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="Uplands Construction Group",
+                    individual_name="Luke Green",
+                    contact_number="07700 999444",
+                )
+            )
+            repository.save(
+                DailyAttendanceEntryDocument(
+                    doc_id="ATT-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 30),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-001",
+                    individual_name="Sean Carter",
+                    contractor_name="A. Archer Electrical",
+                    vehicle_registration="AB12 CDE",
+                    distance_travelled="14 miles",
+                    time_in=datetime(2026, 3, 14, 7, 30),
+                )
+            )
+            repository.save(
+                DailyAttendanceEntryDocument(
+                    doc_id="ATT-002",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 45),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-002",
+                    individual_name="Luke Green",
+                    contractor_name="Uplands Construction Group",
+                    vehicle_registration="XY34 ZZZ",
+                    distance_travelled="5 miles",
+                    time_in=datetime(2026, 3, 14, 7, 45),
+                )
+            )
+            repository.save(
+                ToolboxTalkCompletionDocument(
+                    doc_id="TBT-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 8, 30),
+                    status=DocumentStatus.ACTIVE,
+                    topic="High winds",
+                    linked_induction_doc_id="IND-001",
+                    individual_name="Sean Carter",
+                    contractor_name="A. Archer Electrical",
+                    completed_at=datetime(2026, 3, 14, 8, 30),
+                    signature_image_path="/tmp/signature.png",
+                    document_read_confirmed=True,
+                )
+            )
+
+            pending_contacts = build_pending_toolbox_talk_contacts(
+                repository,
+                site_name="NG Lovedean Substation",
+                topic="High winds",
+                on_date=date(2026, 3, 14),
+            )
+
+            self.assertEqual(len(pending_contacts), 1)
+            self.assertEqual(pending_contacts[0].individual_name, "Luke Green")
+
+    def test_launch_messages_sms_broadcast_opens_messages_drafts(self) -> None:
+        mobile_numbers = [f"+44770011{index:04d}" for index in range(25)]
+
+        with patch.object(workspace_module.time_module, "sleep") as mocked_sleep:
+            with patch.object(workspace_module.subprocess, "run") as mocked_run:
+                mocked_run.side_effect = [
+                    workspace_module.subprocess.CompletedProcess(
+                        ["open", "-Ra", "Messages"],
+                        0,
+                        "",
+                        "",
+                    ),
+                    workspace_module.subprocess.CompletedProcess(
+                        ["open", "-a", "Messages", "sms:chunk-1"],
+                        0,
+                        "",
+                        "",
+                    ),
+                    workspace_module.subprocess.CompletedProcess(
+                        ["open", "-a", "Messages", "sms:chunk-2"],
+                        0,
+                        "",
+                        "",
+                    ),
+                ]
+
+                launch_result = launch_messages_sms_broadcast(
+                    mobile_numbers,
+                    message="Toolbox talk in ten minutes",
+                    max_recipients_per_chunk=20,
+                )
+
+        self.assertTrue(launch_result.launched_successfully)
+        self.assertEqual(launch_result.recipient_count, 25)
+        self.assertEqual(launch_result.chunk_count, 2)
+        self.assertEqual(mocked_run.call_count, 3)
+        self.assertEqual(
+            mocked_run.call_args_list[1].args[0][:3],
+            ["open", "-a", "Messages"],
+        )
+        mocked_sleep.assert_called_once()
+
+    def test_log_broadcast_dispatch_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            launch_result = workspace_module.MessagesDraftLaunchResult(
+                draft_links=["sms:+447700111222&body=Stand%20down"],
+                recipient_count=1,
+                chunk_count=1,
+                launched_successfully=True,
+                error_message="",
+            )
+            logged_dispatch = log_broadcast_dispatch(
+                repository,
+                site_name="NG Lovedean Substation",
+                dispatch_kind="mass_broadcast",
+                audience_label="Everyone On Site",
+                subject="Stand down",
+                message_body="Stand down in the canteen",
+                recipient_numbers=["+447700111222"],
+                recipient_names=["Sean Carter"],
+                launch_result=launch_result,
+            )
+
+            stored_dispatches = list_broadcast_dispatches(
+                repository,
+                site_name="NG Lovedean Substation",
+            )
+
+            self.assertEqual(len(stored_dispatches), 1)
+            self.assertIsInstance(stored_dispatches[0], BroadcastDispatchDocument)
+            self.assertEqual(stored_dispatches[0].subject, "Stand down")
+            self.assertEqual(stored_dispatches[0].recipient_numbers, ["+447700111222"])
+            self.assertTrue(logged_dispatch.dispatch_document.launched_successfully)
+
+    def test_toolbox_talk_completion_and_export_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            workspace_root = project_root / "Uplands_Workspace"
+            tbt_register_dir = workspace_root / "FILE_2_Registers" / "Toolbox_Talk_Register"
+            tbt_active_docs_dir = tbt_register_dir / "Active_Docs"
+            tbt_signature_dir = tbt_register_dir / "Signatures"
+            tbt_output_dir = tbt_register_dir / "Registers"
+            templates_dir = project_root / "templates"
+            database_path = workspace_root / "documents.sqlite3"
+
+            for directory in (
+                tbt_active_docs_dir,
+                tbt_signature_dir,
+                tbt_output_dir,
+                templates_dir,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            template_path = templates_dir / "UHSF16.2_Template.docx"
+            document = Document()
+            document.add_paragraph("Topic {{ topic }}")
+            table = document.add_table(rows=2, cols=4)
+            table.cell(0, 0).text = "Name"
+            table.cell(0, 1).text = "Company"
+            table.cell(0, 2).text = "Date"
+            table.cell(0, 3).text = "Signature"
+            table.cell(1, 0).text = "{{ name }}"
+            table.cell(1, 1).text = "{{ company }}"
+            table.cell(1, 2).text = "{{ date }}"
+            table.cell(1, 3).text = "{{ signature }}"
+            document.save(template_path)
+
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.DATABASE_PATH,
+                app_config.TOOLBOX_TALK_REGISTER_DIR,
+                app_config.FILE_2_TBT_ACTIVE_DOCS_DIR,
+                app_config.FILE_2_TBT_SIGNATURES_DIR,
+                app_config.FILE_2_TBT_OUTPUT_DIR,
+            )
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.DATABASE_PATH = database_path
+                app_config.TOOLBOX_TALK_REGISTER_DIR = tbt_register_dir
+                app_config.FILE_2_TBT_ACTIVE_DOCS_DIR = tbt_active_docs_dir
+                app_config.FILE_2_TBT_SIGNATURES_DIR = tbt_signature_dir
+                app_config.FILE_2_TBT_OUTPUT_DIR = tbt_output_dir
+                TemplateRegistry.PROJECT_ROOT = project_root
+                TemplateRegistry.TEMPLATE_PATHS["toolbox_talk_register"] = Path(
+                    "templates/UHSF16.2_Template.docx"
+                )
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+
+                saved_toolbox_talk_document = save_toolbox_talk_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                    uploaded_file_name="Working-in-high-winds.pdf",
+                    uploaded_file_bytes=b"%PDF-1.4 fake toolbox talk",
+                )
+
+                repository.save(
+                    InductionDocument(
+                        doc_id="IND-001",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 14, 7, 0),
+                        status=DocumentStatus.ACTIVE,
+                        contractor_name="A. Archer Electrical",
+                        individual_name="Sean Carter",
+                        contact_number="07700111222",
+                    )
+                )
+                first_attendance = DailyAttendanceEntryDocument(
+                    doc_id="ATT-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 7, 30),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-001",
+                    individual_name="Sean Carter",
+                    contractor_name="A. Archer Electrical",
+                    time_in=datetime(2026, 3, 14, 7, 30),
+                )
+                repository.save(first_attendance)
+
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                first_completion = log_toolbox_talk_completion(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                    attendance_entry=first_attendance,
+                    signature_image_data=signature_image_data,
+                    document_read_confirmed=True,
+                )
+
+                repository.save(
+                    InductionDocument(
+                        doc_id="IND-002",
+                        site_name="NG Lovedean Substation",
+                        created_at=datetime(2026, 3, 14, 7, 5),
+                        status=DocumentStatus.ACTIVE,
+                        contractor_name="Uplands Construction Group",
+                        individual_name="Luke Green",
+                        contact_number="07700999444",
+                    )
+                )
+                second_attendance = DailyAttendanceEntryDocument(
+                    doc_id="ATT-002",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 14, 8, 0),
+                    status=DocumentStatus.ACTIVE,
+                    linked_induction_doc_id="IND-002",
+                    individual_name="Luke Green",
+                    contractor_name="Uplands Construction Group",
+                    time_in=datetime(2026, 3, 14, 8, 0),
+                )
+                repository.save(second_attendance)
+                log_toolbox_talk_completion(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                    attendance_entry=second_attendance,
+                    signature_image_data=signature_image_data,
+                    document_read_confirmed=True,
+                )
+
+                source_documents = list_toolbox_talk_documents(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                )
+                latest_toolbox_talk_document = get_latest_toolbox_talk_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                )
+                source_document_bytes, source_document_mime_type = (
+                    read_toolbox_talk_document_bytes(saved_toolbox_talk_document.toolbox_talk_document)
+                )
+                completions = list_toolbox_talk_completions(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                )
+                generated_register = generate_toolbox_talk_register_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    topic="Working in high winds",
+                )
+            finally:
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.DATABASE_PATH,
+                    app_config.TOOLBOX_TALK_REGISTER_DIR,
+                    app_config.FILE_2_TBT_ACTIVE_DOCS_DIR,
+                    app_config.FILE_2_TBT_SIGNATURES_DIR,
+                    app_config.FILE_2_TBT_OUTPUT_DIR,
+                ) = original_config
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+
+            self.assertEqual(len(source_documents), 1)
+            self.assertIsNotNone(latest_toolbox_talk_document)
+            self.assertEqual(
+                latest_toolbox_talk_document.original_file_name,
+                "Working-in-high-winds.pdf",
+            )
+            self.assertEqual(source_document_bytes, b"%PDF-1.4 fake toolbox talk")
+            self.assertEqual(source_document_mime_type, "application/pdf")
+            self.assertEqual(len(completions), 2)
+            self.assertTrue(first_completion.signature_path.exists())
+            self.assertTrue(generated_register.output_path.exists())
+            self.assertEqual(generated_register.row_count, 2)
+
+            rendered_document = Document(generated_register.output_path)
+            rendered_text = "\n".join(
+                paragraph.text for paragraph in rendered_document.paragraphs
+            )
+            self.assertIn("Working in high winds", rendered_text)
+            table = rendered_document.tables[0]
+            first_row = [cell.text.strip() for cell in table.rows[1].cells]
+            second_row = [cell.text.strip() for cell in table.rows[2].cells]
+            self.assertEqual(first_row[0], "Sean Carter")
+            self.assertEqual(first_row[1], "A. Archer Electrical")
+            self.assertEqual(second_row[0], "Luke Green")
+            self.assertEqual(second_row[1], "Uplands Construction Group")
 
     def test_plant_asset_document_parses_inspection_due_date(self) -> None:
         plant_asset = PlantAssetDocument(
@@ -3780,6 +5083,7 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             original_attendance_destination = app_config.ATTENDANCE_DESTINATION
             original_plant_hire_directory = app_config.PLANT_HIRE_REGISTER_DIR
             original_induction_directory = app_config.INDUCTION_DIR
+            original_review_directory = app_config.FILE_3_REVIEW_DIR
             original_database_path = app_config.DATABASE_PATH
 
             try:
@@ -3791,6 +5095,7 @@ class WasteRegisterAutomationTests(unittest.TestCase):
                 app_config.ATTENDANCE_DESTINATION = attendance_destination
                 app_config.PLANT_HIRE_REGISTER_DIR = workspace_root / "FILE_2_Registers" / "Plant_Hire_Register"
                 app_config.INDUCTION_DIR = induction_directory
+                app_config.FILE_3_REVIEW_DIR = induction_directory / "Needs_Review"
                 app_config.DATABASE_PATH = database_path
 
                 repository = DocumentRepository(database_path)
@@ -3807,6 +5112,7 @@ class WasteRegisterAutomationTests(unittest.TestCase):
                 app_config.ATTENDANCE_DESTINATION = original_attendance_destination
                 app_config.PLANT_HIRE_REGISTER_DIR = original_plant_hire_directory
                 app_config.INDUCTION_DIR = original_induction_directory
+                app_config.FILE_3_REVIEW_DIR = original_review_directory
                 app_config.DATABASE_PATH = original_database_path
 
             self.assertEqual(len(waste_transfer_notes), 1)
@@ -3984,6 +5290,7 @@ class SafetyScannerAutomationTests(unittest.TestCase):
             original_induction_directory = app_config.INDUCTION_DIR
             original_rams_destination = app_config.RAMS_DESTINATION
             original_coshh_destination = app_config.COSHH_DESTINATION
+            original_review_directory = app_config.FILE_3_REVIEW_DIR
             original_file_3_output_dir = app_config.FILE_3_OUTPUT_DIR
             original_database_path = app_config.DATABASE_PATH
 
@@ -3998,6 +5305,7 @@ class SafetyScannerAutomationTests(unittest.TestCase):
                 app_config.INDUCTION_DIR = induction_directory
                 app_config.RAMS_DESTINATION = rams_destination
                 app_config.COSHH_DESTINATION = coshh_destination
+                app_config.FILE_3_REVIEW_DIR = workspace_root / "FILE_3_Inductions" / "Needs_Review"
                 app_config.FILE_3_OUTPUT_DIR = file_3_output_directory
                 app_config.DATABASE_PATH = database_path
 
@@ -4020,6 +5328,7 @@ class SafetyScannerAutomationTests(unittest.TestCase):
                 app_config.INDUCTION_DIR = original_induction_directory
                 app_config.RAMS_DESTINATION = original_rams_destination
                 app_config.COSHH_DESTINATION = original_coshh_destination
+                app_config.FILE_3_REVIEW_DIR = original_review_directory
                 app_config.FILE_3_OUTPUT_DIR = original_file_3_output_dir
                 app_config.DATABASE_PATH = original_database_path
 
@@ -4159,17 +5468,11 @@ class SafetyScannerAutomationTests(unittest.TestCase):
             self.assertEqual(activity_description, "Switch Room Cable Tray Install")
             self.assertEqual(version, "03")
 
-    def test_is_rams_safety_source_allows_review_forms_with_rams_anchors(self) -> None:
+    def test_is_rams_safety_source_excludes_review_forms_from_live_register(self) -> None:
         self.assertFalse(
             workspace_module._is_rams_safety_source(
                 Path("UHSF20.1 Review Form - Bluecord RAMS.docx"),
                 "Risk Assessment and Method Statement",
-            )
-        )
-        self.assertTrue(
-            workspace_module._is_rams_safety_source(
-                Path("UHSF20.1 Review Form - Bluecord RAMS.docx"),
-                "RAMS TITLE: Cable Tray Install\nRisk Assessment and Method Statement",
             )
         )
         self.assertFalse(
@@ -4185,6 +5488,300 @@ class SafetyScannerAutomationTests(unittest.TestCase):
             )
         )
 
+    def test_is_coshh_safety_source_rejects_rams_documents_with_generic_labels(self) -> None:
+        self.assertFalse(
+            workspace_module._is_coshh_safety_source(
+                Path("MS26-003-002 - Ventilation Install National Grid Lovedean.docx"),
+                (
+                    "COMPANY NAME: Bluecord\n"
+                    "BRIEF DESCRIPTION OF WORK: Installation of ventilation services\n"
+                    "Risk Assessment and Method Statement"
+                ),
+            )
+        )
+
+    def test_is_coshh_safety_source_rejects_construction_phase_plan(self) -> None:
+        self.assertFalse(
+            workspace_module._is_coshh_safety_source(
+                Path("UHSF15.1 Construction Phase Plan - NG Lovedean rev 2.docx"),
+                "Construction Phase Plan\nProject Details\nSite safety management",
+            )
+        )
+
+    def test_is_rams_safety_source_does_not_capture_safety_data_sheet(self) -> None:
+        self.assertFalse(
+            workspace_module._is_rams_safety_source(
+                Path("Mapei Latexplan NA safety sheet.pdf"),
+                (
+                    "Safety Data Sheet\n"
+                    "Product Name(s): LATEXPLAN NA\n"
+                    "Supplier Name & Address: Mapei UK Ltd\n"
+                    "Recommended use: Cement based levelling mortar"
+                ),
+            )
+        )
+
+    def test_rebuild_file_3_safety_inventory_reclassifies_and_holds_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            safety_root = workspace_root / "FILE_3_Inductions"
+            rams_destination = safety_root / "RAMS"
+            coshh_destination = safety_root / "COSHH"
+            review_directory = safety_root / "Needs_Review"
+            database_path = workspace_root / "documents.sqlite3"
+            for directory in (rams_destination, coshh_destination, review_directory):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            def _write_docx(path: Path, lines: list[str]) -> None:
+                document = Document()
+                for line in lines:
+                    document.add_paragraph(line)
+                document.save(path)
+
+            misfiled_rams_path = coshh_destination / "Bluecord-RAMS-Cable Tray Install-Rev 2.docx"
+            review_form_path = rams_destination / "UHSF20.1 Review Form - Bluecord.docx"
+            _write_docx(
+                misfiled_rams_path,
+                [
+                    "Risk Assessment and Method Statement",
+                    "Activity Description: Cable Tray Install",
+                    "Version: 2",
+                    "Contractor: Bluecord",
+                ],
+            )
+            _write_docx(
+                review_form_path,
+                [
+                    "Review Form",
+                    "RAMS TITLE: Cable Tray Install",
+                    "Version: 1",
+                ],
+            )
+
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.DATABASE_PATH,
+                app_config.INDUCTION_DIR,
+                app_config.FILE_3_SAFETY_DIR,
+                app_config.RAMS_DESTINATION,
+                app_config.COSHH_DESTINATION,
+                app_config.FILE_3_REVIEW_DIR,
+            )
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.DATABASE_PATH = database_path
+                app_config.INDUCTION_DIR = safety_root
+                app_config.FILE_3_SAFETY_DIR = safety_root
+                app_config.RAMS_DESTINATION = rams_destination
+                app_config.COSHH_DESTINATION = coshh_destination
+                app_config.FILE_3_REVIEW_DIR = review_directory
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+
+                rebuild_result = workspace_module.rebuild_file_3_safety_inventory(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                )
+            finally:
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.DATABASE_PATH,
+                    app_config.INDUCTION_DIR,
+                    app_config.FILE_3_SAFETY_DIR,
+                    app_config.RAMS_DESTINATION,
+                    app_config.COSHH_DESTINATION,
+                    app_config.FILE_3_REVIEW_DIR,
+                ) = original_config
+
+            self.assertEqual(rebuild_result.total_sources, 2)
+            self.assertEqual(rebuild_result.rams_records, 1)
+            self.assertEqual(rebuild_result.coshh_records, 0)
+            self.assertEqual(rebuild_result.ignored_sources, 1)
+            self.assertTrue((rams_destination / misfiled_rams_path.name).exists())
+            self.assertTrue((review_directory / review_form_path.name).exists())
+
+            rams_documents = repository.list_documents(
+                document_type=RAMSDocument.document_type,
+                site_name="NG Lovedean Substation",
+            )
+            coshh_documents = repository.list_documents(
+                document_type=COSHHDocument.document_type,
+                site_name="NG Lovedean Substation",
+            )
+            self.assertEqual(len(rams_documents), 1)
+            self.assertFalse(coshh_documents)
+
+    def test_park_file_3_document_for_review_moves_linked_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            rams_destination = workspace_root / "FILE_3_Inductions" / "RAMS"
+            review_directory = workspace_root / "FILE_3_Inductions" / "Needs_Review"
+            database_path = workspace_root / "documents.sqlite3"
+            rams_destination.mkdir(parents=True, exist_ok=True)
+            review_directory.mkdir(parents=True, exist_ok=True)
+
+            source_path = rams_destination / "Bluecord-RAMS.docx"
+            document = Document()
+            document.add_paragraph("Risk Assessment and Method Statement")
+            document.save(source_path)
+
+            original_review_directory = app_config.FILE_3_REVIEW_DIR
+            try:
+                app_config.FILE_3_REVIEW_DIR = review_directory
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                rams_document = RAMSDocument(
+                    doc_id="RAMS-bluecord-cable-tray",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 15, 8, 0),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="Bluecord",
+                    activity_description="Cable Tray Install",
+                    approval_date=date(2026, 3, 15),
+                    reference="RAMS-01",
+                    version="1",
+                )
+                repository.save(rams_document)
+                repository.index_file(
+                    file_name=source_path.name,
+                    file_path=source_path,
+                    file_category="rams_docx",
+                    file_group=FileGroup.FILE_3,
+                    site_name=rams_document.site_name,
+                    related_doc_id=rams_document.doc_id,
+                )
+
+                parked_paths = workspace_module.park_file_3_document_for_review(
+                    repository,
+                    rams_document.doc_id,
+                )
+            finally:
+                app_config.FILE_3_REVIEW_DIR = original_review_directory
+
+            self.assertEqual(len(parked_paths), 1)
+            self.assertTrue(parked_paths[0].exists())
+            self.assertEqual(parked_paths[0].parent.resolve(), review_directory.resolve())
+            self.assertFalse(repository.list_documents(document_type=RAMSDocument.document_type))
+
+    def test_build_file_3_review_candidates_flags_noisy_live_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+            noisy_rams = RAMSDocument(
+                doc_id="RAMS-flagged",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 8, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="Electrical Work",
+                activity_description="Severity (S)",
+                approval_date=date(2026, 3, 15),
+                reference="EC26 - Electrical Work",
+                version="1.0",
+            )
+            clean_rams = RAMSDocument(
+                doc_id="RAMS-clean",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 8, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="Uplands",
+                activity_description="Barrier Matting",
+                approval_date=date(2026, 3, 15),
+                reference="RAMS-02",
+                version="1.0",
+            )
+
+            candidates = app_module._build_file_3_review_candidates(
+                repository,
+                rams_documents=[noisy_rams, clean_rams],
+                coshh_documents=[],
+            )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].doc_id, noisy_rams.doc_id)
+            self.assertIn("Company", candidates[0].findings)
+            self.assertIn("Activity", candidates[0].findings)
+
+    def test_filter_file_3_review_candidates_supports_type_finding_and_search(self) -> None:
+        candidates = [
+            app_module.File3ReviewCandidate(
+                document_type="RAMS",
+                doc_id="RAMS-01",
+                company="Electrical Work",
+                title="Severity (S)",
+                reference="EC26 - Electrical Work",
+                version="1.0",
+                findings=("Company", "Activity"),
+                source_path=Path("/tmp/Electrical-Work.docx"),
+            ),
+            app_module.File3ReviewCandidate(
+                document_type="COSHH",
+                doc_id="COSHH-01",
+                company="Limits",
+                title="Mapei Latexplan NA",
+                reference="COSHH ASSESSMENT - Mapei Latexplan NA",
+                version="1.0",
+                findings=("Supplier",),
+                source_path=Path("/tmp/Mapei.pdf"),
+            ),
+        ]
+
+        filtered_by_type = app_module._filter_file_3_review_candidates(
+            candidates,
+            document_type_filter="RAMS",
+        )
+        filtered_by_finding = app_module._filter_file_3_review_candidates(
+            candidates,
+            finding_filter="Title / Substance",
+        )
+        filtered_by_search = app_module._filter_file_3_review_candidates(
+            candidates,
+            search_query="mapei pdf",
+        )
+
+        self.assertEqual([candidate.doc_id for candidate in filtered_by_type], ["RAMS-01"])
+        self.assertEqual([candidate.doc_id for candidate in filtered_by_finding], ["RAMS-01"])
+        self.assertEqual([candidate.doc_id for candidate in filtered_by_search], ["COSHH-01"])
+
+    def test_get_file_3_review_adjacent_doc_ids_returns_previous_and_next(self) -> None:
+        candidates = [
+            app_module.File3ReviewCandidate(
+                document_type="RAMS",
+                doc_id="RAMS-01",
+                company="Uplands",
+                title="Barrier Matting",
+                reference="RAMS-01",
+                version="1",
+                findings=("Company",),
+            ),
+            app_module.File3ReviewCandidate(
+                document_type="RAMS",
+                doc_id="RAMS-02",
+                company="Bluecord",
+                title="Roof Works",
+                reference="RAMS-02",
+                version="1",
+                findings=("Reference",),
+            ),
+            app_module.File3ReviewCandidate(
+                document_type="COSHH",
+                doc_id="COSHH-01",
+                company="Limits",
+                title="Latexplan",
+                reference="COSHH-01",
+                version="1",
+                findings=("Supplier",),
+            ),
+        ]
+
+        previous_doc_id, next_doc_id = app_module._get_file_3_review_adjacent_doc_ids(
+            candidates,
+            "RAMS-02",
+        )
+
+        self.assertEqual(previous_doc_id, "RAMS-01")
+        self.assertEqual(next_doc_id, "COSHH-01")
+
 
 class WorkspaceDoctorTests(unittest.TestCase):
     def test_run_workspace_diagnostic_reports_healthy_workspace(self) -> None:
@@ -4193,6 +5790,7 @@ class WorkspaceDoctorTests(unittest.TestCase):
             workspace_root = project_root / "Uplands_Workspace"
             templates_dir = project_root / "templates"
             file_2_output_dir = workspace_root / "FILE_2_Output"
+            review_dir = workspace_root / "FILE_3_Inductions" / "Needs_Review"
             signatures_dir = workspace_root / "FILE_3_Inductions" / "Signatures"
             completed_dir = workspace_root / "FILE_3_Inductions" / "Completed_Inductions"
             database_path = workspace_root / "documents.sqlite3"
@@ -4202,6 +5800,7 @@ class WorkspaceDoctorTests(unittest.TestCase):
                 workspace_root,
                 templates_dir,
                 file_2_output_dir,
+                review_dir,
                 signatures_dir,
                 completed_dir,
             ):
@@ -4213,6 +5812,8 @@ class WorkspaceDoctorTests(unittest.TestCase):
             with patch.object(app_config, "PROJECT_ROOT", project_root), patch.object(
                 app_config, "BASE_DATA_DIR", workspace_root
             ), patch.object(app_config, "FILE_2_OUTPUT_DIR", file_2_output_dir), patch.object(
+                app_config, "FILE_3_REVIEW_DIR", review_dir
+            ), patch.object(
                 app_config, "FILE_3_SIGNATURES_DIR", signatures_dir
             ), patch.object(
                 app_config,
@@ -4240,6 +5841,7 @@ class WorkspaceDoctorTests(unittest.TestCase):
             workspace_root = project_root / "Uplands_Workspace"
             templates_dir = project_root / "templates"
             file_2_output_dir = workspace_root / "FILE_2_Output"
+            review_dir = workspace_root / "FILE_3_Inductions" / "Needs_Review"
             signatures_dir = workspace_root / "FILE_3_Inductions" / "Signatures"
             completed_dir = workspace_root / "FILE_3_Inductions" / "Completed_Inductions"
             database_path = workspace_root / "documents.sqlite3"
@@ -4248,6 +5850,7 @@ class WorkspaceDoctorTests(unittest.TestCase):
                 workspace_root,
                 templates_dir,
                 file_2_output_dir,
+                review_dir,
                 signatures_dir,
                 completed_dir,
             ):
@@ -4258,6 +5861,8 @@ class WorkspaceDoctorTests(unittest.TestCase):
             with patch.object(app_config, "PROJECT_ROOT", project_root), patch.object(
                 app_config, "BASE_DATA_DIR", workspace_root
             ), patch.object(app_config, "FILE_2_OUTPUT_DIR", file_2_output_dir), patch.object(
+                app_config, "FILE_3_REVIEW_DIR", review_dir
+            ), patch.object(
                 app_config, "FILE_3_SIGNATURES_DIR", signatures_dir
             ), patch.object(
                 app_config,
@@ -4284,7 +5889,231 @@ class WorkspaceDoctorTests(unittest.TestCase):
             )
 
 
+class SiteDiaryDictationTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        app_module.st.session_state.clear()
+
+    def test_apply_site_diary_dictation_result_appends_transcript_once(self) -> None:
+        target_key = "file2_site_diary_comments_2026-03-15"
+        app_module.st.session_state.clear()
+        app_module.st.session_state[target_key] = "Existing note"
+
+        app_module._apply_site_diary_dictation_result(
+            {
+                "target": target_key,
+                "transcript": "Additional dictated update",
+                "nonce": "12345",
+            },
+            friendly_label="Today's Comments",
+        )
+        app_module._apply_site_diary_dictation_result(
+            {
+                "target": target_key,
+                "transcript": "Additional dictated update",
+                "nonce": "12345",
+            },
+            friendly_label="Today's Comments",
+        )
+
+        self.assertEqual(
+            app_module.st.session_state[target_key],
+            "Existing note\nAdditional dictated update",
+        )
+        self.assertEqual(
+            app_module.st.session_state["file2_site_diary_dictation_flash"],
+            "Dictation added to Today's Comments.",
+        )
+
+    def test_apply_site_diary_dictation_result_surfaces_browser_error(self) -> None:
+        app_module.st.session_state.clear()
+
+        app_module._apply_site_diary_dictation_result(
+            {
+                "target": "file2_site_diary_incidents_2026-03-15",
+                "error": "Microphone permission was blocked by the browser.",
+                "nonce": "error-1",
+            },
+            friendly_label="Incidents Details",
+        )
+
+        self.assertEqual(
+            app_module.st.session_state["file2_site_diary_dictation_warning"],
+            "Microphone permission was blocked by the browser.",
+        )
+
+
+class SiteInductionPrintPackTests(unittest.TestCase):
+    def test_build_induction_print_pack_paths_groups_docx_and_preview_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            induction_docx = temp_root / "induction.docx"
+            cscs_pdf = temp_root / "cscs.pdf"
+            first_aid_jpg = temp_root / "first-aid.jpg"
+            extra_docx = temp_root / "certificate.docx"
+            induction_docx.write_bytes(b"docx")
+            cscs_pdf.write_bytes(b"pdf")
+            first_aid_jpg.write_bytes(b"jpg")
+            extra_docx.write_bytes(b"other-docx")
+
+            induction = InductionDocument(
+                doc_id="induction-1",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 8, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="A. Archer Electrical",
+                individual_name="Sean Carter",
+                competency_card_paths=",".join(
+                    [
+                        str(cscs_pdf),
+                        str(first_aid_jpg),
+                        str(extra_docx),
+                        str(temp_root / "missing.pdf"),
+                    ]
+                ),
+                completed_document_path=str(induction_docx),
+            )
+
+            pack_paths = app_module._build_induction_print_pack_paths(induction)
+
+            self.assertEqual(pack_paths["default"], [induction_docx, extra_docx])
+            self.assertEqual(pack_paths["preview"], [cscs_pdf, first_aid_jpg])
+
+
 class SiteInductionPosterTests(unittest.TestCase):
+    def test_lookup_uk_postcode_details_returns_formatted_area(self) -> None:
+        class _FakeResponse:
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "status": 200,
+                        "result": {
+                            "postcode": "CF44 9TZ",
+                            "latitude": 51.742077,
+                            "longitude": -3.505021,
+                            "parish": "Hirwaun",
+                            "admin_district": "Rhondda Cynon Taf",
+                            "country": "Wales",
+                        },
+                    }
+                ).encode("utf-8")
+
+        with patch.object(workspace_module, "urlopen", return_value=_FakeResponse()):
+            self.assertEqual(
+                lookup_uk_postcode_details("cf449tz"),
+                {
+                    "postcode": "CF44 9TZ",
+                    "latitude": 51.742077,
+                    "longitude": -3.505021,
+                    "locality": "Hirwaun",
+                    "district": "Rhondda Cynon Taf",
+                    "country": "Wales",
+                    "formatted_address": "Hirwaun, Rhondda Cynon Taf, CF44 9TZ",
+                },
+            )
+
+    def test_lookup_uk_postcode_coordinates_returns_lat_lng(self) -> None:
+        class _FakeResponse:
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "status": 200,
+                        "result": {
+                            "postcode": "PO8 0SJ",
+                            "latitude": 50.917,
+                            "longitude": -1.036,
+                        },
+                    }
+                ).encode("utf-8")
+
+        with patch.object(workspace_module, "urlopen", return_value=_FakeResponse()):
+            self.assertEqual(
+                lookup_uk_postcode_coordinates("po8 0sj"),
+                (50.917, -1.036, "PO8 0SJ"),
+            )
+
+    def test_lookup_uk_postcode_coordinates_returns_none_for_bad_response(self) -> None:
+        class _FakeResponse:
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps({"status": 404, "result": None}).encode("utf-8")
+
+        with patch.object(workspace_module, "urlopen", return_value=_FakeResponse()):
+            self.assertIsNone(lookup_uk_postcode_coordinates("BAD"))
+
+    def test_load_project_setup_normalizes_lovedean_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_setup_path = Path(temp_dir) / "project_setup.json"
+            project_setup_path.write_text(
+                json.dumps(
+                    {
+                        "current_site_name": "NG Lovedean Substation",
+                        "job_number": "81888",
+                        "site_address": "National Grid Sub Station Horndean Broadway Lane Waterlooville PO8 0SJ, CF44 9TZ",
+                        "client_name": "National Grid",
+                        "site_latitude": 51.742077,
+                        "site_longitude": -3.505021,
+                        "known_sites": [
+                            {
+                                "site_name": "NG Lovedean Substation",
+                                "site_address": "National Grid Sub Station Horndean Broadway Lane Waterlooville PO8 0SJ, CF44 9TZ",
+                                "client_name": "National Grid",
+                                "job_number": "81888",
+                                "site_latitude": 51.742077,
+                                "site_longitude": -3.505021,
+                                "geofence_radius_meters": 500,
+                                "last_used_at": "2026-03-15T01:35:52",
+                            },
+                            {
+                                "site_name": "11 station close",
+                                "site_address": "11 station close, Hirwaun, Rhondda Cynon Taf, CF44 9TZ",
+                                "client_name": "National Grid",
+                                "job_number": "81888",
+                                "site_latitude": 51.742077,
+                                "site_longitude": -3.505021,
+                                "geofence_radius_meters": 500,
+                                "last_used_at": "2026-03-15T01:35:52",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(app_module, "PROJECT_SETUP_PATH", project_setup_path):
+                loaded_setup = app_module._load_project_setup()
+
+            self.assertEqual(
+                loaded_setup.site_address,
+                app_module.LOVEDEAN_SITE_ADDRESS,
+            )
+            self.assertEqual(loaded_setup.site_latitude, app_module.LOVEDEAN_SITE_LATITUDE)
+            self.assertEqual(loaded_setup.site_longitude, app_module.LOVEDEAN_SITE_LONGITUDE)
+            lovedean_profile = next(
+                profile
+                for profile in loaded_setup.known_sites
+                if profile.site_name == "NG Lovedean Substation"
+            )
+            self.assertEqual(lovedean_profile.site_address, app_module.LOVEDEAN_SITE_ADDRESS)
+            self.assertEqual(lovedean_profile.site_latitude, app_module.LOVEDEAN_SITE_LATITUDE)
+            self.assertEqual(lovedean_profile.site_longitude, app_module.LOVEDEAN_SITE_LONGITUDE)
+
     def test_get_site_induction_url_uses_local_ip_and_induction_station(self) -> None:
         with patch.object(
             workspace_module,
@@ -4295,6 +6124,84 @@ class SiteInductionPosterTests(unittest.TestCase):
                 get_site_induction_url(),
                 "http://192.168.1.88:8501/?station=induction",
             )
+
+    def test_generate_site_induction_poster_uses_kiosk_mode_with_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logo_path = Path(temp_dir) / "uplands-logo.png"
+            fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 50, 20), 0).save(str(logo_path))
+
+            with patch.object(
+                workspace_module,
+                "get_local_ip_address",
+                return_value="192.168.1.88",
+            ):
+                poster = generate_site_induction_poster(
+                    site_name="NG Lovedean Substation",
+                    logo_path=logo_path,
+                )
+
+        self.assertEqual(
+            poster.induction_url,
+            "https://uplands-site-induction.omegaleague.win/?station=induction&mode=kiosk",
+        )
+        self.assertTrue(poster.qr_code_png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(poster.poster_png.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_generate_site_induction_poster_prefers_public_tunnel_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logo_path = Path(temp_dir) / "uplands-logo.png"
+            fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 50, 20), 0).save(str(logo_path))
+
+            poster = generate_site_induction_poster(
+                site_name="NG Lovedean Substation",
+                logo_path=logo_path,
+                public_url="https://uplands.example.workers.dev",
+            )
+
+        self.assertEqual(
+            poster.induction_url,
+            "https://uplands-site-induction.omegaleague.win/?station=induction&mode=kiosk",
+        )
+        self.assertTrue(poster.qr_code_png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(poster.poster_png.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_detect_public_tunnel_url_from_log_accepts_custom_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_tunnel_log_path = app_config.TUNNEL_LOG_PATH
+            try:
+                tunnel_log_path = Path(temp_dir) / "tunnel.log"
+                tunnel_log_path.write_text(
+                    "INFO Connected\nhttps://uplands-site-induction.omegaleague.win\n",
+                    encoding="utf-8",
+                )
+                app_config.TUNNEL_LOG_PATH = tunnel_log_path
+                self.assertEqual(
+                    detect_public_tunnel_url_from_log(),
+                    "https://uplands-site-induction.omegaleague.win",
+                )
+            finally:
+                app_config.TUNNEL_LOG_PATH = original_tunnel_log_path
+
+    def test_detect_public_tunnel_url_from_log_prioritizes_permanent_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_tunnel_log_path = app_config.TUNNEL_LOG_PATH
+            try:
+                tunnel_log_path = Path(temp_dir) / "tunnel.log"
+                tunnel_log_path.write_text(
+                    (
+                        "INFO Connected\n"
+                        "https://random-subdomain.trycloudflare.com\n"
+                        "https://uplands-site-induction.omegaleague.win\n"
+                    ),
+                    encoding="utf-8",
+                )
+                app_config.TUNNEL_LOG_PATH = tunnel_log_path
+                self.assertEqual(
+                    detect_public_tunnel_url_from_log(),
+                    "https://uplands-site-induction.omegaleague.win",
+                )
+            finally:
+                app_config.TUNNEL_LOG_PATH = original_tunnel_log_path
 
     def test_generate_site_induction_poster_returns_png_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4313,7 +6220,7 @@ class SiteInductionPosterTests(unittest.TestCase):
 
         self.assertEqual(
             poster.induction_url,
-            "http://192.168.1.88:8501/?station=induction",
+            "https://uplands-site-induction.omegaleague.win/?station=induction&mode=kiosk",
         )
         self.assertTrue(poster.qr_code_png.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertTrue(poster.poster_png.startswith(b"\x89PNG\r\n\x1a\n"))

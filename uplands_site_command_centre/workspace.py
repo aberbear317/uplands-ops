@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from io import BytesIO
 import json
+import math
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -14,7 +17,11 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time as time_module
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.request import urlopen
 import zipfile
 
 from docx import Document
@@ -23,10 +30,12 @@ from uplands_site_command_centre import config
 from uplands_site_command_centre.permits.ingestion_engine import IngestionEngine
 from uplands_site_command_centre.permits.models import (
     BaseDocument,
+    BroadcastDispatchDocument,
     COMMON_CONSTRUCTION_EWC_CODES,
     CarrierComplianceDocument,
     CarrierComplianceDocumentType,
     COSHHDocument,
+    DailyAttendanceEntryDocument,
     DocumentStatus,
     FileGroup,
     InductionDocument,
@@ -35,16 +44,21 @@ from uplands_site_command_centre.permits.models import (
     PlantAssetDocument,
     RAMSDocument,
     SafetyAsset,
+    SITE_CHECK_WEEKDAY_KEYS,
+    SiteDiaryDocument,
     SiteAttendanceRegister,
     SiteAttendanceRecord,
     SiteCheckRegister,
     SiteWorker,
+    ToolboxTalkDocument,
+    ToolboxTalkCompletionDocument,
     TemplateRegistry,
     ValidationError,
     WeeklySiteCheck,
     WeeklySiteCheckRowDefinition,
     WasteRegister,
     WasteTransferNoteDocument,
+    get_weekly_site_check_frequency_for_row,
 )
 from uplands_site_command_centre.permits.repository import (
     DocumentNotFoundError,
@@ -112,6 +126,12 @@ PRIORITY_DATE_PATTERNS = (
         ),
     ),
 )
+
+
+def _weekly_site_check_template_tag(day_key: str, row_number: int) -> str:
+    """Return the placeholder tag name for one File 2 weekly checklist cell."""
+
+    return f"{day_key}_{row_number}"
 LOW_PRIORITY_KEYWORDS = ("expiry", "until", "period", "ends")
 IGNORE_DATE_CONTEXT_KEYWORDS = (
     "dated",
@@ -160,6 +180,8 @@ MONTH_NAME_MAP = {
     "december": 12,
 }
 DEFAULT_SITE_NAME = "NG Lovedean Substation"
+LOVEDEAN_SITE_LATITUDE = 50.917
+LOVEDEAN_SITE_LONGITUDE = -1.036
 DEFAULT_WASTE_CARRIER_NAME = "Abucs"
 DEFAULT_WASTE_DESCRIPTION = "Mixed Construction"
 DEFAULT_EWC_CODE = "17 09 04"
@@ -301,6 +323,7 @@ FILE_3_COMPANY_ANCHOR_LABELS = (
 FILE_3_TITLE_ANCHOR_LABELS = (
     "rams title",
     "activity description",
+    "brief description of work",
     "title",
 )
 FILE_3_VERSION_ANCHOR_LABELS = (
@@ -370,6 +393,7 @@ SAFETY_REVIEW_DATE_LABELS = (
 )
 COSHH_SUBSTANCE_LABELS = (
     "product name",
+    "product name(s)",
     "substance name",
     "product identifier",
     "trade name",
@@ -377,7 +401,10 @@ COSHH_SUBSTANCE_LABELS = (
 )
 COSHH_SUPPLIER_LABELS = (
     "supplier",
+    "suppliers name",
     "supplier name",
+    "supplier name & address",
+    "suppliers name & address",
     "manufacturer/supplier",
     "manufacturer",
     "company name",
@@ -395,6 +422,84 @@ RAMS_ACTIVITY_LABELS = (
     "description of works",
     "works description",
     "activity",
+    "brief description of work",
+    "brief description of works",
+    "job/activity/sequence",
+    "task / activity",
+)
+FILE_3_STRONG_COSHH_TEXT_LABELS = (
+    "coshh assessment",
+    "safety data sheet",
+    "material safety data sheet",
+    "product name",
+    "substance name",
+    "product identifier",
+    "trade name",
+    "description of substance",
+    "suppliers name",
+    "supplier name",
+    "supplier",
+    "workplace exposure limits",
+    "risk phrases",
+    "safety phrases",
+    "msds attached",
+)
+FILE_3_REVIEW_HOLD_KEYWORDS = (
+    *COSHH_KEYWORDS,
+    *RAMS_KEYWORDS,
+    "review form",
+    "construction phase plan",
+    "uhsf15.1",
+)
+FILE_3_SUSPICIOUS_COMPANY_LABELS = frozenset(
+    {
+        "review",
+        "company",
+        "company name",
+        "contractor",
+        "contractor name",
+        "supplier",
+        "manufacturer",
+        "main contractor",
+        "subcontractor",
+        "site contractor",
+    }
+)
+FILE_3_COMMON_PERSON_FIRST_NAMES = frozenset(
+    {
+        "adam",
+        "alex",
+        "andrew",
+        "ben",
+        "cameron",
+        "ceri",
+        "chris",
+        "dan",
+        "david",
+        "gary",
+        "george",
+        "jake",
+        "jacob",
+        "james",
+        "jane",
+        "john",
+        "josh",
+        "lee",
+        "luke",
+        "mark",
+        "matt",
+        "michael",
+        "nick",
+        "paul",
+        "rob",
+        "robert",
+        "ryan",
+        "sam",
+        "sean",
+        "steve",
+        "steven",
+        "tom",
+    }
 )
 
 
@@ -544,9 +649,20 @@ class InductionRecord:
     full_name: str
     company: str
     cscs_number: str
+    cscs_expiry: Optional[date]
     emergency_contact: str
     emergency_tel: str
     medical: str
+    asbestos_cert: bool
+    erect_scaffold: bool
+    cisrs_no: str
+    cisrs_expiry: Optional[date]
+    operate_plant: bool
+    cpcs_no: str
+    cpcs_expiry: Optional[date]
+    client_training_desc: str
+    client_training_date: Optional[date]
+    client_training_expiry: Optional[date]
     first_aider: bool
     fire_warden: bool
     supervisor: bool
@@ -568,6 +684,86 @@ class GeneratedInductionDocument:
 
 
 @dataclass(frozen=True)
+class LoggedDailyAttendanceEntry:
+    """One persisted UHSF16.09 sign-in/out entry with its latest signature path."""
+
+    attendance_entry: DailyAttendanceEntryDocument
+    signature_path: Path
+
+
+@dataclass(frozen=True)
+class SiteBroadcastContact:
+    """One active on-site contact ready for emergency broadcast use."""
+
+    individual_name: str
+    contractor_name: str
+    mobile_number: str
+    vehicle_registration: str
+    linked_induction_doc_id: str
+
+
+@dataclass(frozen=True)
+class MessagesDraftLaunchResult:
+    """Result summary for one Messages draft launch batch."""
+
+    draft_links: List[str]
+    recipient_count: int
+    chunk_count: int
+    launched_successfully: bool
+    error_message: str = ""
+
+
+@dataclass(frozen=True)
+class LoggedBroadcastDispatch:
+    """One persisted broadcast dispatch plus the launch result used to create it."""
+
+    dispatch_document: BroadcastDispatchDocument
+    launch_result: MessagesDraftLaunchResult
+
+
+@dataclass(frozen=True)
+class LoggedToolboxTalkCompletion:
+    """One remote UHSF16.2 completion plus its stored signature path."""
+
+    toolbox_talk_completion: ToolboxTalkCompletionDocument
+    signature_path: Path
+
+
+@dataclass(frozen=True)
+class SavedToolboxTalkDocument:
+    """One uploaded toolbox talk source file plus its stored path."""
+
+    toolbox_talk_document: ToolboxTalkDocument
+    stored_path: Path
+
+
+@dataclass(frozen=True)
+class GeneratedToolboxTalkRegisterDocument:
+    """A populated UHSF16.2 toolbox talk register document ready for printing."""
+
+    output_path: Path
+    row_count: int
+
+
+@dataclass(frozen=True)
+class GeneratedAttendanceRegisterDocument:
+    """A populated File 2 attendance register document ready for printing."""
+
+    output_path: Path
+    row_count: int
+
+
+@dataclass(frozen=True)
+class GeneratedSiteDiaryDocument:
+    """A populated UHSF15.63 diary document ready for printing."""
+
+    output_path: Path
+    contractor_count: int
+    visitor_count: int
+    site_diary_document: SiteDiaryDocument
+
+
+@dataclass(frozen=True)
 class GeneratedSiteInductionPoster:
     """A printable induction poster plus the QR target URL."""
 
@@ -585,6 +781,19 @@ class WorkspaceDiagnosticCheck:
     exists: bool
     expected_kind: str
     display_path: str
+
+
+@dataclass(frozen=True)
+class RebuiltSafetyInventoryResult:
+    """Summary of one File 3 rebuild pass from filed source documents."""
+
+    total_sources: int
+    rams_records: int
+    coshh_records: int
+    moved_files: int
+    ignored_sources: int
+    moved_file_names: Tuple[str, ...] = ()
+    ignored_file_names: Tuple[str, ...] = ()
 
 
 def run_workspace_diagnostic() -> List[WorkspaceDiagnosticCheck]:
@@ -625,6 +834,7 @@ def run_workspace_diagnostic() -> List[WorkspaceDiagnosticCheck]:
     add_check("Workspace Root", config.BASE_DATA_DIR, "dir")
     add_check("Templates Folder", config.PROJECT_ROOT / "templates", "dir")
     add_check("File 2 Output", config.FILE_2_OUTPUT_DIR, "dir")
+    add_check("File 3 Needs Review", config.FILE_3_REVIEW_DIR, "dir")
     add_check("File 3 Signatures", config.FILE_3_SIGNATURES_DIR, "dir")
     add_check(
         "File 3 Completed Inductions",
@@ -653,6 +863,136 @@ def run_workspace_diagnostic() -> List[WorkspaceDiagnosticCheck]:
     return checks
 
 
+def _normalise_site_history_payload(
+    value: Any,
+    *,
+    max_entries: int = 6,
+) -> Dict[str, List[str]]:
+    """Return one cleaned site->recent-values mapping from persisted settings."""
+
+    if not isinstance(value, Mapping):
+        return {}
+
+    normalised_payload: Dict[str, List[str]] = {}
+    for raw_site_name, raw_entries in value.items():
+        site_name = str(raw_site_name or "").strip()
+        if not site_name or not isinstance(raw_entries, list):
+            continue
+        cleaned_entries: List[str] = []
+        seen_entries: set[str] = set()
+        for raw_entry in raw_entries:
+            cleaned_entry = str(raw_entry or "").strip()
+            if not cleaned_entry:
+                continue
+            dedupe_key = cleaned_entry.casefold()
+            if dedupe_key in seen_entries:
+                continue
+            cleaned_entries.append(cleaned_entry)
+            seen_entries.add(dedupe_key)
+            if len(cleaned_entries) >= max_entries:
+                break
+        if cleaned_entries:
+            normalised_payload[site_name] = cleaned_entries
+    return normalised_payload
+
+
+def load_app_settings() -> Dict[str, Any]:
+    """Load the root-level settings used by the permanent tunnel workflow."""
+
+    try:
+        payload = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "public_tunnel_url": "",
+            "broadcast_message_history_by_site": {},
+            "tbt_topic_history_by_site": {},
+        }
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {
+            "public_tunnel_url": "",
+            "broadcast_message_history_by_site": {},
+            "tbt_topic_history_by_site": {},
+        }
+
+    return {
+        "public_tunnel_url": str(payload.get("public_tunnel_url") or "").strip(),
+        "broadcast_message_history_by_site": _normalise_site_history_payload(
+            payload.get("broadcast_message_history_by_site")
+        ),
+        "tbt_topic_history_by_site": _normalise_site_history_payload(
+            payload.get("tbt_topic_history_by_site")
+        ),
+    }
+
+
+def save_app_settings(
+    *,
+    public_tunnel_url: Optional[str] = None,
+    broadcast_message_history_by_site: Optional[Mapping[str, List[str]]] = None,
+    tbt_topic_history_by_site: Optional[Mapping[str, List[str]]] = None,
+) -> None:
+    """Persist the root-level app settings used by the live manager workflows."""
+
+    existing_settings = load_app_settings()
+    resolved_public_tunnel_url = (
+        str(public_tunnel_url).strip()
+        if public_tunnel_url is not None
+        else str(existing_settings.get("public_tunnel_url") or "").strip()
+    )
+    resolved_broadcast_history = (
+        _normalise_site_history_payload(broadcast_message_history_by_site)
+        if broadcast_message_history_by_site is not None
+        else _normalise_site_history_payload(
+            existing_settings.get("broadcast_message_history_by_site")
+        )
+    )
+    resolved_tbt_history = (
+        _normalise_site_history_payload(tbt_topic_history_by_site)
+        if tbt_topic_history_by_site is not None
+        else _normalise_site_history_payload(
+            existing_settings.get("tbt_topic_history_by_site")
+        )
+    )
+    config.SETTINGS_PATH.write_text(
+        json.dumps(
+            {
+                "public_tunnel_url": resolved_public_tunnel_url,
+                "broadcast_message_history_by_site": resolved_broadcast_history,
+                "tbt_topic_history_by_site": resolved_tbt_history,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def detect_public_tunnel_url_from_log() -> str:
+    """Return the latest public tunnel URL from tunnel.log."""
+
+    try:
+        log_text = config.TUNNEL_LOG_PATH.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+    permanent_tunnel_match = re.search(
+        r"https://uplands-site-induction\.omegaleague\.win(?:[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?",
+        log_text,
+        flags=re.IGNORECASE,
+    )
+    if permanent_tunnel_match is not None:
+        return permanent_tunnel_match.group(0).rstrip(".,);")
+
+    tunnel_urls = re.findall(
+        r"https://[A-Za-z0-9.-]+(?:trycloudflare\.com|omegaleague\.win)(?:[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?",
+        log_text,
+        flags=re.IGNORECASE,
+    )
+    for tunnel_url in reversed(tunnel_urls):
+        return tunnel_url.rstrip(".,);")
+    return ""
+
+
 def get_local_ip_address() -> str:
     """Return the current machine's local IP address for on-site QR links."""
 
@@ -668,29 +1008,171 @@ def get_local_ip_address() -> str:
     return local_ip_address or "127.0.0.1"
 
 
+def lookup_uk_postcode_details(postcode: str) -> Optional[Dict[str, Any]]:
+    """Return normalized postcode details from postcodes.io for Project Setup."""
+
+    normalized_postcode = " ".join(str(postcode or "").upper().split())
+    if not normalized_postcode:
+        return None
+
+    lookup_url = (
+        "https://api.postcodes.io/postcodes/"
+        f"{quote(normalized_postcode, safe='')}"
+    )
+    try:
+        with urlopen(lookup_url, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    latitude = result.get("latitude")
+    longitude = result.get("longitude")
+    returned_postcode = str(result.get("postcode") or normalized_postcode).strip()
+    try:
+        resolved_latitude = float(latitude)
+        resolved_longitude = float(longitude)
+    except (TypeError, ValueError):
+        return None
+
+    def _clean_part(value: Any) -> str:
+        return str(value or "").strip()
+
+    district = (
+        _clean_part(result.get("admin_district"))
+        or _clean_part(result.get("admin_county"))
+        or _clean_part(result.get("region"))
+    )
+    locality = (
+        _clean_part(result.get("parish"))
+        or _clean_part(result.get("admin_ward"))
+        or district
+    )
+    country = _clean_part(result.get("country"))
+
+    formatted_parts: List[str] = []
+    for candidate in (locality, district, returned_postcode):
+        if not candidate:
+            continue
+        if any(existing.casefold() == candidate.casefold() for existing in formatted_parts):
+            continue
+        formatted_parts.append(candidate)
+    formatted_address = ", ".join(formatted_parts) or returned_postcode
+
+    return {
+        "postcode": returned_postcode,
+        "latitude": resolved_latitude,
+        "longitude": resolved_longitude,
+        "locality": locality,
+        "district": district,
+        "country": country,
+        "formatted_address": formatted_address,
+    }
+
+
+def lookup_uk_postcode_coordinates(postcode: str) -> Optional[Tuple[float, float, str]]:
+    """Return latitude, longitude, and normalized postcode from postcodes.io."""
+
+    postcode_details = lookup_uk_postcode_details(postcode)
+    if postcode_details is None:
+        return None
+    return (
+        float(postcode_details["latitude"]),
+        float(postcode_details["longitude"]),
+        str(postcode_details["postcode"]),
+    )
+
+
 def get_site_induction_url(*, port: int = 8501) -> str:
     """Return the mobile sign-in URL for the current machine."""
 
-    return f"http://{get_local_ip_address()}:{port}/?station=induction"
+    return build_site_induction_url(port=port)
+
+
+def build_site_induction_url(
+    *,
+    public_url: str = "",
+    port: int = 8501,
+    kiosk_mode: bool = False,
+) -> str:
+    """Return the best available induction URL for manager or kiosk use."""
+
+    cleaned_public_url = public_url.strip()
+    if cleaned_public_url and "://" not in cleaned_public_url:
+        cleaned_public_url = f"https://{cleaned_public_url}"
+
+    if cleaned_public_url:
+        parsed_url = urlparse(cleaned_public_url)
+    else:
+        parsed_url = urlparse(f"http://{get_local_ip_address()}:{port}/")
+
+    query_items = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
+    query_items["station"] = "induction"
+    if kiosk_mode:
+        query_items["mode"] = "kiosk"
+    else:
+        query_items.pop("mode", None)
+
+    normalized_path = parsed_url.path or "/"
+    rebuilt_url = parsed_url._replace(
+        path=normalized_path,
+        query=urlencode(query_items),
+    )
+    return urlunparse(rebuilt_url)
+
+
+def build_toolbox_talk_url(
+    topic: str,
+    *,
+    public_url: str = "",
+    port: int = 8501,
+) -> str:
+    """Return the remote mobile UHSF16.2 signing link for one toolbox talk topic."""
+
+    cleaned_public_url = public_url.strip()
+    if cleaned_public_url and "://" not in cleaned_public_url:
+        cleaned_public_url = f"https://{cleaned_public_url}"
+
+    if cleaned_public_url:
+        parsed_url = urlparse(cleaned_public_url)
+    else:
+        parsed_url = urlparse(f"http://{get_local_ip_address()}:{port}/")
+
+    query_items = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
+    query_items["station"] = "tbt"
+    query_items["topic"] = topic.strip()
+
+    normalized_path = parsed_url.path
+    if normalized_path in ("", "/"):
+        normalized_path = ""
+    rebuilt_url = parsed_url._replace(
+        path=normalized_path,
+        query=urlencode(query_items),
+    )
+    return urlunparse(rebuilt_url)
 
 
 def generate_site_induction_poster(
     *,
     site_name: str,
     logo_path: Optional[Path] = None,
+    public_url: str = "",
     port: int = 8501,
 ) -> GeneratedSiteInductionPoster:
     """Build a QR code poster PNG for the mobile site induction kiosk."""
 
     try:
         import qrcode
-        from PIL import Image, ImageDraw, ImageFont, ImageOps
+        from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
     except ImportError as exc:
         raise RuntimeError(
             "qrcode and Pillow are required to generate the induction poster."
         ) from exc
 
-    induction_url = get_site_induction_url(port=port)
+    induction_url = config.PERMANENT_INDUCTION_KIOSK_URL
 
     qr_code = qrcode.QRCode(
         version=None,
@@ -707,76 +1189,334 @@ def generate_site_induction_poster(
 
     poster_width = 1240
     poster_height = 1754
-    poster_image = Image.new("RGB", (poster_width, poster_height), "#FFFFFF")
-    draw = ImageDraw.Draw(poster_image)
-    heading_font = ImageFont.load_default()
-    body_font = ImageFont.load_default()
+    poster_image = Image.new("RGBA", (poster_width, poster_height), "#FFFFFF")
+    heading_font = _load_poster_font(94, bold=True)
+    subheading_font = _load_poster_font(48, bold=True)
+    site_font = _load_poster_font(30, bold=False)
+    step_number_font = _load_poster_font(44, bold=True)
+    step_label_font = _load_poster_font(25, bold=True)
+    body_font = _load_poster_font(22, bold=False)
 
-    current_y = 90
+    border_color = "#18181B"
+    primary_text = "#111827"
+    secondary_text = "#4B5563"
+    accent_magenta = "#D1228E"
+    accent_red = "#E11D48"
+    glass_outline = "#E8AECF"
+
+    background_overlay = Image.new("RGBA", (poster_width, poster_height), (255, 255, 255, 0))
+    background_draw = ImageDraw.Draw(background_overlay)
+    background_draw.ellipse(
+        [(-120, 180), (440, 740)],
+        fill=(242, 198, 225, 120),
+    )
+    background_draw.ellipse(
+        [(poster_width - 500, -120), (poster_width + 140, 460)],
+        fill=(214, 229, 255, 110),
+    )
+    background_draw.ellipse(
+        [(poster_width - 420, poster_height - 620), (poster_width + 120, poster_height - 80)],
+        fill=(255, 220, 226, 105),
+    )
+    background_overlay = background_overlay.filter(ImageFilter.GaussianBlur(radius=48))
+    poster_image.alpha_composite(background_overlay)
+
+    draw = ImageDraw.Draw(poster_image)
+    draw.rounded_rectangle(
+        [(18, 18), (poster_width - 18, poster_height - 18)],
+        radius=26,
+        outline=border_color,
+        width=5,
+    )
+    _draw_glass_panel(
+        poster_image,
+        (56, 48, poster_width - 56, 232),
+        radius=42,
+        fill=(255, 255, 255, 228),
+        outline="#E5E7EB",
+        shadow=(17, 24, 39, 26),
+    )
+    _draw_gradient_line(
+        draw,
+        left=86,
+        right=poster_width - 86,
+        y=224,
+        width=7,
+        start_color=(209, 34, 142),
+        end_color=(225, 29, 72),
+    )
+
+    current_y = 74
+    logo_box = (252, current_y, poster_width - 252, current_y + 112)
+    draw.rounded_rectangle(
+        logo_box,
+        radius=26,
+        fill=(255, 255, 255, 255),
+        outline="#F8FAFC",
+        width=1,
+    )
     if logo_path is not None and logo_path.exists():
         try:
             logo_image = Image.open(logo_path).convert("RGBA")
-            logo_image = ImageOps.contain(logo_image, (440, 180))
+            logo_image = ImageOps.contain(logo_image, (500, 96))
             logo_x = (poster_width - logo_image.width) // 2
-            poster_image.paste(logo_image, (logo_x, current_y), logo_image)
-            current_y += logo_image.height + 50
+            logo_y = logo_box[1] + ((logo_box[3] - logo_box[1]) - logo_image.height) // 2
+            poster_image.paste(logo_image, (logo_x, logo_y), logo_image)
         except OSError:
             pass
+    current_y = 278
 
-    draw.text(
-        (poster_width // 2, current_y),
-        "SCAN TO SIGN IN",
-        fill="#111827",
+    _draw_centered_text(
+        draw,
+        poster_width // 2,
+        current_y,
+        "SITE INDUCTION",
         font=heading_font,
-        anchor="ma",
+        fill=primary_text,
     )
-    current_y += 60
-    draw.text(
-        (poster_width // 2, current_y),
+    current_y += 90
+    _draw_centered_text(
+        draw,
+        poster_width // 2,
+        current_y,
+        "SCAN TO SIGN IN",
+        font=subheading_font,
+        fill=accent_magenta,
+    )
+    current_y += 72
+    _draw_centered_text(
+        draw,
+        poster_width // 2,
+        current_y,
         site_name,
-        fill="#374151",
-        font=body_font,
-        anchor="ma",
+        font=site_font,
+        fill=secondary_text,
     )
-    current_y += 70
+    current_y += 62
 
-    instruction_lines = [
-        "1. Scan QR Code",
-        "2. Complete Induction",
-        "3. Sign on Screen",
+    step_box_top = current_y
+    step_box_height = 182
+    step_gap = 28
+    step_box_width = (poster_width - 180 - (2 * step_gap)) // 3
+    step_labels = [
+        ("1", "SCAN\nQR", "Open your camera"),
+        ("2", "COMPLETE\nFORM", "Enter your details"),
+        ("3", "SIGN\nSCREEN", "Sign to finish"),
     ]
-    for instruction_line in instruction_lines:
-        draw.text(
-            (poster_width // 2, current_y),
-            instruction_line,
-            fill="#111827",
-            font=body_font,
-            anchor="ma",
+    for index, (step_number, step_label, step_caption) in enumerate(step_labels):
+        step_left = 90 + index * (step_box_width + step_gap)
+        step_right = step_left + step_box_width
+        _draw_glass_panel(
+            poster_image,
+            (
+                step_left,
+                step_box_top,
+                step_right,
+                step_box_top + step_box_height,
+            ),
+            radius=28,
+            fill=(255, 255, 255, 176),
+            outline=glass_outline,
+            shadow=(209, 34, 142, 30),
         )
-        current_y += 48
+        _draw_glass_panel(
+            poster_image,
+            (
+                step_left + (step_box_width // 2) - 38,
+                step_box_top + 18,
+                step_left + (step_box_width // 2) + 38,
+                step_box_top + 88,
+            ),
+            radius=22,
+            fill=(255, 255, 255, 212),
+            outline="#F5BAD7",
+            shadow=(17, 24, 39, 20),
+        )
+        draw.text(
+            (step_left + (step_box_width // 2), step_box_top + 53),
+            step_number,
+            fill=accent_red,
+            font=step_number_font,
+            anchor="mm",
+        )
+        _draw_centered_multiline_text(
+            draw,
+            step_left + (step_box_width // 2),
+            step_box_top + 114,
+            step_label,
+            font=step_label_font,
+            fill=primary_text,
+            spacing=2,
+        )
+        _draw_centered_text(
+            draw,
+            step_left + (step_box_width // 2),
+            step_box_top + 156,
+            step_caption,
+            font=body_font,
+            fill=secondary_text,
+        )
+    current_y = step_box_top + step_box_height + 52
 
-    qr_display_size = 560
+    qr_display_size = 680
     qr_display = ImageOps.contain(qr_image, (qr_display_size, qr_display_size))
-    qr_x = (poster_width - qr_display.width) // 2
-    poster_image.paste(qr_display, (qr_x, current_y))
-    current_y += qr_display.height + 60
-
-    draw.text(
-        (poster_width // 2, current_y),
-        induction_url,
-        fill="#6B7280",
-        font=body_font,
-        anchor="ma",
+    qr_panel = (
+        (poster_width - 820) // 2,
+        current_y - 6,
+        (poster_width - 820) // 2 + 820,
+        current_y - 6 + 820,
     )
+    _draw_glass_panel(
+        poster_image,
+        qr_panel,
+        radius=42,
+        fill=(255, 255, 255, 228),
+        outline="#E5E7EB",
+        shadow=(17, 24, 39, 34),
+    )
+    qr_x = (poster_width - qr_display.width) // 2
+    poster_image.paste(qr_display, (qr_x, current_y + 64))
 
     poster_buffer = BytesIO()
-    poster_image.save(poster_buffer, format="PNG")
+    poster_image.convert("RGB").save(poster_buffer, format="PNG")
 
     return GeneratedSiteInductionPoster(
         induction_url=induction_url,
         qr_code_png=qr_buffer.getvalue(),
         poster_png=poster_buffer.getvalue(),
     )
+
+
+def _load_poster_font(size: int, *, bold: bool) -> Any:
+    """Return a poster font with a sensible macOS fallback chain."""
+
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+
+    candidate_font_paths = [
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+    ]
+    for candidate_font_path in candidate_font_paths:
+        try:
+            return ImageFont.truetype(candidate_font_path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_centered_text(
+    draw: Any,
+    x: int,
+    y: int,
+    text: str,
+    *,
+    font: Any,
+    fill: str,
+) -> None:
+    """Draw one centered text line on the poster."""
+
+    draw.text((x, y), text, fill=fill, font=font, anchor="ma")
+
+
+def _draw_centered_multiline_text(
+    draw: Any,
+    x: int,
+    y: int,
+    text: str,
+    *,
+    font: Any,
+    fill: str,
+    spacing: int = 4,
+) -> None:
+    """Draw centered multiline text using its rendered bounding box."""
+
+    bounding_box = draw.multiline_textbbox(
+        (0, 0),
+        text,
+        font=font,
+        spacing=spacing,
+        align="center",
+    )
+    text_width = bounding_box[2] - bounding_box[0]
+    text_height = bounding_box[3] - bounding_box[1]
+    draw.multiline_text(
+        (x - (text_width / 2), y - (text_height / 2)),
+        text,
+        fill=fill,
+        font=font,
+        spacing=spacing,
+        align="center",
+    )
+
+
+def _draw_gradient_line(
+    draw: Any,
+    *,
+    left: int,
+    right: int,
+    y: int,
+    width: int,
+    start_color: Tuple[int, int, int],
+    end_color: Tuple[int, int, int],
+) -> None:
+    """Draw a simple left-to-right gradient accent line."""
+
+    span = max(1, right - left)
+    for offset in range(span):
+        ratio = offset / span
+        red = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
+        green = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
+        blue = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
+        draw.line(
+            [(left + offset, y), (left + offset, y)],
+            fill=(red, green, blue),
+            width=width,
+        )
+
+
+def _draw_glass_panel(
+    image: Any,
+    bounds: Tuple[int, int, int, int],
+    *,
+    radius: int,
+    fill: Tuple[int, int, int, int],
+    outline: str,
+    shadow: Tuple[int, int, int, int],
+) -> None:
+    """Draw a soft glassmorphic rounded panel with a subtle shadow."""
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    left, top, right, bottom = bounds
+    shadow_layer = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    shadow_draw = ImageDraw.Draw(shadow_layer)
+    shadow_draw.rounded_rectangle(
+        [(left + 6, top + 14), (right + 6, bottom + 16)],
+        radius=radius,
+        fill=shadow,
+    )
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=18))
+    image.alpha_composite(shadow_layer)
+
+    panel_layer = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    panel_draw = ImageDraw.Draw(panel_layer)
+    panel_draw.rounded_rectangle(
+        [(left, top), (right, bottom)],
+        radius=radius,
+        fill=fill,
+        outline=outline,
+        width=2,
+    )
+    panel_draw.line(
+        [(left + 26, top + 20), (right - 26, top + 20)],
+        fill=(255, 255, 255, 168),
+        width=2,
+    )
+    image.alpha_composite(panel_layer)
 
 
 def build_site_worker_roster(
@@ -836,7 +1576,10 @@ def get_waste_kpi_sheet_metadata(
 
     candidate_metadata: List[Tuple[int, float, WasteKpiSheetMetadata]] = []
     for workbook_path in sorted(_discover_waste_kpi_workbooks()):
-        metadata = _read_waste_kpi_sheet_metadata(workbook_path)
+        try:
+            metadata = _read_waste_kpi_sheet_metadata(workbook_path)
+        except RuntimeError:
+            continue
         score = _score_waste_kpi_sheet_metadata(
             metadata,
             site_name=site_name,
@@ -1153,6 +1896,7 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
     induction_directory = config.INDUCTION_DIR
     rams_destination = config.RAMS_DESTINATION
     coshh_destination = config.COSHH_DESTINATION
+    file_3_review_directory = config.FILE_3_REVIEW_DIR
     file_3_output_directory = config.FILE_3_OUTPUT_DIR
 
     inbox.mkdir(parents=True, exist_ok=True)
@@ -1164,6 +1908,7 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
     induction_directory.mkdir(parents=True, exist_ok=True)
     rams_destination.mkdir(parents=True, exist_ok=True)
     coshh_destination.mkdir(parents=True, exist_ok=True)
+    file_3_review_directory.mkdir(parents=True, exist_ok=True)
     file_3_output_directory.mkdir(parents=True, exist_ok=True)
 
     attendance_engine = IngestionEngine(repository)
@@ -1396,6 +2141,30 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
                 )
                 continue
 
+            if _looks_like_file_3_review_hold_source(source_path, source_text):
+                destination_path = _move_file(source_path, file_3_review_directory)
+                repository.index_file(
+                    file_name=destination_path.name,
+                    file_path=destination_path,
+                    file_category=_resolve_safety_file_category(
+                        "safety_review_pdf",
+                        destination_path,
+                    ),
+                    file_group=FileGroup.FILE_3,
+                    site_name=_load_workspace_project_setup().get("current_site_name"),
+                )
+                filed_assets.append(
+                    FiledAsset(
+                        original_path=source_path,
+                        destination_path=destination_path,
+                        file_category=_resolve_safety_file_category(
+                            "safety_review_pdf",
+                            destination_path,
+                        ),
+                    )
+                )
+                continue
+
         if source_path.suffix.lower() in {".xls", ".xlsx"}:
             destination_path = _move_file(source_path, waste_reports_destination)
             repository.index_file(
@@ -1491,8 +2260,31 @@ def _default_hired_by_for_project(project_setup: Mapping[str, str]) -> str:
 def _is_coshh_safety_source(source_path: Path, source_text: str = "") -> bool:
     """Return True when one safety source belongs in the File 3 COSHH inventory."""
 
-    lowered_text = f"{source_path.name} {source_text}".casefold()
-    return any(keyword in lowered_text for keyword in COSHH_KEYWORDS)
+    lowered_name = source_path.stem.casefold()
+    if any(marker in lowered_name for marker in FILE_3_EXCLUDED_RAMS_FILENAME_MARKERS):
+        return False
+
+    lowered_text = source_text.casefold()
+    if "construction phase plan" in lowered_text or "uhsf15.1" in lowered_name:
+        return False
+    if any(_file_3_contains_keyword(lowered_name, keyword) for keyword in COSHH_KEYWORDS):
+        return True
+    if any(_file_3_contains_keyword(lowered_name, keyword) for keyword in RAMS_KEYWORDS):
+        return False
+
+    fallback_text = _build_file_3_fallback_text(source_text).casefold()
+    strong_signal_count = sum(
+        1
+        for label in FILE_3_STRONG_COSHH_TEXT_LABELS
+        if label in fallback_text or label in lowered_text
+    )
+    if strong_signal_count < 3 and not any(
+        _file_3_contains_keyword(lowered_text, keyword) for keyword in COSHH_KEYWORDS
+    ):
+        return False
+    if _is_rams_safety_source(source_path, source_text):
+        return False
+    return True
 
 
 def _is_rams_safety_source(source_path: Path, source_text: str = "") -> bool:
@@ -1502,12 +2294,39 @@ def _is_rams_safety_source(source_path: Path, source_text: str = "") -> bool:
     if "register" in lowered_text:
         return False
     lowered_name = source_path.stem.casefold()
-    if (
-        any(marker in lowered_name for marker in FILE_3_EXCLUDED_RAMS_FILENAME_MARKERS)
-        and not any(label in source_text.casefold() for label in FILE_3_TITLE_ANCHOR_LABELS)
-    ):
+    if any(marker in lowered_name for marker in FILE_3_EXCLUDED_RAMS_FILENAME_MARKERS):
         return False
-    return any(keyword in lowered_text for keyword in RAMS_KEYWORDS)
+    if "construction phase plan" in lowered_text or "uhsf15.1" in lowered_name:
+        return False
+
+    fallback_text = _build_file_3_fallback_text(source_text).casefold()
+    strong_coshh_signal_count = sum(
+        1
+        for label in FILE_3_STRONG_COSHH_TEXT_LABELS
+        if label in fallback_text or label in lowered_text
+    )
+    if any(_file_3_contains_keyword(lowered_name, keyword) for keyword in RAMS_KEYWORDS):
+        return True
+
+    explicit_rams_signal = any(
+        _file_3_contains_keyword(lowered_text, keyword)
+        or _file_3_contains_keyword(fallback_text, keyword)
+        for keyword in RAMS_KEYWORDS
+    )
+    rams_layout_signal = any(
+        label in fallback_text
+        for label in (
+            "brief description of work",
+            "job/activity/sequence",
+            "hazards and control procedures",
+            "combined risk assessment",
+        )
+    )
+    if not explicit_rams_signal and not rams_layout_signal:
+        return False
+    if strong_coshh_signal_count >= 3 and not any(keyword in lowered_name for keyword in RAMS_KEYWORDS):
+        return False
+    return True
 
 
 def _is_coshh_pdf(source_path: Path, pdf_text: str = "") -> bool:
@@ -1539,7 +2358,11 @@ def _extract_text_after_labels(text: str, labels: Iterable[str]) -> str:
         for line in text.splitlines()
         if _normalize_text(line)
     ]
-    labels_list = [label for label in labels if label]
+    labels_list = sorted(
+        [label for label in labels if label],
+        key=len,
+        reverse=True,
+    )
 
     for index, line in enumerate(normalized_lines):
         lowered_line = line.casefold()
@@ -1555,11 +2378,26 @@ def _extract_text_after_labels(text: str, labels: Iterable[str]) -> str:
             )
             if same_line_match is not None:
                 candidate_value = _clean_safety_value(same_line_match.group("value"))
-                if candidate_value and candidate_value.casefold() != lowered_label:
+                if (
+                    candidate_value
+                    and candidate_value.casefold() != lowered_label
+                    and re.fullmatch(
+                        r"(?:\(?s\)?|&\s*address:?|address:?|name\s*&?)",
+                        candidate_value.casefold(),
+                    )
+                    is None
+                ):
                     return candidate_value
 
             if index + 1 < len(normalized_lines):
-                next_line = _clean_safety_value(normalized_lines[index + 1])
+                next_index = index + 1
+                next_line = _clean_safety_value(normalized_lines[next_index])
+                while next_index + 1 < len(normalized_lines) and (
+                    next_line.startswith("&")
+                    or (len(next_line) <= 20 and next_line.endswith(":"))
+                ):
+                    next_index += 1
+                    next_line = _clean_safety_value(normalized_lines[next_index])
                 if next_line and not any(
                     other_label.casefold() in next_line.casefold()
                     for other_label in labels_list
@@ -1581,12 +2419,46 @@ def _extract_text_after_labels(text: str, labels: Iterable[str]) -> str:
     return ""
 
 
+def _file_3_contains_keyword(text: str, keyword: str) -> bool:
+    """Return True when one keyword appears as a real phrase inside File 3 text."""
+
+    lowered_text = text.casefold()
+    lowered_keyword = keyword.casefold()
+    if " " in lowered_keyword:
+        return lowered_keyword in lowered_text
+    return re.search(rf"\b{re.escape(lowered_keyword)}\b", lowered_text) is not None
+
+
 def _clean_safety_value(value: str) -> str:
     """Normalize one extracted File 3 field value."""
 
-    cleaned_value = re.sub(r"\s+", " ", value).strip(" :;-")
-    cleaned_value = re.sub(r"\s+\|\s+", " ", cleaned_value)
+    cleaned_value = re.sub(r"\s+\|\s+", " ", value)
+    cleaned_value = re.sub(r"\|+", " ", cleaned_value)
+    cleaned_value = re.sub(r"\s+", " ", cleaned_value).strip(" :;|-")
+    cleaned_value = _collapse_repeated_safety_phrase(cleaned_value)
     return cleaned_value
+
+
+def _collapse_repeated_safety_phrase(value: str) -> str:
+    """Collapse obvious OCR-style repeated phrases into a single clean phrase."""
+
+    words = value.split()
+    if len(words) < 6:
+        return value
+
+    max_chunk_size = min(12, len(words) // 2)
+    for chunk_size in range(2, max_chunk_size + 1):
+        chunk_words = words[:chunk_size]
+        repeated = chunk_words * max(2, len(words) // chunk_size)
+        if repeated[: len(words)] == words and len(words) >= chunk_size * 2:
+            return " ".join(chunk_words)
+
+    if len(words) >= 9:
+        first_half = words[: len(words) // 2]
+        second_half = words[len(words) // 2 :]
+        if first_half[: len(second_half)] == second_half[: len(first_half)]:
+            return " ".join(first_half)
+    return value
 
 
 def _split_file_3_filename_segments(source_path: Path) -> List[str]:
@@ -1746,6 +2618,143 @@ def _file_3_looks_like_company_segment(segment: str) -> bool:
     return compact_segment.isalpha() and 2 <= len(compact_segment) <= 6
 
 
+def _file_3_normalize_company_match_text(value: str) -> str:
+    """Return a punctuation-light string for tolerant company-name matching."""
+
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _file_3_matches_company_name(candidate_name: str, haystack: str) -> bool:
+    """Return True when one company name appears in a tolerant text view."""
+
+    normalized_candidate = _file_3_normalize_company_match_text(candidate_name)
+    normalized_haystack = _file_3_normalize_company_match_text(haystack)
+    if not normalized_candidate or not normalized_haystack:
+        return False
+    if f" {normalized_candidate} " in f" {normalized_haystack} ":
+        return True
+
+    trimmed_candidate = re.sub(
+        r"\b(?:ltd|limited|llp|plc|group|uk)\b",
+        " ",
+        normalized_candidate,
+    )
+    trimmed_candidate = re.sub(r"\s+", " ", trimmed_candidate).strip()
+    return bool(trimmed_candidate) and (
+        f" {trimmed_candidate} " in f" {normalized_haystack} "
+    )
+
+
+def _file_3_looks_like_person_name(value: str) -> bool:
+    """Return True when one extracted value looks more like a person than a company."""
+
+    cleaned_value = _clean_safety_value(value)
+    if not cleaned_value or any(character.isdigit() for character in cleaned_value):
+        return False
+    words = cleaned_value.split()
+    if len(words) not in {2, 3}:
+        return False
+    if words[0].casefold() not in FILE_3_COMMON_PERSON_FIRST_NAMES:
+        return False
+    return all(word[:1].isupper() and word[1:].islower() for word in words if word)
+
+
+def _file_3_is_suspicious_company_value(value: str) -> bool:
+    """Return True when one extracted company value looks like OCR or label noise."""
+
+    cleaned_value = _clean_safety_value(value)
+    if not cleaned_value:
+        return True
+    if _file_3_is_blacklisted_contractor_value(cleaned_value):
+        return True
+    if _file_3_looks_like_person_name(cleaned_value):
+        return True
+
+    lowered_value = cleaned_value.casefold()
+    if lowered_value in FILE_3_SUSPICIOUS_COMPANY_LABELS:
+        return True
+    if any(token in cleaned_value for token in {"@", "http://", "https://"}):
+        return True
+    if cleaned_value.startswith(("/", "|", ".")):
+        return True
+    if re.match(r"^\d+(?:\.\d+)?\s", cleaned_value) is not None:
+        return True
+    if "main contractor" in lowered_value or "signature" in lowered_value:
+        return True
+
+    value_words = re.findall(r"[a-z0-9]+", lowered_value)
+    if not value_words:
+        return True
+    if len(value_words) == 1:
+        single_word = value_words[0]
+        if (
+            len(single_word) <= 2
+            or single_word.isdigit()
+            or re.fullmatch(r"(?:ec|ms|w)\d+[a-z]*", single_word) is not None
+        ):
+            return True
+    return False
+
+
+def _file_3_is_suspicious_activity_value(
+    value: str,
+    *,
+    company_name: str = "",
+    reference: str = "",
+) -> bool:
+    """Return True when one extracted activity/title looks like noise."""
+
+    cleaned_value = _clean_safety_value(value)
+    if not cleaned_value:
+        return True
+    if _file_3_is_blacklisted_contractor_value(cleaned_value):
+        return True
+    if _file_3_looks_like_person_name(cleaned_value):
+        return True
+
+    lowered_value = cleaned_value.casefold()
+    if any(token in cleaned_value for token in {"@", "http://", "https://"}):
+        return True
+    if lowered_value in {"review", "review form", "rams", "method statement"}:
+        return True
+    if "signature" in lowered_value or lowered_value.startswith("/sequence"):
+        return True
+    if company_name and lowered_value == company_name.casefold():
+        return True
+    if reference and lowered_value == reference.casefold():
+        return True
+
+    value_words = re.findall(r"[a-z0-9]+", lowered_value)
+    if not value_words:
+        return True
+    if len(value_words) == 1:
+        single_word = value_words[0]
+        if (
+            single_word.isdigit()
+            or re.fullmatch(r"(?:ec|ms|w)\d+[a-z]*", single_word) is not None
+        ):
+            return True
+    return False
+
+
+def _extract_file_3_company_from_text(source_text: str) -> str:
+    """Return a best-effort company line from the raw File 3 text body."""
+
+    preferred_lines: List[str] = []
+    for raw_line in source_text[:1200].splitlines():
+        cleaned_line = _clean_safety_value(_normalize_text(raw_line))
+        if not cleaned_line or len(cleaned_line) > 80:
+            continue
+        if _file_3_is_suspicious_company_value(cleaned_line):
+            continue
+        if _file_3_looks_like_company_segment(cleaned_line):
+            preferred_lines.append(cleaned_line)
+
+    if preferred_lines:
+        return preferred_lines[0]
+    return ""
+
+
 def _extract_file_3_company_from_filename(
     source_path: Path,
     *,
@@ -1760,7 +2769,7 @@ def _extract_file_3_company_from_filename(
         if (
             candidate_name
             and not _file_3_is_blacklisted_contractor_value(candidate_name)
-            and candidate_name.casefold() in lowered_stem
+            and _file_3_matches_company_name(candidate_name, lowered_stem)
         )
     ]
     if matched_names:
@@ -1769,12 +2778,16 @@ def _extract_file_3_company_from_filename(
     segments = _split_file_3_filename_segments(source_path)
     for segment in segments:
         stripped_segment = _strip_file_3_safety_markers(segment)
-        if not stripped_segment or _file_3_is_blacklisted_contractor_value(stripped_segment):
+        if (
+            not stripped_segment
+            or _file_3_is_blacklisted_contractor_value(stripped_segment)
+            or _file_3_is_suspicious_company_value(stripped_segment)
+        ):
             continue
         stripped_matches = [
             candidate_name
             for candidate_name in candidate_names
-            if candidate_name and candidate_name.casefold() in stripped_segment.casefold()
+            if candidate_name and _file_3_matches_company_name(candidate_name, stripped_segment)
         ]
         if stripped_matches:
             return max(stripped_matches, key=len)
@@ -1788,6 +2801,7 @@ def _extract_file_3_company_from_filename(
             for segment in segments[:safety_label_index]
             if not _file_3_is_version_segment(segment)
             and not _file_3_is_blacklisted_contractor_value(segment)
+            and not _file_3_is_suspicious_company_value(segment)
         ]
         if company_segments:
             return _clean_safety_value(" ".join(company_segments))
@@ -1795,7 +2809,10 @@ def _extract_file_3_company_from_filename(
         for segment in segments[:safety_label_index]:
             if _file_3_is_version_segment(segment):
                 continue
-            if _file_3_is_blacklisted_contractor_value(segment):
+            if (
+                _file_3_is_blacklisted_contractor_value(segment)
+                or _file_3_is_suspicious_company_value(segment)
+            ):
                 continue
             return segment
         return ""
@@ -1803,7 +2820,10 @@ def _extract_file_3_company_from_filename(
     for segment in segments:
         if _file_3_is_version_segment(segment) or _file_3_is_safety_label_segment(segment):
             continue
-        if _file_3_is_blacklisted_contractor_value(segment):
+        if (
+            _file_3_is_blacklisted_contractor_value(segment)
+            or _file_3_is_suspicious_company_value(segment)
+        ):
             continue
         if _file_3_looks_like_company_segment(segment):
             return segment
@@ -1811,7 +2831,10 @@ def _extract_file_3_company_from_filename(
         for segment in segments:
             if _file_3_is_version_segment(segment) or _file_3_is_safety_label_segment(segment):
                 continue
-            if _file_3_is_blacklisted_contractor_value(segment):
+            if (
+                _file_3_is_blacklisted_contractor_value(segment)
+                or _file_3_is_suspicious_company_value(segment)
+            ):
                 continue
             return segment
     return ""
@@ -1883,6 +2906,10 @@ def _extract_file_3_title_from_filename(
             stripped_segments.append(stripped_segment)
         filtered_segments = stripped_segments
 
+    if not filtered_segments:
+        return ""
+    while filtered_segments and re.fullmatch(r"\d+[a-zA-Z]*", filtered_segments[0]) is not None:
+        filtered_segments.pop(0)
     if not filtered_segments:
         return ""
     return _clean_safety_value(" ".join(filtered_segments))
@@ -2032,15 +3059,15 @@ def _extract_coshh_substance_name(pdf_text: str, source_path: Path) -> str:
     )
     if extracted_value and (
         not filename_substance or len(filename_substance.split()) <= 1
-    ):
+    ) and not _file_3_is_suspicious_activity_value(extracted_value):
         return extracted_value
     if filename_substance and not re.search(
         r"\b(?:coshh|sds|assessment|sheet)\b",
         filename_substance,
         re.IGNORECASE,
-    ):
+    ) and not _file_3_is_suspicious_activity_value(filename_substance):
         return filename_substance
-    if extracted_value:
+    if extracted_value and not _file_3_is_suspicious_activity_value(extracted_value):
         return extracted_value
 
     fallback = re.sub(
@@ -2049,7 +3076,9 @@ def _extract_coshh_substance_name(pdf_text: str, source_path: Path) -> str:
         source_path.stem.replace("_", " ").replace("-", " "),
     )
     cleaned_fallback = _clean_safety_value(fallback)
-    return cleaned_fallback or source_path.stem
+    if not _file_3_is_suspicious_activity_value(cleaned_fallback):
+        return cleaned_fallback
+    return source_path.stem
 
 
 def _extract_coshh_supplier(pdf_text: str, source_path: Optional[Path] = None) -> str:
@@ -2062,14 +3091,22 @@ def _extract_coshh_supplier(pdf_text: str, source_path: Optional[Path] = None) -
             supplier_candidate = _clean_safety_value(
                 " ".join(filename_segments[:safety_label_index])
             )
-            if supplier_candidate:
+            if supplier_candidate and not _file_3_is_suspicious_company_value(
+                supplier_candidate
+            ):
                 return supplier_candidate
 
     extracted_value = _extract_text_after_labels(
         _build_file_3_fallback_text(pdf_text),
         COSHH_SUPPLIER_LABELS,
     )
-    return extracted_value or "Unknown Supplier"
+    if extracted_value and not _file_3_is_suspicious_company_value(extracted_value):
+        return extracted_value
+
+    text_company = _extract_file_3_company_from_text(pdf_text)
+    if text_company:
+        return text_company
+    return "Unknown Supplier"
 
 
 def _extract_coshh_use(pdf_text: str) -> str:
@@ -2112,21 +3149,30 @@ def _extract_rams_activity_description(
         FILE_3_TITLE_ANCHOR_LABELS,
         max_length=160,
     )
-    if anchored_activity:
+    if anchored_activity and not _file_3_is_suspicious_activity_value(
+        anchored_activity,
+        company_name=company_name,
+    ):
         return anchored_activity
 
     filename_activity = _extract_file_3_title_from_filename(
         source_path,
         company_name=company_name,
     )
-    if filename_activity:
+    if filename_activity and not _file_3_is_suspicious_activity_value(
+        filename_activity,
+        company_name=company_name,
+    ):
         return filename_activity
 
     extracted_value = _extract_text_after_labels(
         _build_file_3_fallback_text(pdf_text),
         RAMS_ACTIVITY_LABELS,
     )
-    if extracted_value:
+    if extracted_value and not _file_3_is_suspicious_activity_value(
+        extracted_value,
+        company_name=company_name,
+    ):
         return extracted_value
 
     fallback = re.sub(
@@ -2135,6 +3181,11 @@ def _extract_rams_activity_description(
         source_path.stem.replace("_", " ").replace("-", " "),
     )
     cleaned_fallback = _clean_safety_value(fallback)
+    if _file_3_is_suspicious_activity_value(
+        cleaned_fallback,
+        company_name=company_name,
+    ):
+        return "RAMS Document"
     return cleaned_fallback or "RAMS Document"
 
 
@@ -2153,7 +3204,7 @@ def _guess_file_3_contractor_name(
         FILE_3_COMPANY_ANCHOR_LABELS,
         max_length=120,
     )
-    if anchored_company:
+    if anchored_company and not _file_3_is_suspicious_company_value(anchored_company):
         return anchored_company
 
     candidate_names = _file_3_candidate_company_names(
@@ -2167,19 +3218,23 @@ def _guess_file_3_contractor_name(
     if filename_company:
         return filename_company
 
-    search_text = _build_file_3_fallback_text(pdf_text).casefold()
+    search_text = pdf_text
     matched_names = [
         candidate_name
         for candidate_name in candidate_names
         if (
-            candidate_name.casefold() in search_text
+            _file_3_matches_company_name(candidate_name, search_text)
             and not _file_3_is_blacklisted_contractor_value(candidate_name)
         )
     ]
     if matched_names:
         return max(matched_names, key=len)
 
-    if fallback.strip() and not _file_3_is_blacklisted_contractor_value(fallback.strip()):
+    text_company = _extract_file_3_company_from_text(pdf_text)
+    if text_company:
+        return text_company
+
+    if fallback.strip() and not _file_3_is_suspicious_company_value(fallback.strip()):
         return fallback.strip()
 
     filename_tokens = _split_file_3_filename_segments(source_path)
@@ -2201,6 +3256,7 @@ def _upsert_coshh_document_from_source(
     source_path: Path,
     *,
     source_text: Optional[str] = None,
+    site_name_override: Optional[str] = None,
 ) -> Optional[COSHHDocument]:
     """Create or update one File 3 COSHH record from a synced safety source."""
 
@@ -2211,7 +3267,11 @@ def _upsert_coshh_document_from_source(
         return None
 
     project_setup = _load_workspace_project_setup()
-    site_name = project_setup.get("current_site_name") or _infer_default_site_name(repository)
+    site_name = (
+        site_name_override
+        or project_setup.get("current_site_name")
+        or _infer_default_site_name(repository)
+    )
     supplier_name = _extract_coshh_supplier(resolved_source_text, source_path)
     contractor_name = _guess_file_3_contractor_name(
         repository,
@@ -2271,6 +3331,7 @@ def _upsert_rams_document_from_source(
     source_path: Path,
     *,
     source_text: Optional[str] = None,
+    site_name_override: Optional[str] = None,
 ) -> Optional[RAMSDocument]:
     """Create or update one File 3 RAMS record from a synced safety source."""
 
@@ -2281,7 +3342,11 @@ def _upsert_rams_document_from_source(
         return None
 
     project_setup = _load_workspace_project_setup()
-    site_name = project_setup.get("current_site_name") or _infer_default_site_name(repository)
+    site_name = (
+        site_name_override
+        or project_setup.get("current_site_name")
+        or _infer_default_site_name(repository)
+    )
     contractor_name = _guess_file_3_contractor_name(
         repository,
         site_name=site_name,
@@ -2374,6 +3439,173 @@ def _sync_existing_safety_sources(
                 else None
             ),
         )
+
+
+def _looks_like_file_3_review_hold_source(source_path: Path, source_text: str = "") -> bool:
+    """Return True when one source looks safety-related but should be held out of registers."""
+
+    lowered_text = f"{source_path.name} {source_text}".casefold()
+    return any(keyword in lowered_text for keyword in FILE_3_REVIEW_HOLD_KEYWORDS)
+
+
+def rebuild_file_3_safety_inventory(
+    repository: DocumentRepository,
+    *,
+    site_name: Optional[str] = None,
+) -> RebuiltSafetyInventoryResult:
+    """Rebuild File 3 RAMS/COSHH records from the filed source documents."""
+
+    repository.create_schema()
+
+    active_site_name = (
+        site_name
+        or _load_workspace_project_setup().get("current_site_name")
+        or _infer_default_site_name(repository)
+    )
+    for directory in (
+        config.RAMS_DESTINATION,
+        config.COSHH_DESTINATION,
+        config.FILE_3_REVIEW_DIR,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    for document_type in (RAMSDocument.document_type, COSHHDocument.document_type):
+        for document in repository.list_documents(
+            document_type=document_type,
+            site_name=active_site_name,
+        ):
+            repository.delete_document(document.doc_id)
+
+    source_paths = sorted(
+        {
+            source_path.resolve()
+            for destination_directory in (
+                config.RAMS_DESTINATION,
+                config.COSHH_DESTINATION,
+                config.FILE_3_REVIEW_DIR,
+            )
+            for source_path in destination_directory.iterdir()
+            if source_path.is_file()
+            and source_path.suffix.lower() in FILE_3_SAFETY_SOURCE_SUFFIXES
+        },
+        key=lambda path: (path.parent.name.casefold(), path.name.casefold()),
+    )
+
+    moved_file_names: List[str] = []
+    ignored_file_names: List[str] = []
+    rams_records = 0
+    coshh_records = 0
+    moved_files = 0
+
+    for source_path in source_paths:
+        source_text = _safe_extract_safety_source_text(source_path)
+
+        if _is_coshh_safety_source(source_path, source_text):
+            destination_directory = config.COSHH_DESTINATION
+            base_category = "coshh_pdf"
+            created_document = _upsert_coshh_document_from_source(
+                repository,
+                source_path,
+                source_text=source_text,
+                site_name_override=active_site_name,
+            )
+            coshh_records += 1
+        elif _is_rams_safety_source(source_path, source_text):
+            destination_directory = config.RAMS_DESTINATION
+            base_category = "rams_pdf"
+            created_document = _upsert_rams_document_from_source(
+                repository,
+                source_path,
+                source_text=source_text,
+                site_name_override=active_site_name,
+            )
+            rams_records += 1
+        else:
+            destination_directory = config.FILE_3_REVIEW_DIR
+            base_category = "safety_review_pdf"
+            created_document = None
+            ignored_file_names.append(source_path.name)
+
+        target_path = source_path
+        if source_path.parent != destination_directory:
+            target_path = _move_file(source_path, destination_directory)
+            moved_files += 1
+            moved_file_names.append(target_path.name)
+
+        if created_document is not None and target_path != source_path:
+            created_document = (
+                _upsert_coshh_document_from_source(
+                    repository,
+                    target_path,
+                    source_text=source_text,
+                    site_name_override=active_site_name,
+                )
+                if isinstance(created_document, COSHHDocument)
+                else _upsert_rams_document_from_source(
+                    repository,
+                    target_path,
+                    source_text=source_text,
+                    site_name_override=active_site_name,
+                )
+            )
+
+        repository.index_file(
+            file_name=target_path.name,
+            file_path=target_path,
+            file_category=_resolve_safety_file_category(base_category, target_path),
+            file_group=FileGroup.FILE_3,
+            site_name=active_site_name,
+            related_doc_id=created_document.doc_id if created_document is not None else None,
+        )
+
+    return RebuiltSafetyInventoryResult(
+        total_sources=len(source_paths),
+        rams_records=rams_records,
+        coshh_records=coshh_records,
+        moved_files=moved_files,
+        ignored_sources=len(ignored_file_names),
+        moved_file_names=tuple(sorted(moved_file_names, key=str.casefold)),
+        ignored_file_names=tuple(sorted(ignored_file_names, key=str.casefold)),
+    )
+
+
+def park_file_3_document_for_review(
+    repository: DocumentRepository,
+    doc_id: str,
+) -> Tuple[Path, ...]:
+    """Move one live File 3 source into Needs Review and remove its register row."""
+
+    repository.create_schema()
+    document = repository.get(doc_id)
+    if not isinstance(document, (RAMSDocument, COSHHDocument)):
+        raise ValueError("Only RAMS and COSHH documents can be parked for File 3 review.")
+
+    indexed_files = repository.list_indexed_files(related_doc_id=doc_id)
+    moved_paths: List[Path] = []
+    config.FILE_3_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+    for indexed_file in indexed_files:
+        current_path = indexed_file.file_path
+        if not current_path.exists():
+            continue
+        target_path = current_path
+        if current_path.parent != config.FILE_3_REVIEW_DIR:
+            target_path = _move_file(current_path, config.FILE_3_REVIEW_DIR)
+        moved_paths.append(target_path)
+
+    repository.delete_document(doc_id)
+
+    for moved_path in moved_paths:
+        repository.index_file(
+            file_name=moved_path.name,
+            file_path=moved_path,
+            file_category=_resolve_safety_file_category("safety_review_pdf", moved_path),
+            file_group=FileGroup.FILE_3,
+            site_name=document.site_name,
+            related_doc_id=None,
+        )
+
+    return tuple(moved_paths)
 
 
 def _safe_extract_safety_source_text(source_path: Path) -> str:
@@ -2934,22 +4166,34 @@ def _discover_docx_template_tags(template_path: Path) -> FrozenSet[str]:
     return frozenset(placeholders)
 
 
-@lru_cache(maxsize=4)
-def get_valid_template_tags() -> FrozenSet[str]:
-    """Return the valid placeholder tags present in the approved File 2 template."""
+@lru_cache(maxsize=8)
+def _get_valid_template_tags_for_path(template_path_str: str) -> FrozenSet[str]:
+    """Return valid placeholder tags for one specific weekly template path."""
 
-    template_path = TemplateRegistry.resolve_template_path(WeeklySiteCheck.document_type)
+    template_path = Path(template_path_str)
     with tempfile.TemporaryDirectory() as temp_dir:
         repaired_template_path = Path(temp_dir) / "weekly-site-check-template.docx"
         _repair_weekly_site_check_template(template_path, repaired_template_path)
         return _discover_docx_template_tags(repaired_template_path)
 
 
-@lru_cache(maxsize=4)
-def get_weekly_site_check_row_definitions() -> Tuple[WeeklySiteCheckRowDefinition, ...]:
-    """Return the 31 row definitions extracted from the approved File 2 template."""
+def get_valid_template_tags() -> FrozenSet[str]:
+    """Return the valid placeholder tags present in the approved File 2 template."""
 
     template_path = TemplateRegistry.resolve_template_path(WeeklySiteCheck.document_type)
+    return _get_valid_template_tags_for_path(str(template_path.resolve()))
+
+
+get_valid_template_tags.cache_clear = _get_valid_template_tags_for_path.cache_clear  # type: ignore[attr-defined]
+
+
+@lru_cache(maxsize=8)
+def _get_weekly_site_check_row_definitions_for_path(
+    template_path_str: str,
+) -> Tuple[WeeklySiteCheckRowDefinition, ...]:
+    """Return row definitions for one specific weekly template path."""
+
+    template_path = Path(template_path_str)
     document = Document(template_path)
     if not document.tables:
         raise ValueError(f"Weekly site check template has no tables: {template_path}")
@@ -2970,9 +4214,22 @@ def get_weekly_site_check_row_definitions() -> Tuple[WeeklySiteCheckRowDefinitio
                 row_number=row_number,
                 section=section,
                 prompt=prompt,
+                frequency=get_weekly_site_check_frequency_for_row(row_number),
             )
         )
     return tuple(row_definitions)
+
+
+def get_weekly_site_check_row_definitions() -> Tuple[WeeklySiteCheckRowDefinition, ...]:
+    """Return the 31 row definitions extracted from the approved File 2 template."""
+
+    template_path = TemplateRegistry.resolve_template_path(WeeklySiteCheck.document_type)
+    return _get_weekly_site_check_row_definitions_for_path(str(template_path.resolve()))
+
+
+get_weekly_site_check_row_definitions.cache_clear = (  # type: ignore[attr-defined]
+    _get_weekly_site_check_row_definitions_for_path.cache_clear
+)
 
 
 def _repair_weekly_site_check_template(
@@ -3046,7 +4303,7 @@ def _rewrite_inline_table_row_loops(member_xml: str) -> str:
             flags=re.IGNORECASE,
         )
         end_match = re.search(
-            r"\{%\s*tr\s+endfor\s*%\}",
+            r"\{%\s*(?:tr\s+endfor|endtr)\s*%\}",
             row_xml,
             flags=re.IGNORECASE,
         )
@@ -3061,7 +4318,7 @@ def _rewrite_inline_table_row_loops(member_xml: str) -> str:
             flags=re.IGNORECASE,
         )
         cleaned_row = re.sub(
-            r"\s*\{%\s*tr\s+endfor\s*%\}",
+            r"\s*\{%\s*(?:tr\s+endfor|endtr)\s*%\}",
             "",
             cleaned_row,
             count=1,
@@ -3123,6 +4380,98 @@ def _stamp_weekly_site_check_header(
     document.save(output_path)
 
 
+def _build_export_ready_weekly_site_check(
+    weekly_site_check: WeeklySiteCheck,
+) -> WeeklySiteCheck:
+    """Return a copy with signed blank days carried forward from the previous day."""
+
+    export_ready_check = deepcopy(weekly_site_check)
+    row_definitions = get_weekly_site_check_row_definitions()
+    valid_template_tags = set(get_valid_template_tags())
+
+    for day_index in range(1, len(SITE_CHECK_WEEKDAY_KEYS)):
+        day_key = SITE_CHECK_WEEKDAY_KEYS[day_index]
+        previous_day_key = SITE_CHECK_WEEKDAY_KEYS[day_index - 1]
+        if not (
+            export_ready_check.daily_initials.get(day_key, "").strip()
+            or export_ready_check.daily_time_markers.get(day_key, "").strip()
+        ):
+            continue
+
+        target_row_definitions = [
+            row_definition
+            for row_definition in row_definitions
+            if row_definition.supports_day_key(day_key)
+            and _weekly_site_check_template_tag(day_key, row_definition.row_number)
+            in valid_template_tags
+        ]
+        if not target_row_definitions:
+            continue
+
+        current_values = [
+            export_ready_check.get_row_state(row_definition.row_number).get_value(day_key)
+            for row_definition in target_row_definitions
+        ]
+        if any(value is not None for value in current_values):
+            continue
+
+        previous_values = [
+            export_ready_check.get_row_state(row_definition.row_number).get_value(
+                previous_day_key
+            )
+            for row_definition in target_row_definitions
+        ]
+        if not any(value is not None for value in previous_values):
+            continue
+
+        for row_definition, previous_value in zip(
+            target_row_definitions,
+            previous_values,
+        ):
+            export_ready_check.get_row_state(row_definition.row_number).set_value(
+                day_key,
+                previous_value,
+            )
+
+    return export_ready_check
+
+
+def _normalise_weekly_site_check_signoff_rows(output_path: Path) -> None:
+    """Normalize the initials/time sign-off rows so all day cells render identically."""
+
+    from docx.shared import Pt
+
+    document = Document(output_path)
+    if not document.tables:
+        document.save(output_path)
+        return
+
+    table = document.tables[0]
+    if len(table.rows) <= 34 or len(table.columns) <= 9:
+        document.save(output_path)
+        return
+
+    for row_index in (33, 34):
+        for column_index in range(3, 10):
+            cell = table.cell(row_index, column_index)
+            normalized_text = " ".join(cell.text.split())
+            cell.text = normalized_text
+            paragraph = cell.paragraphs[0]
+            paragraph.alignment = 1
+            if not paragraph.runs:
+                paragraph.add_run(normalized_text)
+            run = paragraph.runs[0]
+            run.text = normalized_text
+            run.font.name = "Arial Narrow"
+            run.font.size = Pt(5)
+            run.bold = False
+            run.italic = False
+            for extra_run in paragraph.runs[1:]:
+                extra_run.text = ""
+
+    document.save(output_path)
+
+
 def create_weekly_site_check_checklist_draft(
     repository: DocumentRepository,
     *,
@@ -3140,6 +4489,9 @@ def create_weekly_site_check_checklist_draft(
     repository.create_schema()
     output_directory = config.FILE_2_CHECKLIST_OUTPUT_DIR
     output_directory.mkdir(parents=True, exist_ok=True)
+    export_ready_weekly_site_check = _build_export_ready_weekly_site_check(
+        weekly_site_check
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir:
         repaired_template_path = Path(temp_dir) / "weekly-site-check-template.docx"
@@ -3163,32 +4515,33 @@ def create_weekly_site_check_checklist_draft(
         output_path = (
             output_directory
             / (
-                f"{weekly_site_check.week_commencing.strftime('%Y%m%d')}-"
-                f"{weekly_site_check.doc_id}.docx"
+                f"{export_ready_weekly_site_check.week_commencing.strftime('%Y%m%d')}-"
+                f"{export_ready_weekly_site_check.doc_id}.docx"
             )
         )
         document_template = DocxTemplate(str(patched_template_path))
         document_template.render(
-            weekly_site_check.to_template_context(),
+            export_ready_weekly_site_check.to_template_context(),
             autoescape=False,
         )
         document_template.save(output_path)
 
     _stamp_weekly_site_check_header(
         output_path,
-        site_name=weekly_site_check.site_name,
-        week_commencing=weekly_site_check.week_commencing,
+        site_name=export_ready_weekly_site_check.site_name,
+        week_commencing=export_ready_weekly_site_check.week_commencing,
     )
+    _normalise_weekly_site_check_signoff_rows(output_path)
     repository.index_file(
         file_name=output_path.name,
         file_path=output_path,
         file_category="weekly_site_check_docx",
         file_group=FileGroup.FILE_2,
-        site_name=weekly_site_check.site_name,
-        related_doc_id=weekly_site_check.doc_id,
+        site_name=export_ready_weekly_site_check.site_name,
+        related_doc_id=export_ready_weekly_site_check.doc_id,
     )
     return GeneratedWeeklySiteCheckChecklist(
-        weekly_site_check=weekly_site_check,
+        weekly_site_check=export_ready_weekly_site_check,
         output_path=output_path,
     )
 
@@ -3250,10 +4603,23 @@ def create_site_induction_document(
     emergency_tel: str,
     medical: str,
     cscs_number: str,
+    cscs_expiry: Optional[date] = None,
+    asbestos_cert: bool = False,
+    erect_scaffold: bool = False,
+    cisrs_no: str = "",
+    cisrs_expiry: Optional[date] = None,
+    operate_plant: bool = False,
+    cpcs_no: str = "",
+    cpcs_expiry: Optional[date] = None,
+    client_training_desc: str = "",
+    client_training_date: Optional[date] = None,
+    client_training_expiry: Optional[date] = None,
     first_aider: bool,
     fire_warden: bool,
     supervisor: bool,
     smsts: bool,
+    competency_expiry_date: Optional[date] = None,
+    competency_files: Optional[List[Mapping[str, Any]]] = None,
     signature_image_data: Any,
     linked_rams_doc_id: str = "",
 ) -> GeneratedInductionDocument:
@@ -3287,12 +4653,20 @@ def create_site_induction_document(
         raise ValidationError("Company is required.")
 
     repository.create_schema()
+    config.FILE_3_COMPETENCY_CARDS_DIR.mkdir(parents=True, exist_ok=True)
     config.FILE_3_SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
     config.FILE_3_COMPLETED_INDUCTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+    saved_competency_card_paths = _save_induction_competency_cards(
+        competency_files=competency_files or [],
+        full_name=cleaned_full_name,
+        company=cleaned_company,
+        created_at=created_at,
+    )
     signature_path = _save_induction_signature_image(
         signature_image_data=signature_image_data,
         full_name=cleaned_full_name,
+        company=cleaned_company,
         created_at=created_at,
     )
     induction_document = InductionDocument(
@@ -3310,18 +4684,32 @@ def create_site_induction_document(
         emergency_tel=emergency_tel.strip(),
         medical=medical.strip(),
         cscs_number=cscs_number.strip(),
+        cscs_expiry=cscs_expiry,
+        asbestos_cert=bool(asbestos_cert),
+        erect_scaffold=bool(erect_scaffold),
+        cisrs_no=cisrs_no.strip(),
+        cisrs_expiry=cisrs_expiry,
+        operate_plant=bool(operate_plant),
+        cpcs_no=cpcs_no.strip(),
+        cpcs_expiry=cpcs_expiry,
+        client_training_desc=client_training_desc.strip(),
+        client_training_date=client_training_date,
+        client_training_expiry=client_training_expiry,
         first_aider=bool(first_aider),
         fire_warden=bool(fire_warden),
         supervisor=bool(supervisor),
         smsts=bool(smsts),
+        competency_expiry_date=competency_expiry_date,
+        competency_card_paths=",".join(str(path) for path in saved_competency_card_paths),
         signature_image_path=str(signature_path),
     )
 
     template_path = TemplateRegistry.resolve_template_path("site_induction")
     output_path = _build_available_destination(
         Path(
-            "Induction_"
-            f"{_sanitize_filename_fragment(cleaned_full_name)}_"
+            "Induction - "
+            f"{_sanitize_filename_fragment(cleaned_full_name)} - "
+            f"{_sanitize_filename_fragment(cleaned_company)} - "
             f"{created_at:%Y-%m-%d}.docx"
         ),
         config.FILE_3_COMPLETED_INDUCTIONS_DIR,
@@ -3350,6 +4738,42 @@ def create_site_induction_document(
                 "today_date": created_at.strftime("%d/%m/%Y"),
                 "home_address": induction_document.home_address,
                 "company": induction_document.contractor_name,
+                "cscs_expiry": (
+                    induction_document.cscs_expiry.strftime("%d/%m/%Y")
+                    if induction_document.cscs_expiry is not None
+                    else ""
+                ),
+                "asbestos_cert": "✔" if induction_document.asbestos_cert else "",
+                "erect_scaffold": "Yes" if induction_document.erect_scaffold else "No",
+                "cisrs_no": induction_document.cisrs_no,
+                "cisrs_expiry": (
+                    induction_document.cisrs_expiry.strftime("%d/%m/%Y")
+                    if induction_document.cisrs_expiry is not None
+                    else ""
+                ),
+                "operate_plant": "Yes" if induction_document.operate_plant else "No",
+                "cpcs_no": induction_document.cpcs_no,
+                "cpcs_expiry": (
+                    induction_document.cpcs_expiry.strftime("%d/%m/%Y")
+                    if induction_document.cpcs_expiry is not None
+                    else ""
+                ),
+                "client_training_desc": induction_document.client_training_desc,
+                "client_training_date": (
+                    induction_document.client_training_date.strftime("%d/%m/%Y")
+                    if induction_document.client_training_date is not None
+                    else ""
+                ),
+                "client_training_expiry": (
+                    induction_document.client_training_expiry.strftime("%d/%m/%Y")
+                    if induction_document.client_training_expiry is not None
+                    else ""
+                ),
+                "competency_expiry_date": (
+                    induction_document.competency_expiry_date.strftime("%d/%m/%Y")
+                    if induction_document.competency_expiry_date is not None
+                    else ""
+                ),
                 "inductor_name_date": "Ceri Edwards",
                 "inductor_title": "Site Manager",
                 "signature_image": InlineImage(
@@ -3376,6 +4800,15 @@ def create_site_induction_document(
         site_name=induction_document.site_name,
         related_doc_id=induction_document.doc_id,
     )
+    for competency_card_path in saved_competency_card_paths:
+        repository.index_file(
+            file_name=competency_card_path.name,
+            file_path=competency_card_path,
+            file_category="competency_card_upload",
+            file_group=FileGroup.FILE_3,
+            site_name=induction_document.site_name,
+            related_doc_id=induction_document.doc_id,
+        )
     repository.index_file(
         file_name=output_path.name,
         file_path=output_path,
@@ -3388,6 +4821,1022 @@ def create_site_induction_document(
         induction_document=induction_document,
         output_path=output_path,
         signature_path=signature_path,
+    )
+
+
+def list_daily_attendance_entries(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    on_date: Optional[date] = None,
+    active_only: bool = False,
+) -> List[DailyAttendanceEntryDocument]:
+    """Return live UHSF16.09 attendance entries for one site."""
+
+    repository.create_schema()
+    resolved_date = on_date
+    entries = [
+        document
+        for document in repository.list_documents(
+            document_type=DailyAttendanceEntryDocument.document_type,
+            site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        )
+        if isinstance(document, DailyAttendanceEntryDocument)
+    ]
+    if resolved_date is not None:
+        entries = [
+            entry for entry in entries if entry.attendance_date == resolved_date
+        ]
+    if active_only:
+        entries = [entry for entry in entries if entry.is_on_site]
+    return sorted(entries, key=lambda entry: entry.time_in, reverse=True)
+
+
+def build_live_site_broadcast_contacts(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    on_date: Optional[date] = None,
+) -> List[SiteBroadcastContact]:
+    """Return the current on-site mobile contacts sourced from live attendance."""
+
+    active_attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=site_name,
+        on_date=on_date or date.today(),
+        active_only=True,
+    )
+    contacts: List[SiteBroadcastContact] = []
+    seen_mobile_numbers: set[str] = set()
+    for attendance_entry in sorted(
+        active_attendance_entries,
+        key=lambda attendance_entry: (
+            attendance_entry.individual_name.casefold(),
+            attendance_entry.contractor_name.casefold(),
+            attendance_entry.time_in,
+        ),
+    ):
+        if not attendance_entry.linked_induction_doc_id:
+            continue
+        try:
+            linked_document = repository.get(attendance_entry.linked_induction_doc_id)
+        except (DocumentNotFoundError, ValueError):
+            continue
+        if not isinstance(linked_document, InductionDocument):
+            continue
+
+        mobile_number = _normalise_uk_mobile_number(linked_document.contact_number)
+        if not mobile_number or mobile_number in seen_mobile_numbers:
+            continue
+
+        contacts.append(
+            SiteBroadcastContact(
+                individual_name=attendance_entry.individual_name,
+                contractor_name=attendance_entry.contractor_name,
+                mobile_number=mobile_number,
+                vehicle_registration=attendance_entry.vehicle_registration,
+                linked_induction_doc_id=attendance_entry.linked_induction_doc_id,
+            )
+        )
+        seen_mobile_numbers.add(mobile_number)
+    return contacts
+
+
+def build_pending_toolbox_talk_contacts(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str,
+    on_date: Optional[date] = None,
+) -> List[SiteBroadcastContact]:
+    """Return active live contacts who still need to sign one toolbox talk."""
+
+    live_contacts = build_live_site_broadcast_contacts(
+        repository,
+        site_name=site_name,
+        on_date=on_date or date.today(),
+    )
+    if not topic.strip():
+        return live_contacts
+
+    completions = list_toolbox_talk_completions(
+        repository,
+        site_name=site_name,
+        topic=topic,
+    )
+    signed_induction_ids = {
+        completion.linked_induction_doc_id
+        for completion in completions
+        if completion.linked_induction_doc_id
+    }
+    signed_people = {
+        (
+            completion.individual_name.casefold(),
+            completion.contractor_name.casefold(),
+        )
+        for completion in completions
+    }
+    return [
+        contact
+        for contact in live_contacts
+        if (
+            contact.linked_induction_doc_id not in signed_induction_ids
+            and (
+                contact.individual_name.casefold(),
+                contact.contractor_name.casefold(),
+            )
+            not in signed_people
+        )
+    ]
+
+
+def _deduplicate_mobile_numbers(mobile_numbers: Iterable[str]) -> List[str]:
+    """Return cleaned broadcast numbers without duplicates."""
+
+    resolved_numbers: List[str] = []
+    seen_mobile_numbers: set[str] = set()
+    for mobile_number in mobile_numbers:
+        cleaned_mobile_number = str(mobile_number or "").strip()
+        if not cleaned_mobile_number or cleaned_mobile_number in seen_mobile_numbers:
+            continue
+        resolved_numbers.append(cleaned_mobile_number)
+        seen_mobile_numbers.add(cleaned_mobile_number)
+    return resolved_numbers
+
+
+def _build_sms_link(
+    mobile_numbers: Iterable[str],
+    *,
+    message: str = "",
+) -> str:
+    """Return one sms: deep link for a resolved recipient chunk."""
+
+    resolved_numbers = _deduplicate_mobile_numbers(mobile_numbers)
+    if not resolved_numbers:
+        return ""
+
+    sms_link = f"sms:{','.join(resolved_numbers)}"
+    trimmed_message = message.strip()
+    if trimmed_message:
+        sms_link += f"&body={quote(trimmed_message)}"
+    return sms_link
+
+
+def build_site_alert_sms_links(
+    mobile_numbers: Iterable[str],
+    *,
+    message: str = "",
+    max_recipients_per_chunk: int = 24,
+    max_url_length: int = 1800,
+) -> List[str]:
+    """Return one or more Messages-ready sms: links for the supplied recipients."""
+
+    if max_recipients_per_chunk < 1:
+        raise ValueError("max_recipients_per_chunk must be at least 1.")
+    if max_url_length < 32:
+        raise ValueError("max_url_length must be at least 32.")
+
+    resolved_numbers = _deduplicate_mobile_numbers(mobile_numbers)
+    if not resolved_numbers:
+        return []
+
+    trimmed_message = message.strip()
+    draft_links: List[str] = []
+    current_chunk: List[str] = []
+    for mobile_number in resolved_numbers:
+        candidate_chunk = current_chunk + [mobile_number]
+        candidate_link = _build_sms_link(candidate_chunk, message=trimmed_message)
+        if (
+            current_chunk
+            and (
+                len(candidate_chunk) > max_recipients_per_chunk
+                or len(candidate_link) > max_url_length
+            )
+        ):
+            draft_links.append(_build_sms_link(current_chunk, message=trimmed_message))
+            current_chunk = [mobile_number]
+            continue
+        current_chunk = candidate_chunk
+
+    if current_chunk:
+        draft_links.append(_build_sms_link(current_chunk, message=trimmed_message))
+    return draft_links
+
+
+def build_site_alert_sms_link(
+    mobile_numbers: Iterable[str],
+    *,
+    message: str = "",
+) -> str:
+    """Return a clickable sms: link for the supplied recipients."""
+
+    sms_links = build_site_alert_sms_links(
+        mobile_numbers,
+        message=message,
+    )
+    return sms_links[0] if sms_links else ""
+
+
+def build_toolbox_talk_sms_message(
+    topic: str,
+    tbt_link: str,
+) -> str:
+    """Return the default delivery message for one remote toolbox talk."""
+
+    resolved_topic = topic.strip()
+    resolved_link = tbt_link.strip()
+    return (
+        f"Toolbox Talk: {resolved_topic}. "
+        "Please click this link to read the document and sign the register: "
+        f"{resolved_link}"
+    ).strip()
+
+
+def launch_messages_sms_broadcast(
+    mobile_numbers: Iterable[str],
+    *,
+    message: str = "",
+    max_recipients_per_chunk: int = 24,
+    max_url_length: int = 1800,
+) -> MessagesDraftLaunchResult:
+    """Open one or more ready-to-send SMS drafts in the local Messages app."""
+
+    resolved_numbers = _deduplicate_mobile_numbers(mobile_numbers)
+    if not resolved_numbers:
+        return MessagesDraftLaunchResult(
+            draft_links=[],
+            recipient_count=0,
+            chunk_count=0,
+            launched_successfully=False,
+            error_message="No valid mobile numbers were supplied.",
+        )
+
+    draft_links = build_site_alert_sms_links(
+        resolved_numbers,
+        message=message,
+        max_recipients_per_chunk=max_recipients_per_chunk,
+        max_url_length=max_url_length,
+    )
+    if not draft_links:
+        return MessagesDraftLaunchResult(
+            draft_links=[],
+            recipient_count=0,
+            chunk_count=0,
+            launched_successfully=False,
+            error_message="Unable to build any SMS draft links.",
+        )
+
+    app_lookup = subprocess.run(
+        ["open", "-Ra", "Messages"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if app_lookup.returncode != 0:
+        return MessagesDraftLaunchResult(
+            draft_links=draft_links,
+            recipient_count=len(resolved_numbers),
+            chunk_count=len(draft_links),
+            launched_successfully=False,
+            error_message=(
+                app_lookup.stderr.strip()
+                or app_lookup.stdout.strip()
+                or "Messages is not available on this Mac."
+            ),
+        )
+
+    launch_error_message = ""
+    launched_successfully = True
+    for draft_link_index, draft_link in enumerate(draft_links):
+        launch_result = subprocess.run(
+            ["open", "-a", "Messages", draft_link],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if launch_result.returncode != 0:
+            launched_successfully = False
+            launch_error_message = (
+                launch_result.stderr.strip()
+                or launch_result.stdout.strip()
+                or "The Messages draft could not be opened."
+            )
+            break
+        if draft_link_index < len(draft_links) - 1:
+            time_module.sleep(0.25)
+
+    return MessagesDraftLaunchResult(
+        draft_links=draft_links,
+        recipient_count=len(resolved_numbers),
+        chunk_count=len(draft_links),
+        launched_successfully=launched_successfully,
+        error_message=launch_error_message,
+    )
+
+
+def log_broadcast_dispatch(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    dispatch_kind: str,
+    audience_label: str,
+    subject: str,
+    message_body: str,
+    recipient_numbers: Iterable[str],
+    recipient_names: Iterable[str],
+    launch_result: MessagesDraftLaunchResult,
+    topic: str = "",
+) -> LoggedBroadcastDispatch:
+    """Persist one broadcast/TBT delivery batch to the workspace database."""
+
+    repository.create_schema()
+    dispatched_at = datetime.now()
+    dispatch_document = BroadcastDispatchDocument(
+        doc_id=(
+            f"DISPATCH-{dispatched_at:%Y%m%d%H%M%S%f}-"
+            f"{_slugify_identifier(subject)}"
+        ),
+        site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        created_at=dispatched_at,
+        status=DocumentStatus.ACTIVE,
+        dispatch_kind=dispatch_kind.strip().lower(),
+        channel="messages",
+        audience_label=audience_label.strip() or "Live fire roll",
+        subject=subject.strip(),
+        message_body=message_body,
+        recipient_numbers=_deduplicate_mobile_numbers(recipient_numbers),
+        recipient_names=[
+            str(name).strip()
+            for name in recipient_names
+            if str(name).strip()
+        ],
+        topic=topic.strip(),
+        dispatched_at=dispatched_at,
+        launch_mode="messages_draft",
+        launched_successfully=launch_result.launched_successfully,
+        chunk_count=launch_result.chunk_count,
+    )
+    repository.save(dispatch_document)
+    return LoggedBroadcastDispatch(
+        dispatch_document=dispatch_document,
+        launch_result=launch_result,
+    )
+
+
+def list_broadcast_dispatches(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str = "",
+    dispatch_kind: str = "",
+) -> List[BroadcastDispatchDocument]:
+    """Return prior broadcast/TBT deliveries for one site."""
+
+    repository.create_schema()
+    dispatches = [
+        document
+        for document in repository.list_documents(
+            document_type=BroadcastDispatchDocument.document_type,
+            site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        )
+        if isinstance(document, BroadcastDispatchDocument)
+    ]
+    if topic.strip():
+        lowered_topic = topic.strip().casefold()
+        dispatches = [
+            dispatch
+            for dispatch in dispatches
+            if dispatch.topic.casefold() == lowered_topic
+        ]
+    if dispatch_kind.strip():
+        lowered_dispatch_kind = dispatch_kind.strip().casefold()
+        dispatches = [
+            dispatch
+            for dispatch in dispatches
+            if dispatch.dispatch_kind.casefold() == lowered_dispatch_kind
+        ]
+    return sorted(
+        dispatches,
+        key=lambda dispatch: (dispatch.dispatched_at, dispatch.doc_id),
+        reverse=True,
+    )
+
+
+def calculate_haversine_distance_meters(
+    latitude_a: float,
+    longitude_a: float,
+    latitude_b: float,
+    longitude_b: float,
+) -> float:
+    """Return the great-circle distance between two GPS coordinates in meters."""
+
+    earth_radius_meters = 6_371_000.0
+    latitude_a_radians = math.radians(float(latitude_a))
+    latitude_b_radians = math.radians(float(latitude_b))
+    latitude_delta_radians = math.radians(float(latitude_b) - float(latitude_a))
+    longitude_delta_radians = math.radians(float(longitude_b) - float(longitude_a))
+
+    haversine_value = (
+        math.sin(latitude_delta_radians / 2) ** 2
+        + math.cos(latitude_a_radians)
+        * math.cos(latitude_b_radians)
+        * math.sin(longitude_delta_radians / 2) ** 2
+    )
+    return 2 * earth_radius_meters * math.atan2(
+        math.sqrt(haversine_value),
+        math.sqrt(1 - haversine_value),
+    )
+
+
+def list_toolbox_talk_completions(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str = "",
+    on_date: Optional[date] = None,
+) -> List[ToolboxTalkCompletionDocument]:
+    """Return stored UHSF16.2 completions for one site and optional topic."""
+
+    repository.create_schema()
+    completions = [
+        document
+        for document in repository.list_documents(
+            document_type=ToolboxTalkCompletionDocument.document_type,
+            site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        )
+        if isinstance(document, ToolboxTalkCompletionDocument)
+    ]
+    if topic.strip():
+        lowered_topic = topic.strip().casefold()
+        completions = [
+            completion
+            for completion in completions
+            if completion.topic.casefold() == lowered_topic
+        ]
+    if on_date is not None:
+        completions = [
+            completion
+            for completion in completions
+            if completion.completed_at.date() == on_date
+        ]
+    return sorted(
+        completions,
+        key=lambda completion: (completion.completed_at, completion.doc_id),
+        reverse=True,
+    )
+
+
+def list_toolbox_talk_documents(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str = "",
+) -> List[ToolboxTalkDocument]:
+    """Return uploaded toolbox talk source documents for one site and optional topic."""
+
+    repository.create_schema()
+    documents = [
+        document
+        for document in repository.list_documents(
+            document_type=ToolboxTalkDocument.document_type,
+            site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        )
+        if isinstance(document, ToolboxTalkDocument)
+    ]
+    if topic.strip():
+        lowered_topic = topic.strip().casefold()
+        documents = [
+            document
+            for document in documents
+            if document.topic.casefold() == lowered_topic
+        ]
+    return sorted(
+        documents,
+        key=lambda document: (document.created_at, document.doc_id),
+        reverse=True,
+    )
+
+
+def get_latest_toolbox_talk_document(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str,
+) -> Optional[ToolboxTalkDocument]:
+    """Return the most recent uploaded toolbox talk source document for one topic."""
+
+    documents = list_toolbox_talk_documents(
+        repository,
+        site_name=site_name,
+        topic=topic,
+    )
+    return documents[0] if documents else None
+
+
+def save_toolbox_talk_document(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str,
+    uploaded_file_name: str,
+    uploaded_file_bytes: bytes,
+) -> SavedToolboxTalkDocument:
+    """Persist one uploaded toolbox talk source document inside File 2."""
+
+    repository.create_schema()
+    resolved_topic = topic.strip()
+    if not resolved_topic:
+        raise ValidationError("Toolbox talk topic must not be blank.")
+    cleaned_file_name = Path(uploaded_file_name or "").name
+    if not cleaned_file_name:
+        raise ValidationError("Upload a toolbox talk document before creating the link.")
+    if not uploaded_file_bytes:
+        raise ValidationError("The uploaded toolbox talk document is empty.")
+
+    created_at = datetime.now()
+    suffix = Path(cleaned_file_name).suffix or ".bin"
+    stored_path = _build_available_destination(
+        Path(
+            f"{created_at:%Y%m%d-%H%M%S}-"
+            f"{_sanitize_filename_fragment(resolved_topic)}"
+            f"{suffix}"
+        ),
+        config.FILE_2_TBT_ACTIVE_DOCS_DIR,
+    )
+    config.FILE_2_TBT_ACTIVE_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    stored_path.write_bytes(uploaded_file_bytes)
+
+    toolbox_talk_document = ToolboxTalkDocument(
+        doc_id=(
+            f"TBTDOC-{created_at:%Y%m%d%H%M%S%f}-"
+            f"{_slugify_identifier(resolved_topic)}"
+        ),
+        site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        created_at=created_at,
+        status=DocumentStatus.ACTIVE,
+        topic=resolved_topic,
+        original_file_name=cleaned_file_name,
+        stored_file_path=str(stored_path),
+    )
+    repository.save(toolbox_talk_document)
+    repository.index_file(
+        file_name=stored_path.name,
+        file_path=stored_path,
+        file_category="toolbox_talk_source_doc",
+        file_group=FileGroup.FILE_2,
+        site_name=toolbox_talk_document.site_name,
+        related_doc_id=toolbox_talk_document.doc_id,
+    )
+    return SavedToolboxTalkDocument(
+        toolbox_talk_document=toolbox_talk_document,
+        stored_path=stored_path,
+    )
+
+
+def log_toolbox_talk_completion(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str,
+    attendance_entry: DailyAttendanceEntryDocument,
+    signature_image_data: Any,
+    document_read_confirmed: bool,
+) -> LoggedToolboxTalkCompletion:
+    """Persist one remote toolbox talk sign-off from the active fire roll."""
+
+    repository.create_schema()
+    resolved_topic = topic.strip()
+    if not resolved_topic:
+        raise ValidationError("Toolbox talk topic must not be blank.")
+    if not document_read_confirmed:
+        raise ValidationError(
+            "Confirm that you have read and understood the toolbox talk before signing."
+        )
+    if not attendance_entry.is_on_site:
+        raise ValidationError("Only operatives currently on site can sign this toolbox talk.")
+
+    existing_completions = list_toolbox_talk_completions(
+        repository,
+        site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        topic=resolved_topic,
+        on_date=date.today(),
+    )
+    for existing_completion in existing_completions:
+        if (
+            existing_completion.linked_induction_doc_id
+            and existing_completion.linked_induction_doc_id
+            == attendance_entry.linked_induction_doc_id
+        ) or (
+            existing_completion.individual_name.casefold()
+            == attendance_entry.individual_name.casefold()
+            and existing_completion.contractor_name.casefold()
+            == attendance_entry.contractor_name.casefold()
+        ):
+            raise ValidationError(
+                f"{attendance_entry.individual_name} has already signed this toolbox talk today."
+            )
+
+    completed_at = datetime.now()
+    signature_path = _save_toolbox_talk_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=attendance_entry.individual_name,
+        created_at=completed_at,
+        topic=resolved_topic,
+    )
+    completion_document = ToolboxTalkCompletionDocument(
+        doc_id=(
+            f"TBT-{completed_at:%Y%m%d%H%M%S%f}-"
+            f"{_slugify_identifier(resolved_topic)}-"
+            f"{_slugify_identifier(attendance_entry.individual_name)}"
+        ),
+        site_name=site_name.strip() or DEFAULT_SITE_NAME,
+        created_at=completed_at,
+        status=DocumentStatus.ACTIVE,
+        topic=resolved_topic,
+        linked_induction_doc_id=attendance_entry.linked_induction_doc_id,
+        individual_name=attendance_entry.individual_name,
+        contractor_name=attendance_entry.contractor_name,
+        completed_at=completed_at,
+        signature_image_path=str(signature_path),
+        document_read_confirmed=document_read_confirmed,
+    )
+    repository.save(completion_document)
+    repository.index_file(
+        file_name=signature_path.name,
+        file_path=signature_path,
+        file_category="toolbox_talk_signature_png",
+        file_group=FileGroup.FILE_2,
+        site_name=completion_document.site_name,
+        related_doc_id=completion_document.doc_id,
+    )
+    return LoggedToolboxTalkCompletion(
+        toolbox_talk_completion=completion_document,
+        signature_path=signature_path,
+    )
+
+
+def generate_toolbox_talk_register_document(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    topic: str,
+) -> GeneratedToolboxTalkRegisterDocument:
+    """Render the approved UHSF16.2 toolbox talk register for one topic."""
+
+    repository.create_schema()
+    template_path = TemplateRegistry.resolve_template_path("toolbox_talk_register")
+    if not template_path.exists():
+        raise TemplateValidationError(
+            f"Toolbox talk template is missing: {template_path}"
+        )
+
+    completions = list_toolbox_talk_completions(
+        repository,
+        site_name=site_name,
+        topic=topic,
+    )
+    export_rows = sorted(
+        completions,
+        key=lambda completion: (completion.completed_at, completion.doc_id),
+    )
+    config.FILE_2_TBT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = _build_available_destination(
+        Path(
+            "UHSF16.2 Toolbox Talk Register - "
+            f"{_sanitize_filename_fragment(topic)} - "
+            f"{date.today():%Y-%m-%d}.docx"
+        ),
+        config.FILE_2_TBT_OUTPUT_DIR,
+    )
+
+    document = Document(template_path)
+    _replace_docx_token_everywhere(document, "{{ topic }}", topic.strip())
+    _populate_toolbox_talk_rows(document, export_rows)
+    document.save(output_path)
+
+    repository.index_file(
+        file_name=output_path.name,
+        file_path=output_path,
+        file_category="toolbox_talk_register_docx",
+        file_group=FileGroup.FILE_2,
+        site_name=site_name,
+    )
+    return GeneratedToolboxTalkRegisterDocument(
+        output_path=output_path,
+        row_count=len(export_rows),
+    )
+
+
+def create_daily_attendance_sign_in(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    induction_document: InductionDocument,
+    vehicle_registration: str,
+    distance_travelled: str,
+    signature_image_data: Any,
+) -> LoggedDailyAttendanceEntry:
+    """Create one live daily sign-in record from an existing induction record."""
+
+    repository.create_schema()
+    created_at = datetime.now().replace(second=0, microsecond=0)
+    resolved_site_name = site_name.strip() or DEFAULT_SITE_NAME
+    if induction_document.status == DocumentStatus.ARCHIVED:
+        raise ValidationError(
+            f"{induction_document.individual_name} is archived and cannot be signed in."
+        )
+
+    active_entries = list_daily_attendance_entries(
+        repository,
+        site_name=resolved_site_name,
+        on_date=created_at.date(),
+        active_only=True,
+    )
+    for active_entry in active_entries:
+        same_induction = (
+            induction_document.doc_id
+            and active_entry.linked_induction_doc_id == induction_document.doc_id
+        )
+        same_person = (
+            active_entry.individual_name.casefold()
+            == induction_document.individual_name.casefold()
+            and active_entry.contractor_name.casefold()
+            == induction_document.contractor_name.casefold()
+        )
+        if same_induction or same_person:
+            raise ValidationError(
+                f"{induction_document.individual_name} is already signed in for today."
+            )
+
+    config.FILE_2_ATTENDANCE_SIGNATURES_DIR.mkdir(parents=True, exist_ok=True)
+    signature_path = _save_attendance_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=induction_document.individual_name,
+        created_at=created_at,
+        action="sign-in",
+    )
+
+    attendance_entry = DailyAttendanceEntryDocument(
+        doc_id=_build_daily_attendance_doc_id(created_at, induction_document.individual_name),
+        site_name=resolved_site_name,
+        created_at=created_at,
+        status=DocumentStatus.ACTIVE,
+        linked_induction_doc_id=induction_document.doc_id,
+        individual_name=induction_document.individual_name,
+        contractor_name=induction_document.contractor_name,
+        vehicle_registration=vehicle_registration.strip().upper(),
+        distance_travelled=distance_travelled.strip(),
+        time_in=created_at,
+        sign_in_signature_path=str(signature_path),
+    )
+
+    repository.save(attendance_entry)
+    repository.index_file(
+        file_name=signature_path.name,
+        file_path=signature_path,
+        file_category="attendance_sign_in_signature_png",
+        file_group=FileGroup.FILE_2,
+        site_name=attendance_entry.site_name,
+        related_doc_id=attendance_entry.doc_id,
+    )
+    return LoggedDailyAttendanceEntry(
+        attendance_entry=attendance_entry,
+        signature_path=signature_path,
+    )
+
+
+def complete_daily_attendance_sign_out(
+    repository: DocumentRepository,
+    *,
+    attendance_doc_id: str,
+    signature_image_data: Any,
+) -> LoggedDailyAttendanceEntry:
+    """Complete one live daily sign-out record and calculate hours worked."""
+
+    repository.create_schema()
+    attendance_entry = repository.get(attendance_doc_id)
+    if not isinstance(attendance_entry, DailyAttendanceEntryDocument):
+        raise ValidationError("Selected attendance record is not a UHSF16.09 entry.")
+    if not attendance_entry.is_on_site:
+        raise ValidationError(
+            f"{attendance_entry.individual_name} is not currently signed in."
+        )
+
+    completed_at = datetime.now().replace(second=0, microsecond=0)
+    signature_path = _save_attendance_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=attendance_entry.individual_name,
+        created_at=completed_at,
+        action="sign-out",
+    )
+    worked_duration_hours = round(
+        max((completed_at - attendance_entry.time_in).total_seconds(), 0.0) / 3600.0,
+        2,
+    )
+
+    attendance_entry.time_out = completed_at
+    attendance_entry.hours_worked = worked_duration_hours
+    attendance_entry.sign_out_signature_path = str(signature_path)
+    attendance_entry.status = DocumentStatus.ARCHIVED
+    repository.save(attendance_entry)
+    repository.index_file(
+        file_name=signature_path.name,
+        file_path=signature_path,
+        file_category="attendance_sign_out_signature_png",
+        file_group=FileGroup.FILE_2,
+        site_name=attendance_entry.site_name,
+        related_doc_id=attendance_entry.doc_id,
+    )
+    return LoggedDailyAttendanceEntry(
+        attendance_entry=attendance_entry,
+        signature_path=signature_path,
+    )
+
+
+def get_daily_contractor_headcount(
+    repository: DocumentRepository,
+    site_name: str,
+    target_date: date,
+) -> List[Dict[str, Any]]:
+    """Return contractor day/night counts from the live UHSF16.09 register."""
+
+    attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=site_name,
+        on_date=target_date,
+        active_only=True,
+    )
+    contractor_counts: Dict[str, int] = {}
+    for attendance_entry in attendance_entries:
+        contractor_name = attendance_entry.contractor_name.strip() or "Unknown"
+        contractor_counts[contractor_name] = contractor_counts.get(contractor_name, 0) + 1
+    return [
+        {
+            "company": contractor_name,
+            "days": count,
+            "nights": 0,
+        }
+        for contractor_name, count in sorted(
+            contractor_counts.items(),
+            key=lambda item: item[0].casefold(),
+        )
+    ]
+
+
+def _build_site_diary_doc_id(site_name: str, target_date: date) -> str:
+    """Return a stable document id for one UHSF15.63 diary date."""
+
+    return (
+        "site-diary-"
+        f"{_slugify_identifier(site_name)}-"
+        f"{target_date:%Y%m%d}"
+    )
+
+
+def generate_site_diary_document(
+    repository: DocumentRepository,
+    *,
+    site_diary_document: SiteDiaryDocument,
+) -> GeneratedSiteDiaryDocument:
+    """Render and store the approved UHSF15.63 daily site diary."""
+
+    try:
+        from docxtpl import DocxTemplate
+    except ImportError as exc:
+        raise RuntimeError(
+            "docxtpl is required to generate the printable UHSF15.63 daily site diary."
+        ) from exc
+    try:
+        from jinja2 import Environment
+    except ImportError as exc:
+        raise RuntimeError(
+            "jinja2 is required to generate the printable UHSF15.63 daily site diary."
+        ) from exc
+
+    repository.create_schema()
+    config.FILE_2_DIARY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    template_path = TemplateRegistry.resolve_template_path("site_diary")
+    if not template_path.exists():
+        raise TemplateValidationError(
+            f"Daily site diary template is missing: {template_path}"
+        )
+
+    output_name = Path(
+        "UHSF15.63 Daily Site Diary - "
+        f"{_sanitize_filename_fragment(site_diary_document.site_name)} - "
+        f"{site_diary_document.date:%Y-%m-%d}.docx"
+    )
+    output_path = _build_available_destination(
+        output_name,
+        config.FILE_2_DIARY_OUTPUT_DIR,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repaired_template_path = Path(temp_dir) / "site-diary-template.docx"
+        _build_patched_docxtpl_template(template_path, repaired_template_path)
+
+        discovered_placeholders = (
+            _discover_docx_template_tags(template_path)
+            | _discover_docx_template_tags(repaired_template_path)
+        )
+        missing_placeholders = sorted(
+            SiteDiaryDocument.required_template_placeholders - discovered_placeholders
+        )
+        if missing_placeholders:
+            raise TemplateValidationError(
+                "Daily site diary template is missing required placeholders: "
+                + ", ".join(missing_placeholders)
+            )
+
+        document_template = DocxTemplate(str(repaired_template_path))
+        clean_jinja_environment = Environment(autoescape=False)
+        document_template.render(
+            site_diary_document.to_template_context(),
+            jinja_env=clean_jinja_environment,
+            autoescape=False,
+        )
+        document_template.save(output_path)
+
+    saved_document = replace(
+        site_diary_document,
+        generated_document_path=str(output_path),
+    )
+    repository.save(saved_document)
+    repository.index_file(
+        file_name=output_path.name,
+        file_path=output_path,
+        file_category="site_diary_docx",
+        file_group=FileGroup.FILE_2,
+        site_name=saved_document.site_name,
+        related_doc_id=saved_document.doc_id,
+    )
+    return GeneratedSiteDiaryDocument(
+        output_path=output_path,
+        contractor_count=len(saved_document.contractors),
+        visitor_count=len(saved_document.visitors),
+        site_diary_document=saved_document,
+    )
+
+
+def generate_attendance_register_document(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    on_date: Optional[date] = None,
+) -> GeneratedAttendanceRegisterDocument:
+    """Render the approved File 2 attendance register into the attendance folder."""
+
+    report_date = on_date or date.today()
+    repository.create_schema()
+    config.FILE_2_ATTENDANCE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    template_path = TemplateRegistry.resolve_template_path("attendance_register")
+    attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=site_name,
+        on_date=report_date,
+        active_only=False,
+    )
+    printable_entries = sorted(
+        attendance_entries,
+        key=lambda attendance_entry: attendance_entry.time_in,
+    )[:17]
+    induction_lookup = _build_attendance_induction_lookup(repository, printable_entries)
+
+    output_name = Path(
+        "UHSF16.09 Site Attendance Register - "
+        f"{_sanitize_filename_fragment(site_name)} - "
+        f"{report_date:%Y-%m-%d}.docx"
+    )
+    output_path = _build_available_destination(
+        output_name,
+        config.FILE_2_ATTENDANCE_OUTPUT_DIR,
+    )
+
+    document = Document(template_path)
+    _validate_attendance_register_template(document)
+    _populate_attendance_register_rows(
+        document,
+        attendance_entries=printable_entries,
+        induction_lookup=induction_lookup,
+    )
+    _populate_attendance_register_summary(
+        document,
+        attendance_entries=printable_entries,
+    )
+    document.save(output_path)
+
+    repository.index_file(
+        file_name=output_path.name,
+        file_path=output_path,
+        file_category="attendance_register_docx",
+        file_group=FileGroup.FILE_2,
+        site_name=site_name,
+    )
+    return GeneratedAttendanceRegisterDocument(
+        output_path=output_path,
+        row_count=len(printable_entries),
     )
 
 
@@ -3488,6 +5937,263 @@ def generate_plant_register_document(
         output_path=output_path,
         asset_count=len(plant_assets),
     )
+
+
+def _build_attendance_induction_lookup(
+    repository: DocumentRepository,
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> Dict[str, InductionDocument]:
+    """Return linked induction records used to backfill contact details."""
+
+    induction_lookup: Dict[str, InductionDocument] = {}
+    for attendance_entry in attendance_entries:
+        linked_doc_id = attendance_entry.linked_induction_doc_id
+        if not linked_doc_id or linked_doc_id in induction_lookup:
+            continue
+        try:
+            linked_document = repository.get(linked_doc_id)
+        except (DocumentNotFoundError, ValueError):
+            continue
+        if isinstance(linked_document, InductionDocument):
+            induction_lookup[linked_doc_id] = linked_document
+    return induction_lookup
+
+
+def _validate_attendance_register_template(document: Document) -> None:
+    """Check the approved attendance template still uses the fixed Lovedean layout."""
+
+    if len(document.tables) < 4:
+        raise TemplateValidationError(
+            "Attendance register template must contain the attendance and summary tables."
+        )
+
+    attendance_table = document.tables[1]
+    if len(attendance_table.rows) < 18 or len(attendance_table.columns) < 11:
+        raise TemplateValidationError(
+            "Attendance register template must contain 17 printable attendance rows."
+        )
+
+    expected_headers = (
+        "Date",
+        "Name",
+        "Company",
+        "Phone No",
+        "Distance Travelled",
+        "Vehicle Reg",
+        "Time In",
+        "Signature",
+        "Time Out",
+        "Hours Worked",
+        "Signature",
+    )
+    actual_headers = tuple(
+        re.sub(r"\s+", " ", cell.text.replace("\n", " ").strip())
+        for cell in attendance_table.rows[0].cells[:11]
+    )
+    if actual_headers != expected_headers:
+        raise TemplateValidationError(
+            "Attendance register template headers no longer match the approved UHSF16.09 layout."
+        )
+
+    summary_table = document.tables[3]
+    if len(summary_table.rows) < 2 or len(summary_table.columns) < 5:
+        raise TemplateValidationError(
+            "Attendance register template summary table is missing required totals cells."
+        )
+
+
+def _populate_attendance_register_rows(
+    document: Document,
+    *,
+    attendance_entries: List[DailyAttendanceEntryDocument],
+    induction_lookup: Dict[str, InductionDocument],
+) -> None:
+    """Fill the fixed-row UHSF16.09 table from today's live attendance entries."""
+
+    attendance_table = document.tables[1]
+    for row_index in range(1, 18):
+        row = attendance_table.rows[row_index]
+        if row_index - 1 >= len(attendance_entries):
+            for cell in row.cells[:11]:
+                _set_docx_cell_text(cell, "")
+            continue
+
+        attendance_entry = attendance_entries[row_index - 1]
+        linked_induction = induction_lookup.get(attendance_entry.linked_induction_doc_id)
+        row_values = (
+            attendance_entry.attendance_date.strftime("%d/%m/%Y"),
+            attendance_entry.individual_name,
+            attendance_entry.contractor_name,
+            linked_induction.contact_number if linked_induction is not None else "",
+            attendance_entry.distance_travelled,
+            attendance_entry.vehicle_registration,
+            attendance_entry.time_in.strftime("%H:%M"),
+            "",
+            attendance_entry.time_out.strftime("%H:%M")
+            if attendance_entry.time_out is not None
+            else "",
+            f"{attendance_entry.hours_worked:.2f}"
+            if attendance_entry.hours_worked is not None
+            else "",
+            "",
+        )
+        for cell, value in zip(row.cells[:11], row_values):
+            _set_docx_cell_text(cell, value)
+        _insert_signature_into_cell(row.cells[7], attendance_entry.sign_in_signature_path)
+        _insert_signature_into_cell(row.cells[10], attendance_entry.sign_out_signature_path)
+
+
+def _populate_attendance_register_summary(
+    document: Document,
+    *,
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> None:
+    """Fill the summary totals for Uplands and subcontractor rows."""
+
+    summary_table = document.tables[3]
+    subcontractor_entries = [
+        attendance_entry
+        for attendance_entry in attendance_entries
+        if not attendance_entry.is_uplands_employee
+    ]
+    uplands_entries = [
+        attendance_entry
+        for attendance_entry in attendance_entries
+        if attendance_entry.is_uplands_employee
+    ]
+
+    _set_docx_cell_text(summary_table.rows[0].cells[1], str(len(subcontractor_entries)))
+    _set_docx_cell_text(summary_table.rows[0].cells[4], str(len(uplands_entries)))
+    _set_docx_cell_text(
+        summary_table.rows[1].cells[1],
+        _format_attendance_hours_total(subcontractor_entries),
+    )
+    _set_docx_cell_text(
+        summary_table.rows[1].cells[4],
+        _format_attendance_hours_total(uplands_entries),
+    )
+
+
+def _format_attendance_hours_total(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> str:
+    """Return the printed total hours for one attendance grouping."""
+
+    total_hours = sum(
+        attendance_entry.hours_worked or 0.0
+        for attendance_entry in attendance_entries
+    )
+    return f"{total_hours:.2f}" if total_hours > 0 else ""
+
+
+def _set_docx_cell_text(cell: Any, value: str) -> None:
+    """Replace one docx table cell with plain text while clearing placeholders."""
+
+    cell.text = value
+
+
+def _insert_signature_into_cell(cell: Any, signature_path: str) -> None:
+    """Insert a saved signature image into one attendance register cell."""
+
+    from docx.shared import Mm
+
+    resolved_signature_path = Path(str(signature_path)).expanduser()
+    if not signature_path or not resolved_signature_path.exists():
+        _set_docx_cell_text(cell, "")
+        return
+
+    _set_docx_cell_text(cell, "")
+    paragraph = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    paragraph.alignment = 1
+    paragraph.add_run().add_picture(str(resolved_signature_path), width=Mm(16))
+
+
+def _replace_docx_token_everywhere(document: Document, token: str, value: str) -> None:
+    """Replace one literal placeholder token across paragraphs and table cells."""
+
+    for paragraph in document.paragraphs:
+        if token in paragraph.text:
+            paragraph.text = paragraph.text.replace(token, value)
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if token in cell.text:
+                    cell.text = cell.text.replace(token, value)
+
+
+def _populate_toolbox_talk_rows(
+    document: Document,
+    completions: List[ToolboxTalkCompletionDocument],
+) -> None:
+    """Fill the UHSF16.2 signature rows from the collected remote completions."""
+
+    placeholder_row_specs: List[tuple[Any, int]] = []
+    placeholder_tokens = ("{{ name }}", "{{ company }}", "{{ date }}", "{{ signature }}")
+    for table in document.tables:
+        for row_index, row in enumerate(table.rows):
+            row_text = " ".join(cell.text for cell in row.cells)
+            if any(token in row_text for token in placeholder_tokens):
+                placeholder_row_specs.append((table, row_index))
+
+    if not placeholder_row_specs:
+        raise TemplateValidationError(
+            "Toolbox talk template is missing the tagged signature rows."
+        )
+
+    target_table, template_row_index = placeholder_row_specs[0]
+    placeholder_row_indices = [
+        row_index
+        for table, row_index in placeholder_row_specs
+        if table is target_table
+    ]
+    template_row_xml = target_table.rows[template_row_index]._tr
+    last_row_xml = target_table.rows[placeholder_row_indices[-1]]._tr
+    missing_row_count = max(0, len(completions) - len(placeholder_row_indices))
+    for _ in range(missing_row_count):
+        cloned_row_xml = deepcopy(template_row_xml)
+        last_row_xml.addnext(cloned_row_xml)
+        last_row_xml = cloned_row_xml
+
+    placeholder_rows = [
+        row
+        for row in target_table.rows
+        if any(token in " ".join(cell.text for cell in row.cells) for token in placeholder_tokens)
+    ]
+
+    for row_index, row in enumerate(placeholder_rows):
+        if row_index < len(completions):
+            _apply_toolbox_talk_row_values(row, completions[row_index])
+        else:
+            _blank_toolbox_talk_row(row)
+
+
+def _apply_toolbox_talk_row_values(
+    row: Any,
+    completion: ToolboxTalkCompletionDocument,
+) -> None:
+    """Fill one UHSF16.2 row with a single operative completion."""
+
+    replacement_map = {
+        "{{ name }}": completion.individual_name,
+        "{{ company }}": completion.contractor_name,
+        "{{ topic }}": completion.topic,
+        "{{ date }}": completion.completed_at.strftime("%d/%m/%Y"),
+    }
+    for cell in row.cells:
+        if "{{ signature }}" in cell.text:
+            _insert_signature_into_cell(cell, completion.signature_image_path)
+            continue
+        updated_text = cell.text
+        for token, value in replacement_map.items():
+            updated_text = updated_text.replace(token, value)
+        _set_docx_cell_text(cell, updated_text if "{{" not in updated_text else "")
+
+
+def _blank_toolbox_talk_row(row: Any) -> None:
+    """Clear one unused toolbox talk row in the export template."""
+
+    for cell in row.cells:
+        _set_docx_cell_text(cell, "")
 
 
 def _list_site_rams_documents(
@@ -5660,6 +8366,36 @@ def _build_induction_doc_id(created_at: datetime, full_name: str) -> str:
     )
 
 
+def _build_daily_attendance_doc_id(created_at: datetime, full_name: str) -> str:
+    """Return a deterministic-ish UHSF16.09 attendance identifier."""
+
+    return (
+        f"ATT-{created_at:%Y%m%d%H%M%S}-"
+        f"{_slugify_identifier(full_name)}"
+    )
+
+
+def _normalise_uk_mobile_number(raw_phone_number: str) -> str:
+    """Return one normalised UK mobile number or an empty string when invalid."""
+
+    if not raw_phone_number:
+        return ""
+
+    compact_value = re.sub(r"[^\d+]+", "", raw_phone_number.strip())
+    if compact_value.startswith("00"):
+        compact_value = "+" + compact_value[2:]
+
+    if compact_value.startswith("+447") and len(compact_value) == 13:
+        return compact_value
+
+    digits_only = re.sub(r"\D+", "", compact_value)
+    if digits_only.startswith("447") and len(digits_only) == 12:
+        return f"+{digits_only}"
+    if digits_only.startswith("07") and len(digits_only) == 11:
+        return f"+44{digits_only[1:]}"
+    return ""
+
+
 def _sanitize_filename_fragment(value: str) -> str:
     """Return a human-readable filename fragment with unsafe characters removed."""
 
@@ -5677,17 +8413,126 @@ def _save_induction_signature_image(
     *,
     signature_image_data: Any,
     full_name: str,
+    company: str,
     created_at: datetime,
 ) -> Path:
     """Persist one drawn kiosk signature as a PNG inside File 3."""
 
+    return _save_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=f"{full_name} - {company}",
+        created_at=created_at,
+        destination_directory=config.FILE_3_SIGNATURES_DIR,
+        filename_prefix="signature",
+        validation_label="induction",
+    )
+
+
+def _save_induction_competency_cards(
+    *,
+    competency_files: List[Mapping[str, Any]],
+    full_name: str,
+    company: str,
+    created_at: datetime,
+) -> List[Path]:
+    """Persist uploaded competency cards alongside the File 3 induction record."""
+
+    saved_paths: List[Path] = []
+    for uploaded_file in competency_files:
+        file_name = Path(str(uploaded_file.get("name", ""))).name
+        file_stem = Path(file_name).stem
+        file_suffix = Path(file_name).suffix or ".bin"
+        competency_label = str(uploaded_file.get("label", "") or "").strip()
+        file_bytes = uploaded_file.get("bytes", b"")
+        if not file_name or not file_bytes:
+            continue
+        label_fragment = _sanitize_filename_fragment(competency_label)
+        stem_fragment = _sanitize_filename_fragment(file_stem or file_name)
+        destination_path = _build_available_destination(
+            Path(
+                f"{created_at:%Y-%m-%d}_"
+                f"{_sanitize_filename_fragment(full_name)}_"
+                f"{_sanitize_filename_fragment(company)}_"
+                f"{label_fragment + '_' if label_fragment else ''}"
+                f"{stem_fragment}{file_suffix}"
+            ),
+            config.FILE_3_COMPETENCY_CARDS_DIR,
+        )
+        destination_path.write_bytes(bytes(file_bytes))
+        saved_paths.append(destination_path)
+    return saved_paths
+
+
+def _save_attendance_signature_image(
+    *,
+    signature_image_data: Any,
+    full_name: str,
+    created_at: datetime,
+    action: str,
+) -> Path:
+    """Persist one drawn UHSF16.09 signature inside File 2."""
+
+    return _save_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=full_name,
+        created_at=created_at,
+        destination_directory=config.FILE_2_ATTENDANCE_SIGNATURES_DIR,
+        filename_prefix=f"attendance-{action}",
+        validation_label="attendance",
+    )
+
+
+def _save_toolbox_talk_signature_image(
+    *,
+    signature_image_data: Any,
+    full_name: str,
+    created_at: datetime,
+    topic: str,
+) -> Path:
+    """Persist one remote UHSF16.2 signature inside File 2."""
+
+    return _save_signature_image(
+        signature_image_data=signature_image_data,
+        full_name=f"{topic}-{full_name}",
+        created_at=created_at,
+        destination_directory=config.FILE_2_TBT_SIGNATURES_DIR,
+        filename_prefix="tbt-signature",
+        validation_label="toolbox talk",
+    )
+
+
+def read_toolbox_talk_document_bytes(
+    toolbox_talk_document: ToolboxTalkDocument,
+) -> Tuple[bytes, str]:
+    """Return the stored toolbox talk file bytes and a best-effort mime type."""
+
+    stored_path = Path(toolbox_talk_document.stored_file_path).expanduser()
+    if not stored_path.exists():
+        raise FileNotFoundError(f"Toolbox talk document is missing: {stored_path}")
+    mime_type = mimetypes.guess_type(toolbox_talk_document.original_file_name)[0]
+    return stored_path.read_bytes(), mime_type or "application/octet-stream"
+
+
+def _save_signature_image(
+    *,
+    signature_image_data: Any,
+    full_name: str,
+    created_at: datetime,
+    destination_directory: Path,
+    filename_prefix: str,
+    validation_label: str,
+) -> Path:
+    """Persist one drawn signature PNG in the requested workspace directory."""
+
     try:
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError("Pillow is required to save induction signatures.") from exc
+        raise RuntimeError("Pillow is required to save signature images.") from exc
 
     if signature_image_data is None:
-        raise ValidationError("Draw a signature before submitting the induction.")
+        raise ValidationError(
+            f"Draw a signature before submitting the {validation_label} form."
+        )
 
     try:
         signature_image = Image.fromarray(signature_image_data.astype("uint8")).convert(
@@ -5697,15 +8542,18 @@ def _save_induction_signature_image(
         raise ValidationError("Signature capture could not be processed.") from exc
 
     if not _signature_image_has_content(signature_image):
-        raise ValidationError("Draw a signature before submitting the induction.")
+        raise ValidationError(
+            f"Draw a signature before submitting the {validation_label} form."
+        )
 
+    destination_directory.mkdir(parents=True, exist_ok=True)
     output_path = _build_available_destination(
         Path(
-            "signature-"
+            f"{filename_prefix}-"
             f"{_sanitize_filename_fragment(full_name)}-"
             f"{created_at:%Y%m%d-%H%M}.png"
         ),
-        config.FILE_3_SIGNATURES_DIR,
+        destination_directory,
     )
     signature_image.convert("RGBA").save(output_path, format="PNG")
     return output_path

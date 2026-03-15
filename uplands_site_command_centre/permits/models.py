@@ -94,10 +94,30 @@ class VerificationStatus(str, Enum):
     UNVERIFIED = "UNVERIFIED"
 
 
+class WeeklySiteCheckFrequency(str, Enum):
+    """Applicability of one UHSF19.1 row across daily and weekly scopes."""
+
+    DAILY_ONLY = "daily_only"
+    WEEKLY_ONLY = "weekly_only"
+    BOTH = "both"
+
+    @property
+    def label(self) -> str:
+        """Return a human-readable label for the checklist editor."""
+
+        labels = {
+            WeeklySiteCheckFrequency.DAILY_ONLY: "Daily",
+            WeeklySiteCheckFrequency.WEEKLY_ONLY: "Weekly",
+            WeeklySiteCheckFrequency.BOTH: "Daily + Weekly",
+        }
+        return labels[self]
+
+
 class TemplateRegistry:
     """Hard-coded registry of approved official templates."""
 
-    PROJECT_ROOT: ClassVar[Path] = Path(__file__).resolve().parents[2]
+    DEFAULT_PROJECT_ROOT: ClassVar[Path] = Path(__file__).resolve().parents[2]
+    PROJECT_ROOT: ClassVar[Path] = DEFAULT_PROJECT_ROOT
     TEMPLATE_PATHS: ClassVar[Dict[str, Path]] = {
         "ladder_permit": Path(
             "templates/UHSF21.09 Step Ladders Permit - tagged-middle-v2.docx"
@@ -116,6 +136,9 @@ class TemplateRegistry:
         "site_check_register": Path("templates/UHSF19.1 Daily-Weekly Checklist - tagged.docx"),
         "weekly_site_check": Path("templates/UHSF19.1 Daily-Weekly Checklist - tagged.docx"),
         "site_induction": Path("templates/UHSF16.01_Template.docx"),
+        "attendance_register": Path("templates/UHSF16.09_Template_refocused_v2.docx"),
+        "site_diary": Path("templates/UHSF15.63_Template.docx"),
+        "toolbox_talk_register": Path("templates/UHSF16.2_Template.docx"),
     }
 
     @classmethod
@@ -133,7 +156,14 @@ class TemplateRegistry:
 
         if registered_path.is_absolute():
             return registered_path.resolve()
-        return (cls.PROJECT_ROOT / registered_path).resolve()
+        primary_path = (cls.PROJECT_ROOT / registered_path).resolve()
+        if primary_path.exists():
+            return primary_path
+
+        fallback_path = (cls.DEFAULT_PROJECT_ROOT / registered_path).resolve()
+        if fallback_path.exists():
+            return fallback_path
+        return primary_path
 
 
 COMMON_CONSTRUCTION_EWC_CODES: FrozenSet[str] = frozenset(
@@ -190,6 +220,39 @@ WEEKLY_SITE_CHECK_DAY_LABELS: Dict[str, str] = {
     **SITE_CHECK_WEEKDAY_LABELS,
     "weekly": "Weekly",
 }
+WEEKLY_SITE_CHECK_FREQUENCY_BY_ROW_NUMBER: Dict[int, WeeklySiteCheckFrequency] = {
+    1: WeeklySiteCheckFrequency.BOTH,
+    2: WeeklySiteCheckFrequency.BOTH,
+    3: WeeklySiteCheckFrequency.WEEKLY_ONLY,
+    4: WeeklySiteCheckFrequency.BOTH,
+    5: WeeklySiteCheckFrequency.BOTH,
+    6: WeeklySiteCheckFrequency.DAILY_ONLY,
+    7: WeeklySiteCheckFrequency.DAILY_ONLY,
+    8: WeeklySiteCheckFrequency.DAILY_ONLY,
+    9: WeeklySiteCheckFrequency.DAILY_ONLY,
+    10: WeeklySiteCheckFrequency.DAILY_ONLY,
+    11: WeeklySiteCheckFrequency.BOTH,
+    12: WeeklySiteCheckFrequency.DAILY_ONLY,
+    13: WeeklySiteCheckFrequency.BOTH,
+    14: WeeklySiteCheckFrequency.WEEKLY_ONLY,
+    15: WeeklySiteCheckFrequency.DAILY_ONLY,
+    16: WeeklySiteCheckFrequency.DAILY_ONLY,
+    17: WeeklySiteCheckFrequency.WEEKLY_ONLY,
+    18: WeeklySiteCheckFrequency.BOTH,
+    19: WeeklySiteCheckFrequency.DAILY_ONLY,
+    20: WeeklySiteCheckFrequency.DAILY_ONLY,
+    21: WeeklySiteCheckFrequency.DAILY_ONLY,
+    22: WeeklySiteCheckFrequency.DAILY_ONLY,
+    23: WeeklySiteCheckFrequency.DAILY_ONLY,
+    24: WeeklySiteCheckFrequency.DAILY_ONLY,
+    25: WeeklySiteCheckFrequency.DAILY_ONLY,
+    26: WeeklySiteCheckFrequency.DAILY_ONLY,
+    27: WeeklySiteCheckFrequency.DAILY_ONLY,
+    28: WeeklySiteCheckFrequency.DAILY_ONLY,
+    29: WeeklySiteCheckFrequency.DAILY_ONLY,
+    30: WeeklySiteCheckFrequency.BOTH,
+    31: WeeklySiteCheckFrequency.DAILY_ONLY,
+}
 SITE_CHECK_TEMPLATE_ROW_COUNT = 7
 SITE_CHECK_REQUIRED_TEMPLATE_PLACEHOLDERS: FrozenSet[str] = frozenset(
     {"site_name", "week_commencing", "checked_by", "checked_at"}
@@ -222,6 +285,37 @@ def _require_text(value: str, field_name: str) -> str:
     if not cleaned:
         raise ValueError(f"{field_name} must not be blank.")
     return cleaned
+
+
+def _coerce_weekly_site_check_frequency(
+    value: Any,
+    field_name: str,
+) -> WeeklySiteCheckFrequency:
+    """Return one validated row-frequency enum."""
+
+    if isinstance(value, WeeklySiteCheckFrequency):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a WeeklySiteCheckFrequency or string.")
+    cleaned_value = value.strip().lower()
+    try:
+        return WeeklySiteCheckFrequency(cleaned_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be one of: "
+            + ", ".join(item.value for item in WeeklySiteCheckFrequency)
+        ) from exc
+
+
+def get_weekly_site_check_frequency_for_row(
+    row_number: int,
+) -> WeeklySiteCheckFrequency:
+    """Return the configured frequency for one official UHSF19.1 row."""
+
+    return WEEKLY_SITE_CHECK_FREQUENCY_BY_ROW_NUMBER.get(
+        row_number,
+        WeeklySiteCheckFrequency.BOTH,
+    )
 
 
 def _normalise_optional_text(value: Optional[str], field_name: str) -> str:
@@ -279,6 +373,14 @@ def _coerce_date(value: date, field_name: str) -> date:
     raise TypeError(f"{field_name} must be a date, datetime, or ISO date string.")
 
 
+def _coerce_optional_date(value: Optional[date], field_name: str) -> Optional[date]:
+    """Accept ``None`` or any value supported by ``_coerce_date``."""
+
+    if value in (None, ""):
+        return None
+    return _coerce_date(value, field_name)
+
+
 def _coerce_datetime(value: datetime, field_name: str) -> datetime:
     """Accept datetimes or ISO strings when rehydrating from storage."""
 
@@ -287,6 +389,17 @@ def _coerce_datetime(value: datetime, field_name: str) -> datetime:
     if isinstance(value, str):
         return datetime.fromisoformat(value)
     raise TypeError(f"{field_name} must be a datetime or ISO datetime string.")
+
+
+def _coerce_optional_datetime(
+    value: Optional[datetime],
+    field_name: str,
+) -> Optional[datetime]:
+    """Accept ``None`` or any value supported by ``_coerce_datetime``."""
+
+    if value in (None, ""):
+        return None
+    return _coerce_datetime(value, field_name)
 
 
 def _coerce_week_commencing(value: date, field_name: str = "week_commencing") -> date:
@@ -534,6 +647,42 @@ def _coerce_non_negative_float(value: Any, field_name: str) -> float:
     return numeric_value
 
 
+def _coerce_optional_non_negative_float(
+    value: Optional[Any],
+    field_name: str,
+) -> Optional[float]:
+    """Accept ``None`` or any value supported by ``_coerce_non_negative_float``."""
+
+    if value in (None, ""):
+        return None
+    return _coerce_non_negative_float(value, field_name)
+
+
+def _coerce_non_negative_int(value: Any, field_name: str) -> int:
+    """Convert integer-like values and reject negatives."""
+
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer.")
+    if isinstance(value, int):
+        resolved_value = value
+    elif isinstance(value, float) and value.is_integer():
+        resolved_value = int(value)
+    elif isinstance(value, str):
+        cleaned_value = value.strip()
+        if not cleaned_value:
+            return 0
+        try:
+            resolved_value = int(cleaned_value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer.") from exc
+    else:
+        raise TypeError(f"{field_name} must be an integer.")
+
+    if resolved_value < 0:
+        raise ValueError(f"{field_name} must be zero or greater.")
+    return resolved_value
+
+
 def _normalise_ewc_code(value: str, field_name: str = "ewc_code") -> str:
     """Normalise common EWC code formats into a canonical form."""
 
@@ -723,7 +872,7 @@ class PermitDocument(BaseDocument):
 
     document_type: ClassVar[str] = "permit"
     document_name: ClassVar[str] = "Permit"
-    file_group: ClassVar[FileGroup] = FileGroup.FILE_4
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
     required_template_placeholders: ClassVar[FrozenSet[str]] = frozenset(
         {
             "permit_number",
@@ -1016,6 +1165,609 @@ class SiteAttendanceRegister(BaseDocument):
 
 
 @dataclass
+class DailyAttendanceEntryDocument(BaseDocument):
+    """Live File 2 daily sign-in/out record used for UHSF16.09 attendance."""
+
+    _register_document_type: ClassVar[bool] = True
+
+    linked_induction_doc_id: str
+    individual_name: str
+    contractor_name: str
+    vehicle_registration: str = ""
+    distance_travelled: str = ""
+    time_in: datetime = field(default_factory=datetime.now)
+    time_out: Optional[datetime] = None
+    hours_worked: Optional[float] = None
+    sign_in_signature_path: str = ""
+    sign_out_signature_path: str = ""
+
+    document_type: ClassVar[str] = "daily_attendance_entry"
+    document_name: ClassVar[str] = "Site Attendance Register (UHSF16.09)"
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
+    form_reference: ClassVar[str] = "UHSF16.09"
+    required_template_placeholders: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            "site_name",
+            "individual_name",
+            "contractor_name",
+            "vehicle_registration",
+            "distance_travelled",
+            "time_in",
+            "time_out",
+            "hours_worked",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.linked_induction_doc_id = _normalise_optional_text(
+            self.linked_induction_doc_id,
+            "linked_induction_doc_id",
+        )
+        self.individual_name = _require_text(self.individual_name, "individual_name")
+        self.contractor_name = _require_text(self.contractor_name, "contractor_name")
+        self.vehicle_registration = _normalise_optional_text(
+            self.vehicle_registration,
+            "vehicle_registration",
+        )
+        self.distance_travelled = _normalise_optional_text(
+            self.distance_travelled,
+            "distance_travelled",
+        )
+        self.time_in = _coerce_datetime(self.time_in, "time_in")
+        self.time_out = _coerce_optional_datetime(self.time_out, "time_out")
+        self.hours_worked = _coerce_optional_non_negative_float(
+            self.hours_worked,
+            "hours_worked",
+        )
+        self.sign_in_signature_path = _normalise_optional_text(
+            self.sign_in_signature_path,
+            "sign_in_signature_path",
+        )
+        self.sign_out_signature_path = _normalise_optional_text(
+            self.sign_out_signature_path,
+            "sign_out_signature_path",
+        )
+
+        if self.time_out is not None and self.time_out < self.time_in:
+            raise ValueError("time_out must be on or after time_in.")
+        if self.time_out is None and self.hours_worked is not None:
+            raise ValueError("hours_worked requires a recorded time_out.")
+
+    @property
+    def is_on_site(self) -> bool:
+        """Return True while the operative is still signed in."""
+
+        return self.status == DocumentStatus.ACTIVE and self.time_out is None
+
+    @property
+    def attendance_date(self) -> date:
+        """Return the calendar date this attendance entry was created for."""
+
+        return self.time_in.date()
+
+    @property
+    def is_uplands_employee(self) -> bool:
+        """Return True when the operative belongs to Uplands."""
+
+        lowered_company_name = self.contractor_name.casefold()
+        return any(
+            alias in lowered_company_name
+            for alias in ("uplands", "url", "uplands retail")
+        )
+
+    def to_template_context(self) -> Dict[str, str]:
+        """Expose live attendance data as a flat placeholder context."""
+
+        context = super().to_template_context()
+        context.update(
+            {
+                "full_name": self.individual_name,
+                "company": self.contractor_name,
+                "attendance_date": self.attendance_date.strftime("%d/%m/%Y"),
+                "time_in_display": self.time_in.strftime("%H:%M"),
+                "time_out_display": (
+                    self.time_out.strftime("%H:%M") if self.time_out is not None else ""
+                ),
+                "hours_worked_display": (
+                    f"{self.hours_worked:.2f}"
+                    if self.hours_worked is not None
+                    else ""
+                ),
+                "document_code": self.form_reference,
+            }
+        )
+        return context
+
+    def get_repository_metadata(self) -> Dict[str, str]:
+        """Expose contractor and linked induction metadata for repository lookups."""
+
+        metadata = {"contractor_name": self.contractor_name}
+        if self.linked_induction_doc_id:
+            metadata["linked_document_id"] = self.linked_induction_doc_id
+        return metadata
+
+    @classmethod
+    def from_storage_dict(cls, data: Mapping[str, Any]) -> "DailyAttendanceEntryDocument":
+        """Rehydrate one live attendance entry from storage."""
+
+        payload = cls._deserialize_base_fields(data)
+        payload["time_in"] = _coerce_datetime(payload["time_in"], "time_in")
+        payload["time_out"] = _coerce_optional_datetime(
+            payload.get("time_out"),
+            "time_out",
+        )
+        payload["hours_worked"] = _coerce_optional_non_negative_float(
+            payload.get("hours_worked"),
+            "hours_worked",
+        )
+        payload["sign_in_signature_path"] = payload.get("sign_in_signature_path", "")
+        payload["sign_out_signature_path"] = payload.get("sign_out_signature_path", "")
+        return cls(**payload)
+
+
+def _normalise_site_diary_contractors(
+    rows: List[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return clean contractor rows for the UHSF15.63 contractor table."""
+
+    if not isinstance(rows, list):
+        raise TypeError("contractors must be a list of mappings.")
+
+    cleaned_rows: List[Dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, Mapping):
+            raise TypeError("Each contractors row must be a mapping.")
+        company = _normalise_optional_text(
+            str(row.get("company", "")),
+            f"contractors[{index}].company",
+        )
+        days = _coerce_non_negative_int(row.get("days", 0), f"contractors[{index}].days")
+        nights = _coerce_non_negative_int(
+            row.get("nights", 0),
+            f"contractors[{index}].nights",
+        )
+        if not company and days == 0 and nights == 0:
+            continue
+        if not company:
+            raise ValueError(f"contractors[{index}].company must not be blank.")
+        cleaned_rows.append(
+            {
+                "company": company,
+                "days": days,
+                "nights": nights,
+            }
+        )
+    return cleaned_rows
+
+
+def _normalise_site_diary_visitors(
+    rows: List[Mapping[str, Any]],
+) -> List[Dict[str, str]]:
+    """Return clean visitor rows for the UHSF15.63 visitors table."""
+
+    if not isinstance(rows, list):
+        raise TypeError("visitors must be a list of mappings.")
+
+    cleaned_rows: List[Dict[str, str]] = []
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, Mapping):
+            raise TypeError("Each visitors row must be a mapping.")
+        visitor_name = _normalise_optional_text(
+            str(row.get("name", "")),
+            f"visitors[{index}].name",
+        )
+        company = _normalise_optional_text(
+            str(row.get("company", "")),
+            f"visitors[{index}].company",
+        )
+        if not visitor_name and not company:
+            continue
+        if not visitor_name:
+            raise ValueError(f"visitors[{index}].name must not be blank.")
+        cleaned_rows.append(
+            {
+                "name": visitor_name,
+                "company": company,
+            }
+        )
+    return cleaned_rows
+
+
+@dataclass
+class SiteDiaryDocument(BaseDocument):
+    """UHSF15.63 daily site diary captured and exported from File 2."""
+
+    _register_document_type: ClassVar[bool] = True
+
+    date: date
+    uplands_days: int = 0
+    uplands_nights: int = 0
+    skip_exchange: str = ""
+    fire_day_on: bool = False
+    fire_day_off: bool = False
+    fire_night_on: bool = False
+    fire_night_off: bool = False
+    weather_dry: bool = False
+    weather_mixed: bool = False
+    weather_wet: bool = False
+    contractors: List[Dict[str, Any]] = field(default_factory=list)
+    visitors: List[Dict[str, str]] = field(default_factory=list)
+    incidents_details: str = ""
+    hs_reported_tick: bool = False
+    area_handovers: str = ""
+    todays_comments: str = ""
+    generated_document_path: str = ""
+
+    document_type: ClassVar[str] = "site_diary"
+    document_name: ClassVar[str] = "Daily Site Diary (UHSF15.63)"
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
+    form_reference: ClassVar[str] = "UHSF15.63"
+    required_template_placeholders: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            "date",
+            "uplands_days",
+            "uplands_nights",
+            "skip_exchange",
+            "fire_day_on",
+            "fire_day_off",
+            "fire_night_on",
+            "fire_night_off",
+            "weather_dry",
+            "weather_mixed",
+            "weather_wet",
+            "incidents_details",
+            "hs_reported_tick",
+            "area_handovers",
+            "todays_comments",
+            "c.company",
+            "c.days",
+            "c.nights",
+            "v.name",
+            "v.company",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.date = _coerce_date(self.date, "date")
+        self.uplands_days = _coerce_non_negative_int(self.uplands_days, "uplands_days")
+        self.uplands_nights = _coerce_non_negative_int(
+            self.uplands_nights,
+            "uplands_nights",
+        )
+        self.skip_exchange = _normalise_optional_text(
+            self.skip_exchange,
+            "skip_exchange",
+        )
+        self.fire_day_on = _require_bool(self.fire_day_on, "fire_day_on")
+        self.fire_day_off = _require_bool(self.fire_day_off, "fire_day_off")
+        self.fire_night_on = _require_bool(self.fire_night_on, "fire_night_on")
+        self.fire_night_off = _require_bool(self.fire_night_off, "fire_night_off")
+        self.weather_dry = _require_bool(self.weather_dry, "weather_dry")
+        self.weather_mixed = _require_bool(self.weather_mixed, "weather_mixed")
+        self.weather_wet = _require_bool(self.weather_wet, "weather_wet")
+        self.contractors = _normalise_site_diary_contractors(self.contractors)
+        self.visitors = _normalise_site_diary_visitors(self.visitors)
+        self.incidents_details = _normalise_optional_text(
+            self.incidents_details,
+            "incidents_details",
+        )
+        self.hs_reported_tick = _require_bool(
+            self.hs_reported_tick,
+            "hs_reported_tick",
+        )
+        self.area_handovers = _normalise_optional_text(
+            self.area_handovers,
+            "area_handovers",
+        )
+        self.todays_comments = _normalise_optional_text(
+            self.todays_comments,
+            "todays_comments",
+        )
+        self.generated_document_path = _normalise_optional_text(
+            self.generated_document_path,
+            "generated_document_path",
+        )
+
+    def to_template_context(self) -> Dict[str, Any]:
+        """Expose template-ready fields for the UHSF15.63 diary export."""
+
+        context: Dict[str, Any] = super().to_template_context()
+        context.update(
+            {
+                "date": self.date.strftime("%d/%m/%Y"),
+                "uplands_days": str(self.uplands_days),
+                "uplands_nights": str(self.uplands_nights),
+                "skip_exchange": self.skip_exchange,
+                "fire_day_on": "X" if self.fire_day_on else "",
+                "fire_day_off": "X" if self.fire_day_off else "",
+                "fire_night_on": "X" if self.fire_night_on else "",
+                "fire_night_off": "X" if self.fire_night_off else "",
+                "weather_dry": "X" if self.weather_dry else "",
+                "weather_mixed": "X" if self.weather_mixed else "",
+                "weather_wet": "X" if self.weather_wet else "",
+                "contractors": [
+                    {
+                        "company": row["company"],
+                        "days": str(row["days"]),
+                        "nights": str(row["nights"]),
+                    }
+                    for row in self.contractors
+                ],
+                "visitors": [
+                    {
+                        "name": row["name"],
+                        "company": row["company"],
+                    }
+                    for row in self.visitors
+                ],
+                "incidents_details": self.incidents_details,
+                "hs_reported_tick": "X" if self.hs_reported_tick else "",
+                "area_handovers": self.area_handovers,
+                "todays_comments": self.todays_comments,
+            }
+        )
+        return context
+
+    def get_repository_metadata(self) -> Dict[str, str]:
+        """Expose diary date metadata for repository lookups."""
+
+        return {
+            "reference_number": self.date.isoformat(),
+            "diary_date": self.date.isoformat(),
+            "form_reference": self.form_reference,
+        }
+
+    @classmethod
+    def from_storage_dict(cls, data: Mapping[str, Any]) -> "SiteDiaryDocument":
+        """Rehydrate one saved UHSF15.63 diary from storage."""
+
+        payload = cls._deserialize_base_fields(data)
+        payload["date"] = _coerce_date(payload.get("date"), "date")
+        payload["uplands_days"] = _coerce_non_negative_int(
+            payload.get("uplands_days", 0),
+            "uplands_days",
+        )
+        payload["uplands_nights"] = _coerce_non_negative_int(
+            payload.get("uplands_nights", 0),
+            "uplands_nights",
+        )
+        payload["contractors"] = _normalise_site_diary_contractors(
+            list(payload.get("contractors", []))
+        )
+        payload["visitors"] = _normalise_site_diary_visitors(
+            list(payload.get("visitors", []))
+        )
+        payload["generated_document_path"] = payload.get("generated_document_path", "")
+        return cls(**payload)
+
+
+@dataclass
+class ToolboxTalkDocument(BaseDocument):
+    """Uploaded source document for one remote toolbox talk topic."""
+
+    _register_document_type: ClassVar[bool] = True
+
+    topic: str
+    original_file_name: str
+    stored_file_path: str
+
+    document_type: ClassVar[str] = "toolbox_talk_document"
+    document_name: ClassVar[str] = "UHSF16.2 Toolbox Talk Document"
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.topic = _require_text(self.topic, "topic")
+        self.original_file_name = _require_text(
+            self.original_file_name,
+            "original_file_name",
+        )
+        self.stored_file_path = _require_text(self.stored_file_path, "stored_file_path")
+
+    def get_repository_metadata(self) -> Dict[str, str]:
+        """Expose topic metadata for repository lookups."""
+
+        return {"reference_number": self.topic}
+
+    @classmethod
+    def from_storage_dict(cls, data: Mapping[str, Any]) -> "ToolboxTalkDocument":
+        """Rehydrate one uploaded toolbox talk source document from storage."""
+
+        payload = cls._deserialize_base_fields(data)
+        payload["original_file_name"] = payload.get("original_file_name", "")
+        payload["stored_file_path"] = payload.get("stored_file_path", "")
+        return cls(**payload)
+
+
+@dataclass
+class ToolboxTalkCompletionDocument(BaseDocument):
+    """Remote UHSF16.2 toolbox talk sign-off captured from on-site operatives."""
+
+    _register_document_type: ClassVar[bool] = True
+
+    topic: str
+    linked_induction_doc_id: str
+    individual_name: str
+    contractor_name: str
+    completed_at: datetime = field(default_factory=datetime.now)
+    signature_image_path: str = ""
+    document_read_confirmed: bool = False
+
+    document_type: ClassVar[str] = "toolbox_talk_completion"
+    document_name: ClassVar[str] = "UHSF16.2 Toolbox Talk Completion"
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
+    required_template_placeholders: ClassVar[FrozenSet[str]] = frozenset(
+        {"topic", "individual_name", "contractor_name", "completed_at", "signature"}
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.topic = _require_text(self.topic, "topic")
+        self.linked_induction_doc_id = _normalise_optional_text(
+            self.linked_induction_doc_id,
+            "linked_induction_doc_id",
+        )
+        self.individual_name = _require_text(self.individual_name, "individual_name")
+        self.contractor_name = _require_text(self.contractor_name, "contractor_name")
+        self.completed_at = _coerce_datetime(self.completed_at, "completed_at")
+        self.signature_image_path = _normalise_optional_text(
+            self.signature_image_path,
+            "signature_image_path",
+        )
+        self.document_read_confirmed = bool(self.document_read_confirmed)
+
+    def to_template_context(self) -> Dict[str, str]:
+        """Expose the UHSF16.2 placeholders used by the Word export."""
+
+        context = super().to_template_context()
+        context.update(
+            {
+                "name": self.individual_name,
+                "company": self.contractor_name,
+                "topic": self.topic,
+                "date": self.completed_at.strftime("%d/%m/%Y"),
+                "completed_date": self.completed_at.strftime("%d/%m/%Y"),
+                "read_confirmed": "Yes" if self.document_read_confirmed else "No",
+            }
+        )
+        return context
+
+    def get_repository_metadata(self) -> Dict[str, str]:
+        """Expose topic and linked induction metadata for repository lookups."""
+
+        metadata = {
+            "contractor_name": self.contractor_name,
+            "reference_number": self.topic,
+        }
+        if self.linked_induction_doc_id:
+            metadata["linked_document_id"] = self.linked_induction_doc_id
+        return metadata
+
+    @classmethod
+    def from_storage_dict(cls, data: Mapping[str, Any]) -> "ToolboxTalkCompletionDocument":
+        """Rehydrate one remote toolbox talk completion from storage."""
+
+        payload = cls._deserialize_base_fields(data)
+        payload["completed_at"] = _coerce_datetime(
+            payload.get("completed_at"),
+            "completed_at",
+        )
+        payload["signature_image_path"] = payload.get("signature_image_path", "")
+        payload["document_read_confirmed"] = bool(
+            payload.get("document_read_confirmed", False)
+        )
+        return cls(**payload)
+
+
+@dataclass
+class BroadcastDispatchDocument(BaseDocument):
+    """One Messages launch batch for a live site broadcast or toolbox talk."""
+
+    _register_document_type: ClassVar[bool] = True
+
+    dispatch_kind: str
+    channel: str
+    audience_label: str
+    subject: str
+    message_body: str
+    recipient_numbers: List[str] = field(default_factory=list)
+    recipient_names: List[str] = field(default_factory=list)
+    topic: str = ""
+    dispatched_at: datetime = field(default_factory=datetime.now)
+    launch_mode: str = "messages_draft"
+    launched_successfully: bool = False
+    chunk_count: int = 0
+
+    document_type: ClassVar[str] = "broadcast_dispatch"
+    document_name: ClassVar[str] = "Broadcast Dispatch"
+    file_group: ClassVar[FileGroup] = FileGroup.FILE_2
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.dispatch_kind = _require_text(self.dispatch_kind, "dispatch_kind")
+        self.channel = _require_text(self.channel, "channel")
+        self.audience_label = _require_text(self.audience_label, "audience_label")
+        self.subject = _require_text(self.subject, "subject")
+        self.message_body = _normalise_optional_text(self.message_body, "message_body")
+        self.recipient_numbers = _normalise_text_list(
+            self.recipient_numbers,
+            "recipient_numbers",
+        )
+        self.recipient_names = _normalise_text_list(
+            self.recipient_names,
+            "recipient_names",
+        )
+        self.topic = _normalise_optional_text(self.topic, "topic")
+        self.dispatched_at = _coerce_datetime(self.dispatched_at, "dispatched_at")
+        self.launch_mode = _require_text(self.launch_mode, "launch_mode")
+        self.launched_successfully = _require_bool(
+            self.launched_successfully,
+            "launched_successfully",
+        )
+        if isinstance(self.chunk_count, bool):
+            raise TypeError("chunk_count must be an integer.")
+        self.chunk_count = int(self.chunk_count)
+        if self.chunk_count < 0:
+            raise ValueError("chunk_count must be zero or greater.")
+
+    def to_template_context(self) -> Dict[str, str]:
+        """Expose a flat dispatch summary for any future register exports."""
+
+        context = super().to_template_context()
+        context.update(
+            {
+                "recipient_count": str(len(self.recipient_numbers)),
+                "recipient_numbers_csv": ", ".join(self.recipient_numbers),
+                "recipient_names_csv": ", ".join(self.recipient_names),
+                "dispatched_at_display": self.dispatched_at.strftime("%d/%m/%Y %H:%M"),
+            }
+        )
+        return context
+
+    def get_repository_metadata(self) -> Dict[str, str]:
+        """Expose dispatch metadata for repository lookups."""
+
+        metadata = {
+            "reference_number": self.topic or self.subject,
+            "dispatch_kind": self.dispatch_kind,
+            "channel": self.channel,
+        }
+        if self.topic:
+            metadata["topic"] = self.topic
+        return metadata
+
+    @classmethod
+    def from_storage_dict(cls, data: Mapping[str, Any]) -> "BroadcastDispatchDocument":
+        """Rehydrate one broadcast dispatch log entry from storage."""
+
+        payload = cls._deserialize_base_fields(data)
+        payload["message_body"] = payload.get("message_body", "")
+        payload["recipient_numbers"] = [
+            str(item).strip()
+            for item in payload.get("recipient_numbers", [])
+            if str(item).strip()
+        ]
+        payload["recipient_names"] = [
+            str(item).strip()
+            for item in payload.get("recipient_names", [])
+            if str(item).strip()
+        ]
+        payload["topic"] = payload.get("topic", "")
+        payload["dispatched_at"] = _coerce_datetime(
+            payload.get("dispatched_at"),
+            "dispatched_at",
+        )
+        payload["launch_mode"] = payload.get("launch_mode", "messages_draft")
+        payload["launched_successfully"] = bool(
+            payload.get("launched_successfully", False)
+        )
+        payload["chunk_count"] = int(payload.get("chunk_count", 0))
+        return cls(**payload)
+
+
+@dataclass
 class PlantAssetDocument(BaseDocument):
     """File 2 plant and equipment asset captured from hire paperwork."""
 
@@ -1142,6 +1894,7 @@ class WeeklySiteCheckRowDefinition:
     row_number: int
     section: str
     prompt: str
+    frequency: WeeklySiteCheckFrequency = WeeklySiteCheckFrequency.BOTH
 
     def __post_init__(self) -> None:
         if not isinstance(self.row_number, int):
@@ -1152,6 +1905,39 @@ class WeeklySiteCheckRowDefinition:
             )
         object.__setattr__(self, "section", _require_text(self.section, "section"))
         object.__setattr__(self, "prompt", _require_text(self.prompt, "prompt"))
+        object.__setattr__(
+            self,
+            "frequency",
+            _coerce_weekly_site_check_frequency(self.frequency, "frequency"),
+        )
+
+    def supports_daily_checks(self) -> bool:
+        """Return True when the row should appear in the daily editor."""
+
+        return self.frequency in {
+            WeeklySiteCheckFrequency.DAILY_ONLY,
+            WeeklySiteCheckFrequency.BOTH,
+        }
+
+    def supports_weekly_checks(self) -> bool:
+        """Return True when the row should appear in the weekly editor."""
+
+        return self.frequency in {
+            WeeklySiteCheckFrequency.WEEKLY_ONLY,
+            WeeklySiteCheckFrequency.BOTH,
+        }
+
+    def supports_day_key(self, day_key: str) -> bool:
+        """Return True when the row should write to the requested template column."""
+
+        resolved_day_key = _require_text(day_key, "day_key").strip().lower()
+        if resolved_day_key == "weekly":
+            return self.supports_weekly_checks()
+        if resolved_day_key not in SITE_CHECK_WEEKDAY_KEYS:
+            raise ValueError(
+                f"day_key must be one of {', '.join(WEEKLY_SITE_CHECK_DAY_KEYS)}."
+            )
+        return self.supports_daily_checks()
 
 
 @dataclass
@@ -1193,12 +1979,33 @@ class WeeklySiteCheckRowState:
             )
         self.values[resolved_day_key] = _normalise_optional_bool(value, "value")
 
-    def to_template_context(self) -> Dict[str, str]:
+    def to_template_context(
+        self,
+        *,
+        frequency: WeeklySiteCheckFrequency = WeeklySiteCheckFrequency.BOTH,
+    ) -> Dict[str, str]:
         """Map one row onto the official tagged placeholders."""
 
         return {
-            f"{day_key}_{self.row_number}": _weekly_checklist_symbol(
-                self.values.get(day_key)
+            f"{day_key}_{self.row_number}": (
+                _weekly_checklist_symbol(self.values.get(day_key))
+                if (
+                    day_key == "weekly"
+                    and frequency
+                    in {
+                        WeeklySiteCheckFrequency.WEEKLY_ONLY,
+                        WeeklySiteCheckFrequency.BOTH,
+                    }
+                )
+                or (
+                    day_key in SITE_CHECK_WEEKDAY_KEYS
+                    and frequency
+                    in {
+                        WeeklySiteCheckFrequency.DAILY_ONLY,
+                        WeeklySiteCheckFrequency.BOTH,
+                    }
+                )
+                else ""
             )
             for day_key in WEEKLY_SITE_CHECK_DAY_KEYS
         }
@@ -1319,7 +2126,13 @@ class WeeklySiteCheck(BaseDocument):
         context["checked_at"] = self.checked_at.strftime("%d/%m/%Y %H:%M")
 
         for row_state in self.row_states:
-            context.update(row_state.to_template_context())
+            context.update(
+                row_state.to_template_context(
+                    frequency=get_weekly_site_check_frequency_for_row(
+                        row_state.row_number
+                    )
+                )
+            )
 
         for day_key in SITE_CHECK_WEEKDAY_KEYS:
             context[f"initials_{day_key}"] = self.daily_initials.get(day_key, "")
@@ -1860,10 +2673,23 @@ class InductionDocument(BaseDocument):
     emergency_tel: str = ""
     medical: str = ""
     cscs_number: str = ""
+    cscs_expiry: Optional[date] = None
+    asbestos_cert: bool = False
+    erect_scaffold: bool = False
+    cisrs_no: str = ""
+    cisrs_expiry: Optional[date] = None
+    operate_plant: bool = False
+    cpcs_no: str = ""
+    cpcs_expiry: Optional[date] = None
+    client_training_desc: str = ""
+    client_training_date: Optional[date] = None
+    client_training_expiry: Optional[date] = None
     first_aider: bool = False
     fire_warden: bool = False
     supervisor: bool = False
     smsts: bool = False
+    competency_expiry_date: Optional[date] = None
+    competency_card_paths: str = ""
     signature_image_path: str = ""
     completed_document_path: str = ""
 
@@ -1882,7 +2708,17 @@ class InductionDocument(BaseDocument):
             "emergency_contact",
             "emergency_tel",
             "medical",
-            "cscs_no",
+            "cscs_expiry",
+            "asbestos_cert",
+            "erect_scaffold",
+            "cisrs_no",
+            "cisrs_expiry",
+            "operate_plant",
+            "cpcs_no",
+            "cpcs_expiry",
+            "client_training_desc",
+            "client_training_date",
+            "client_training_expiry",
             "first_aider",
             "fire_warden",
             "supervisor",
@@ -1917,10 +2753,38 @@ class InductionDocument(BaseDocument):
         )
         self.medical = _normalise_optional_text(self.medical, "medical")
         self.cscs_number = _normalise_optional_text(self.cscs_number, "cscs_number")
+        self.cscs_expiry = _coerce_optional_date(self.cscs_expiry, "cscs_expiry")
+        self.asbestos_cert = _require_bool(self.asbestos_cert, "asbestos_cert")
+        self.erect_scaffold = _require_bool(self.erect_scaffold, "erect_scaffold")
+        self.cisrs_no = _normalise_optional_text(self.cisrs_no, "cisrs_no")
+        self.cisrs_expiry = _coerce_optional_date(self.cisrs_expiry, "cisrs_expiry")
+        self.operate_plant = _require_bool(self.operate_plant, "operate_plant")
+        self.cpcs_no = _normalise_optional_text(self.cpcs_no, "cpcs_no")
+        self.cpcs_expiry = _coerce_optional_date(self.cpcs_expiry, "cpcs_expiry")
+        self.client_training_desc = _normalise_optional_text(
+            self.client_training_desc,
+            "client_training_desc",
+        )
+        self.client_training_date = _coerce_optional_date(
+            self.client_training_date,
+            "client_training_date",
+        )
+        self.client_training_expiry = _coerce_optional_date(
+            self.client_training_expiry,
+            "client_training_expiry",
+        )
         self.first_aider = _require_bool(self.first_aider, "first_aider")
         self.fire_warden = _require_bool(self.fire_warden, "fire_warden")
         self.supervisor = _require_bool(self.supervisor, "supervisor")
         self.smsts = _require_bool(self.smsts, "smsts")
+        self.competency_expiry_date = _coerce_optional_date(
+            self.competency_expiry_date,
+            "competency_expiry_date",
+        )
+        self.competency_card_paths = _normalise_optional_text(
+            self.competency_card_paths,
+            "competency_card_paths",
+        )
         self.signature_image_path = _normalise_optional_text(
             self.signature_image_path,
             "signature_image_path",
@@ -1943,6 +2807,7 @@ class InductionDocument(BaseDocument):
 
         context = super().to_template_context()
         role_ticks = {
+            "asbestos_cert": self.asbestos_cert,
             "first_aider": self.first_aider,
             "fire_warden": self.fire_warden,
             "supervisor": self.supervisor,
@@ -1965,7 +2830,42 @@ class InductionDocument(BaseDocument):
                 "cscs": self.cscs_number,
                 "cscs_no": self.cscs_number,
                 "cscs_number": self.cscs_number,
+                "cscs_expiry": (
+                    self.cscs_expiry.strftime("%d/%m/%Y")
+                    if self.cscs_expiry is not None
+                    else ""
+                ),
+                "erect_scaffold": "Yes" if self.erect_scaffold else "No",
+                "cisrs_no": self.cisrs_no,
+                "cisrs_expiry": (
+                    self.cisrs_expiry.strftime("%d/%m/%Y")
+                    if self.cisrs_expiry is not None
+                    else ""
+                ),
+                "operate_plant": "Yes" if self.operate_plant else "No",
+                "cpcs_no": self.cpcs_no,
+                "cpcs_expiry": (
+                    self.cpcs_expiry.strftime("%d/%m/%Y")
+                    if self.cpcs_expiry is not None
+                    else ""
+                ),
+                "client_training_desc": self.client_training_desc,
+                "client_training_date": (
+                    self.client_training_date.strftime("%d/%m/%Y")
+                    if self.client_training_date is not None
+                    else ""
+                ),
+                "client_training_expiry": (
+                    self.client_training_expiry.strftime("%d/%m/%Y")
+                    if self.client_training_expiry is not None
+                    else ""
+                ),
                 "linked_rams_doc_id": self.linked_rams_doc_id,
+                "competency_expiry_date": (
+                    self.competency_expiry_date.strftime("%d/%m/%Y")
+                    if self.competency_expiry_date is not None
+                    else ""
+                ),
                 "signature_image_path": self.signature_image_path,
                 "completed_document_path": self.completed_document_path,
             }

@@ -2,29 +2,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 import html
 import json
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote, urlparse, urlunparse
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_js_eval import streamlit_js_eval
 
 from uplands_site_command_centre import (
     COSHH_DESTINATION,
     COSHHDocument,
     DATABASE_PATH,
+    DailyAttendanceEntryDocument,
     FILE_1_OUTPUT_DIR,
+    FILE_2_ATTENDANCE_OUTPUT_DIR,
+    FILE_2_ATTENDANCE_SIGNATURES_DIR,
+    FILE_2_DIARY_OUTPUT_DIR,
+    FILE_2_TBT_ACTIVE_DOCS_DIR,
     FILE_2_CHECKLIST_OUTPUT_DIR,
+    FILE_2_TBT_OUTPUT_DIR,
+    FILE_2_TBT_SIGNATURES_DIR,
     FILE_3_COMPLETED_INDUCTIONS_DIR,
+    FILE_3_COMPETENCY_CARDS_DIR,
     FILE_3_OUTPUT_DIR,
+    FILE_3_REVIEW_DIR,
     FILE_3_SIGNATURES_DIR,
     InductionDocument,
     LadderPermit,
+    LOVEDEAN_SITE_LATITUDE,
+    LOVEDEAN_SITE_LONGITUDE,
     PlantAssetDocument,
     PERMITS_DESTINATION,
     PLANT_HIRE_REGISTER_DIR,
@@ -33,14 +49,18 @@ from uplands_site_command_centre import (
     SafetyAsset,
     SITE_CHECK_WEEKDAY_KEYS,
     SITE_CHECK_WEEKDAY_LABELS,
+    SiteDiaryDocument,
     CarrierComplianceDocument,
     CarrierComplianceDocumentType,
+    BroadcastDispatchDocument,
     ComplianceAlertStatus,
+    DocumentNotFoundError,
     DocumentStatus,
     DocumentRepository,
     FileGroup,
     SiteAttendanceRecord,
     SiteAttendanceRegister,
+    SiteBroadcastContact,
     SiteWorker,
     TemplateValidationError,
     TOOLBOX_TALK_REGISTER_DIR,
@@ -48,25 +68,57 @@ from uplands_site_command_centre import (
     WeeklySiteCheck,
     WasteRegister,
     WasteTransferNoteDocument,
+    build_live_site_broadcast_contacts,
+    build_site_alert_sms_link,
+    build_site_alert_sms_links,
+    build_pending_toolbox_talk_contacts,
     build_site_worker_roster,
+    build_toolbox_talk_sms_message,
+    calculate_haversine_distance_meters,
     check_carrier_compliance,
+    complete_daily_attendance_sign_out,
     create_weekly_site_check_checklist_draft,
+    create_daily_attendance_sign_in,
     create_site_induction_document,
     create_ladder_permit_draft,
     file_and_index_all,
+    generate_toolbox_talk_register_document,
+    generate_site_diary_document,
+    detect_public_tunnel_url_from_log,
+    generate_attendance_register_document,
     generate_site_induction_poster,
     generate_coshh_register_document,
     generate_rams_register_document,
     generate_waste_register_document,
     generate_plant_register_document,
     generate_permit_register_document,
+    get_latest_toolbox_talk_document,
+    get_site_induction_url,
+    get_daily_contractor_headcount,
     get_waste_kpi_sheet_metadata,
     get_valid_template_tags,
     get_weekly_site_check_row_definitions,
+    list_daily_attendance_entries,
+    list_toolbox_talk_documents,
+    list_toolbox_talk_completions,
+    log_toolbox_talk_completion,
+    load_app_settings,
+    lookup_uk_postcode_details,
+    list_broadcast_dispatches,
+    read_toolbox_talk_document_bytes,
+    park_file_3_document_for_review,
+    rebuild_file_3_safety_inventory,
     run_workspace_diagnostic,
+    save_toolbox_talk_document,
+    save_app_settings,
     smart_scan_waste_transfer_note,
     sync_file_4_permit_records,
     update_logged_waste_transfer_note,
+    build_toolbox_talk_url,
+    launch_messages_sms_broadcast,
+    log_broadcast_dispatch,
+    ToolboxTalkDocument,
+    ToolboxTalkCompletionDocument,
 )
 
 
@@ -74,6 +126,7 @@ APP_ROOT = Path(__file__).resolve().parent
 UPLANDS_LOGO = APP_ROOT / "Home Uplands.png"
 NATIONAL_GRID_LOGO = APP_ROOT / "Ng logo.png"
 PROJECT_SETUP_PATH = DATABASE_PATH.parent / "project_setup.json"
+SITE_DIARY_DRAFTS_PATH = DATABASE_PATH.parent / "site_diary_drafts.json"
 
 UPLANDS_PINK = "#D1228E"
 UPLANDS_BLUE = "#5B8DEF"
@@ -90,6 +143,12 @@ PROJECT_NAME = "NG Lovedean Substation"
 SITE_TITLE = "Lovedean Substation - Site Management Portal"
 ABUCS_NAME = "Abucs"
 SITE_MANAGER_NAME = "Ceri Edwards"
+LOVEDEAN_SITE_POSTCODE = "PO8 0SJ"
+LOVEDEAN_SITE_ADDRESS = "National Grid, Broadway Lane, Waterlooville, Hampshire, PO8 0SJ"
+ATTENDANCE_FORM_METADATA = (
+    "Date Issued: 12-AUG-2013 | Document Type: FORM | Created by: HSEQ Dept."
+)
+GEOFENCE_RADIUS_METERS = 500
 LADDER_CHECKLIST_QUESTIONS: Dict[int, str] = {
     1: "Safer alternative eliminated",
     2: "Task-specific RAMS prepared and approved",
@@ -140,6 +199,41 @@ class ContractorFolderRow:
 
 
 @dataclass(frozen=True)
+class File3ReviewCandidate:
+    """One live File 3 record that likely needs a manual metadata review."""
+
+    document_type: str
+    doc_id: str
+    company: str
+    title: str
+    reference: str
+    version: str
+    findings: tuple[str, ...]
+    source_path: Optional[Path] = None
+
+    @property
+    def label(self) -> str:
+        """Return a concise selectbox label for one review record."""
+
+        finding_text = ", ".join(self.findings)
+        return (
+            f"{self.document_type} | {self.company or 'No company'} | "
+            f"{self.title or self.reference or self.doc_id} | {finding_text}"
+        )
+
+
+FILE_3_REVIEW_TYPE_FILTERS = ("All", "RAMS", "COSHH")
+FILE_3_REVIEW_FINDING_FILTERS = (
+    "Any finding",
+    "Company",
+    "Title / Substance",
+    "Supplier",
+    "Reference",
+    "Version",
+)
+
+
+@dataclass(frozen=True)
 class ProjectSetup:
     """Portable project metadata reused across the command centre."""
 
@@ -147,6 +241,36 @@ class ProjectSetup:
     job_number: str
     site_address: str
     client_name: str
+    public_tunnel_url: str
+    site_latitude: float
+    site_longitude: float
+    geofence_radius_meters: int
+    known_sites: List["SavedSiteProfile"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SavedSiteProfile:
+    """One previously used site profile remembered by Project Setup."""
+
+    site_name: str
+    site_address: str
+    client_name: str
+    job_number: str
+    site_latitude: float
+    site_longitude: float
+    geofence_radius_meters: int
+    last_used_at: str = ""
+
+    @property
+    def label(self) -> str:
+        """Return a compact sidebar label for this saved site."""
+
+        postcode = _extract_uk_postcode(self.site_address)
+        if postcode:
+            return f"{self.site_name} ({postcode})"
+        if self.site_address:
+            return f"{self.site_name} | {self.site_address[:28]}"
+        return self.site_name
 
 
 FILE_STATIONS: List[FileStation] = [
@@ -169,19 +293,27 @@ FILE_STATIONS: List[FileStation] = [
         subtitle="The bouncer for RAMS, COSHH, and induction coverage.",
     ),
     FileStation(
-        label="📝 SITE INDUCTION",
-        number="INDUCTION",
-        title="Site Induction",
-        subtitle="Mobile sign-in kiosk with signature capture and live induction logging.",
-    ),
-    FileStation(
         label="⚡ FILE 4: Permits & Temp Works",
         number="FILE 4",
         title="Permits & Temp Works",
         subtitle="The motor for UHSF21.09 and live permit issue control.",
     ),
+    FileStation(
+        label="📅 SITE ATTENDANCE REGISTER (UHSF16.09)",
+        number="INDUCTION",
+        title="Site Attendance Register (UHSF16.09)",
+        subtitle="Daily sign-in, sign-out, and live fire roll backed by induction records.",
+    ),
+    FileStation(
+        label="📢 SITE ALERTS & TBTs",
+        number="BROADCAST",
+        title="Site Alerts & TBTs",
+        subtitle="Instant contact lists, remote toolbox talks, and live sign-off export.",
+    ),
 ]
-DEFAULT_FILE_STATION_LABEL = FILE_STATIONS[1].label
+DEFAULT_FILE_STATION_LABEL = next(
+    station.label for station in FILE_STATIONS if station.number == "FILE 1"
+)
 STANDARD_SITE_CHECKS: List[tuple[str, str]] = [
     ("Daily", "Site access and egress routes are clear."),
     ("Daily", "Housekeeping standards are acceptable across the workface."),
@@ -201,6 +333,21 @@ WEEKLY_SITE_CHECK_STATUS_LABELS: Dict[Optional[bool], str] = {
     True: "✔",
     False: "✘",
 }
+FILE_2_VIEW_OPTIONS: List[tuple[str, str]] = [
+    ("checks", "Daily Checks"),
+    ("attendance", "Attendance Snapshot"),
+    ("diary", "Daily Site Diary"),
+    ("plant", "Plant Register"),
+    ("tbt", "Toolbox Talks"),
+]
+FILE_2_VIEW_LABELS: Dict[str, str] = {
+    key: label for key, label in FILE_2_VIEW_OPTIONS
+}
+FILE_2_VIEW_KEYS: set[str] = {key for key, _ in FILE_2_VIEW_OPTIONS}
+WEEKLY_SITE_CHECK_MODE_LABELS: Dict[str, str] = {
+    "daily": "Daily Check",
+    "weekly": "End of Week / Weekly Checks",
+}
 
 
 def _current_week_commencing(reference_date: Optional[date] = None) -> date:
@@ -214,7 +361,7 @@ def _current_active_day_key(reference_date: Optional[date] = None) -> str:
     """Return the current weekday key used by the File 2 checklist grid."""
 
     resolved_date = reference_date or date.today()
-    return SITE_CHECK_WEEKDAY_KEYS[resolved_date.weekday()]
+    return SITE_CHECK_WEEKDAY_KEYS[min(resolved_date.weekday(), len(SITE_CHECK_WEEKDAY_KEYS) - 1)]
 
 
 def _weekly_site_check_status_label(value: Optional[bool]) -> str:
@@ -250,6 +397,8 @@ def _set_weekly_site_check_column_value(
     """Set an entire File 2 checklist column to one value in session state."""
 
     for row_definition in row_definitions:
+        if not row_definition.supports_day_key(day_key):
+            continue
         if (
             _weekly_site_check_template_tag(day_key, row_definition.row_number)
             not in valid_template_tags
@@ -262,6 +411,215 @@ def _set_weekly_site_check_column_value(
             day_key=day_key,
         )
         st.session_state[state_key] = value
+
+
+def _weekly_site_check_visible_row_definitions(
+    row_definitions: List[Any],
+    *,
+    checklist_mode: str,
+) -> List[Any]:
+    """Return only the rows relevant to the selected editor scope."""
+
+    if checklist_mode == "weekly":
+        return [
+            row_definition
+            for row_definition in row_definitions
+            if row_definition.supports_weekly_checks()
+        ]
+    return [
+        row_definition
+        for row_definition in row_definitions
+        if row_definition.supports_daily_checks()
+    ]
+
+
+def _weekly_site_check_active_column_key(
+    *,
+    checklist_mode: str,
+    active_day_key: str,
+) -> str:
+    """Return the currently editable template column key."""
+
+    return "weekly" if checklist_mode == "weekly" else active_day_key
+
+
+def _weekly_site_check_signoff_snapshot(
+    *,
+    daily_initials_map: Dict[str, str],
+    daily_time_markers_map: Dict[str, str],
+    active_day_key: str,
+) -> pd.DataFrame:
+    """Return a compact daily sign-off summary for the current checklist week."""
+
+    rows: List[Dict[str, str]] = []
+    for day_key in SITE_CHECK_WEEKDAY_KEYS:
+        initials_value = str(daily_initials_map.get(day_key, "")).strip()
+        time_value = str(daily_time_markers_map.get(day_key, "")).strip()
+        rows.append(
+            {
+                "Day": SITE_CHECK_WEEKDAY_LABELS[day_key],
+                "Initials": initials_value or "—",
+                "AM/PM": time_value or "—",
+                "Status": (
+                    "Active"
+                    if day_key == active_day_key
+                    else ("Signed" if initials_value or time_value else "Pending")
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _initials_from_name(full_name: str) -> str:
+    """Return a compact initials suggestion from a checked-by full name."""
+
+    cleaned_name = str(full_name).strip()
+    if not cleaned_name:
+        return ""
+    parts = [part for part in re.split(r"[\s\-]+", cleaned_name) if part]
+    if not parts:
+        return ""
+    return "".join(part[0] for part in parts[:2]).upper()
+
+
+def _weekly_site_check_signoff_cache_key(namespace: str, *, field_name: str) -> str:
+    """Return the session key used for the non-widget daily sign-off cache."""
+
+    return f"weekly-site-check-signoff-{field_name}-{namespace}"
+
+
+def _weekly_site_check_signoff_widget_key(namespace: str, *, field_name: str) -> str:
+    """Return the session key used for the visible active-day sign-off widget."""
+
+    return f"weekly-site-check-signoff-widget-{field_name}-{namespace}"
+
+
+def _prefill_weekly_site_check_day_from_previous_day(
+    *,
+    namespace: str,
+    row_definitions: List[Any],
+    target_day_key: str,
+    valid_template_tags: set[str],
+) -> bool:
+    """Seed a blank daily column from the previous completed day when available."""
+
+    try:
+        target_index = SITE_CHECK_WEEKDAY_KEYS.index(target_day_key)
+    except ValueError:
+        return False
+    if target_index == 0:
+        return False
+
+    relevant_row_definitions = [
+        row_definition
+        for row_definition in row_definitions
+        if row_definition.supports_day_key(target_day_key)
+        and _weekly_site_check_template_tag(target_day_key, row_definition.row_number)
+        in valid_template_tags
+    ]
+    if not relevant_row_definitions:
+        return False
+
+    target_values = [
+        st.session_state.get(
+            _weekly_site_check_state_key(
+                namespace,
+                kind="cell",
+                row_number=row_definition.row_number,
+                day_key=target_day_key,
+            )
+        )
+        for row_definition in relevant_row_definitions
+    ]
+    if any(value is not None for value in target_values):
+        return False
+
+    previous_day_key = SITE_CHECK_WEEKDAY_KEYS[target_index - 1]
+    previous_values = [
+        st.session_state.get(
+            _weekly_site_check_state_key(
+                namespace,
+                kind="cell",
+                row_number=row_definition.row_number,
+                day_key=previous_day_key,
+            )
+        )
+        for row_definition in relevant_row_definitions
+    ]
+    if not any(value is not None for value in previous_values):
+        return False
+
+    for row_definition, previous_value in zip(relevant_row_definitions, previous_values):
+        st.session_state[
+            _weekly_site_check_state_key(
+                namespace,
+                kind="cell",
+                row_number=row_definition.row_number,
+                day_key=target_day_key,
+            )
+        ] = previous_value
+    return True
+
+
+def _recommended_weekly_site_check_day_key(
+    *,
+    week_commencing: date,
+    weekly_site_check: Optional[WeeklySiteCheck],
+    daily_initials_map: Optional[Dict[str, str]] = None,
+    daily_time_markers_map: Optional[Dict[str, str]] = None,
+    reference_date: Optional[date] = None,
+) -> str:
+    """Return the most sensible active day for the selected checklist week."""
+
+    resolved_reference_date = reference_date or date.today()
+    current_week_commencing = _current_week_commencing(resolved_reference_date)
+    if week_commencing > current_week_commencing:
+        return "mon"
+
+    latest_relevant_index = (
+        resolved_reference_date.weekday()
+        if week_commencing == current_week_commencing
+        else len(SITE_CHECK_WEEKDAY_KEYS) - 1
+    )
+    latest_relevant_index = min(latest_relevant_index, len(SITE_CHECK_WEEKDAY_KEYS) - 1)
+
+    effective_initials_map = {
+        day_key: str(
+            (daily_initials_map or {}).get(
+                day_key,
+                (
+                    weekly_site_check.daily_initials.get(day_key, "")
+                    if weekly_site_check is not None
+                    else ""
+                ),
+            )
+        ).strip()
+        for day_key in SITE_CHECK_WEEKDAY_KEYS
+    }
+    effective_time_map = {
+        day_key: str(
+            (daily_time_markers_map or {}).get(
+                day_key,
+                (
+                    weekly_site_check.daily_time_markers.get(day_key, "")
+                    if weekly_site_check is not None
+                    else ""
+                ),
+            )
+        ).strip()
+        for day_key in SITE_CHECK_WEEKDAY_KEYS
+    }
+
+    for day_index in range(0, latest_relevant_index + 1):
+        day_key = SITE_CHECK_WEEKDAY_KEYS[day_index]
+        if not effective_initials_map.get(day_key) or not effective_time_map.get(day_key):
+            return day_key
+
+    if week_commencing == current_week_commencing:
+        return SITE_CHECK_WEEKDAY_KEYS[latest_relevant_index]
+    if weekly_site_check is not None:
+        return weekly_site_check.active_day_key
+    return SITE_CHECK_WEEKDAY_KEYS[-1]
 
 
 def _weekly_site_check_namespace(site_name: str, week_commencing: date) -> str:
@@ -291,14 +649,14 @@ def _weekly_site_check_state_key(
 def _ensure_weekly_site_check_editor_state(
     *,
     namespace: str,
+    week_commencing: date,
     weekly_site_check: Optional[WeeklySiteCheck],
     row_definitions: List[Any],
 ) -> None:
     """Load one week of File 2 matrix state into Streamlit session state once."""
 
     loaded_key = "weekly-site-check-editor-loaded"
-    if st.session_state.get(loaded_key) == namespace:
-        return
+    namespace_changed = st.session_state.get(loaded_key) != namespace
 
     row_lookup = {
         row_state.row_number: row_state
@@ -313,42 +671,53 @@ def _ensure_weekly_site_check_editor_state(
                 row_number=row_definition.row_number,
                 day_key=day_key,
             )
-            st.session_state[state_key] = (
-                row_state.get_value(day_key)
-                if row_state is not None
-                else None
-            )
+            stored_value = row_state.get_value(day_key) if row_state is not None else None
+            if namespace_changed or state_key not in st.session_state:
+                st.session_state[state_key] = stored_value
 
     for day_key in SITE_CHECK_WEEKDAY_KEYS:
-        st.session_state[
-            _weekly_site_check_state_key(namespace, kind="initials", day_key=day_key)
-        ] = (
+        initials_key = _weekly_site_check_state_key(
+            namespace,
+            kind="initials",
+            day_key=day_key,
+        )
+        time_key = _weekly_site_check_state_key(
+            namespace,
+            kind="time",
+            day_key=day_key,
+        )
+        stored_initials = (
             weekly_site_check.daily_initials.get(day_key, "")
             if weekly_site_check is not None
             else ""
         )
-        st.session_state[
-            _weekly_site_check_state_key(namespace, kind="time", day_key=day_key)
-        ] = (
+        stored_time = (
             weekly_site_check.daily_time_markers.get(day_key, "")
             if weekly_site_check is not None
             else ""
         )
+        if namespace_changed or initials_key not in st.session_state:
+            st.session_state[initials_key] = stored_initials
+        if namespace_changed or time_key not in st.session_state:
+            st.session_state[time_key] = stored_time
 
-    st.session_state[
-        _weekly_site_check_state_key(namespace, kind="checked-by")
-    ] = (
-        weekly_site_check.checked_by
-        if weekly_site_check is not None
-        else SITE_MANAGER_NAME
+    checked_by_key = _weekly_site_check_state_key(namespace, kind="checked-by")
+    active_day_key = _weekly_site_check_state_key(namespace, kind="active-day")
+    stored_checked_by = (
+        weekly_site_check.checked_by if weekly_site_check is not None else SITE_MANAGER_NAME
     )
-    st.session_state[
-        _weekly_site_check_state_key(namespace, kind="active-day")
-    ] = (
+    stored_active_day = (
         weekly_site_check.active_day_key
         if weekly_site_check is not None
-        else _current_active_day_key()
+        else _recommended_weekly_site_check_day_key(
+            week_commencing=week_commencing,
+            weekly_site_check=weekly_site_check,
+        )
     )
+    if namespace_changed or checked_by_key not in st.session_state:
+        st.session_state[checked_by_key] = stored_checked_by
+    if namespace_changed or active_day_key not in st.session_state:
+        st.session_state[active_day_key] = stored_active_day
     st.session_state[loaded_key] = namespace
 
 
@@ -358,9 +727,233 @@ def _default_project_setup() -> ProjectSetup:
     return ProjectSetup(
         current_site_name=PROJECT_NAME,
         job_number="",
-        site_address="",
+        site_address=LOVEDEAN_SITE_ADDRESS,
         client_name="National Grid",
+        public_tunnel_url="",
+        site_latitude=LOVEDEAN_SITE_LATITUDE,
+        site_longitude=LOVEDEAN_SITE_LONGITUDE,
+        geofence_radius_meters=GEOFENCE_RADIUS_METERS,
+        known_sites=[],
     )
+
+
+def _is_lovedean_site_name(site_name: str) -> bool:
+    """Return whether one site name is the canonical Lovedean profile."""
+
+    return str(site_name or "").strip().casefold() == PROJECT_NAME.casefold()
+
+
+def _normalize_saved_site_profile(profile: SavedSiteProfile) -> SavedSiteProfile:
+    """Keep the canonical Lovedean profile locked to its real postcode and coordinates."""
+
+    if not _is_lovedean_site_name(profile.site_name):
+        return profile
+    return replace(
+        profile,
+        site_address=LOVEDEAN_SITE_ADDRESS,
+        client_name=profile.client_name.strip() or "National Grid",
+        site_latitude=LOVEDEAN_SITE_LATITUDE,
+        site_longitude=LOVEDEAN_SITE_LONGITUDE,
+    )
+
+
+def _normalize_project_setup(project_setup: ProjectSetup) -> ProjectSetup:
+    """Keep the live Lovedean setup aligned to the real site identity."""
+
+    if not _is_lovedean_site_name(project_setup.current_site_name):
+        return project_setup
+    return replace(
+        project_setup,
+        site_address=LOVEDEAN_SITE_ADDRESS,
+        client_name=project_setup.client_name.strip() or "National Grid",
+        site_latitude=LOVEDEAN_SITE_LATITUDE,
+        site_longitude=LOVEDEAN_SITE_LONGITUDE,
+    )
+
+
+def _saved_site_profile_from_payload(payload: Any) -> Optional[SavedSiteProfile]:
+    """Return one validated saved-site profile from JSON payload data."""
+
+    if not isinstance(payload, dict):
+        return None
+    site_name = str(payload.get("site_name") or "").strip()
+    if not site_name:
+        return None
+    return _normalize_saved_site_profile(
+        SavedSiteProfile(
+        site_name=site_name,
+        site_address=str(payload.get("site_address") or "").strip(),
+        client_name=str(payload.get("client_name") or "").strip(),
+        job_number=str(payload.get("job_number") or "").strip(),
+        site_latitude=_coerce_float(payload.get("site_latitude"), LOVEDEAN_SITE_LATITUDE),
+        site_longitude=_coerce_float(
+            payload.get("site_longitude"),
+            LOVEDEAN_SITE_LONGITUDE,
+        ),
+        geofence_radius_meters=max(
+            1,
+            int(
+                round(
+                    _coerce_float(
+                        payload.get("geofence_radius_meters"),
+                        float(GEOFENCE_RADIUS_METERS),
+                    )
+                )
+            ),
+        ),
+        last_used_at=str(payload.get("last_used_at") or "").strip(),
+        )
+    )
+
+
+def _saved_site_profile_from_project_setup(
+    project_setup: ProjectSetup,
+    *,
+    last_used_at: Optional[str] = None,
+) -> SavedSiteProfile:
+    """Build one saved-site profile from the active project setup."""
+
+    return _normalize_saved_site_profile(
+        SavedSiteProfile(
+        site_name=project_setup.current_site_name.strip() or PROJECT_NAME,
+        site_address=project_setup.site_address.strip(),
+        client_name=project_setup.client_name.strip(),
+        job_number=project_setup.job_number.strip(),
+        site_latitude=float(project_setup.site_latitude),
+        site_longitude=float(project_setup.site_longitude),
+        geofence_radius_meters=max(1, int(project_setup.geofence_radius_meters)),
+        last_used_at=last_used_at or datetime.now().isoformat(timespec="seconds"),
+        )
+    )
+
+
+def _merge_known_site_profiles(
+    project_setup: ProjectSetup,
+    known_sites: Optional[List[SavedSiteProfile]] = None,
+) -> List[SavedSiteProfile]:
+    """Return the saved-site list with the current site remembered and deduped."""
+
+    merged_profiles = [
+        _normalize_saved_site_profile(profile)
+        for profile in list(known_sites if known_sites is not None else project_setup.known_sites)
+    ]
+    current_profile = _saved_site_profile_from_project_setup(project_setup)
+    deduped_profiles: Dict[str, SavedSiteProfile] = {}
+    for profile in merged_profiles + [current_profile]:
+        profile_key = (
+            profile.site_name.casefold().strip(),
+            profile.site_address.casefold().strip(),
+        )
+        existing_profile = deduped_profiles.get(str(profile_key))
+        if existing_profile is None or profile.last_used_at >= existing_profile.last_used_at:
+            deduped_profiles[str(profile_key)] = profile
+
+    return sorted(
+        deduped_profiles.values(),
+        key=lambda profile: (
+            profile.last_used_at or "",
+            profile.site_name.casefold(),
+        ),
+        reverse=True,
+    )
+
+
+def _replace_or_append_postcode(existing_address: str, normalized_postcode: str) -> str:
+    """Replace the postcode inside an address when present, otherwise append it once."""
+
+    cleaned_address = str(existing_address).strip()
+    if not normalized_postcode:
+        return cleaned_address
+    if not cleaned_address:
+        return normalized_postcode
+
+    existing_postcode = _extract_uk_postcode(cleaned_address)
+    if existing_postcode:
+        updated_address = re.sub(
+            r"\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b",
+            normalized_postcode,
+            cleaned_address,
+            flags=re.IGNORECASE,
+        )
+        updated_address = re.sub(
+            rf"(?:\s*,?\s*{re.escape(normalized_postcode)}){{2,}}",
+            f" {normalized_postcode}",
+            updated_address,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s{2,}", " ", updated_address).strip(" ,")
+    if normalized_postcode.casefold() in cleaned_address.casefold():
+        return cleaned_address
+    return f"{cleaned_address}, {normalized_postcode}".strip(", ")
+
+
+def _strip_uk_postcode(raw_text: str) -> str:
+    """Remove any postcode token from free text while keeping the address readable."""
+
+    cleaned_text = str(raw_text or "").strip()
+    if not cleaned_text:
+        return ""
+    updated_text = re.sub(
+        r"\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b",
+        "",
+        cleaned_text,
+        flags=re.IGNORECASE,
+    )
+    updated_text = re.sub(r"\s*,\s*,+", ", ", updated_text)
+    updated_text = re.sub(r"\s{2,}", " ", updated_text)
+    return updated_text.strip(" ,")
+
+
+def _build_site_address_from_postcode_result(
+    postcode_result: Dict[str, Any],
+    site_or_building_name: str = "",
+) -> str:
+    """Return a clean site address built from one postcode lookup result."""
+
+    address_parts: List[str] = []
+    leading_line = str(site_or_building_name or "").strip()
+    if leading_line:
+        address_parts.append(leading_line)
+    formatted_address = str(postcode_result.get("formatted_address") or "").strip()
+    if formatted_address:
+        address_parts.append(formatted_address)
+    return ", ".join(address_parts).strip(", ")
+
+
+def _matching_known_sites_for_postcode(
+    project_setup: ProjectSetup,
+    normalized_postcode: str,
+) -> List[SavedSiteProfile]:
+    """Return saved sites already remembered for one postcode."""
+
+    postcode_key = str(normalized_postcode or "").strip().casefold()
+    if not postcode_key:
+        return []
+    return [
+        profile
+        for profile in project_setup.known_sites
+        if _extract_uk_postcode(profile.site_address).casefold() == postcode_key
+    ]
+
+
+def _clear_project_setup_postcode_state() -> None:
+    """Queue a safe reset of the staged postcode search state."""
+
+    st.session_state["project_setup_postcode_clear_pending"] = True
+
+
+def _flush_project_setup_postcode_state_clear() -> None:
+    """Apply any queued postcode-state reset before widgets are created."""
+
+    if not st.session_state.pop("project_setup_postcode_clear_pending", False):
+        return
+
+    for state_key in (
+        "project_setup_postcode_result",
+        "project_setup_postcode_resolution_choice",
+        "project_setup_postcode_site_name",
+    ):
+        st.session_state.pop(state_key, None)
 
 
 def _load_project_setup() -> ProjectSetup:
@@ -374,33 +967,263 @@ def _load_project_setup() -> ProjectSetup:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return default_setup
 
-    return ProjectSetup(
+    known_sites_payload = payload.get("known_sites", [])
+    known_sites = [
+        profile
+        for profile in (
+            _saved_site_profile_from_payload(item)
+            for item in (known_sites_payload if isinstance(known_sites_payload, list) else [])
+        )
+        if profile is not None
+    ]
+
+    loaded_setup = _normalize_project_setup(
+        ProjectSetup(
         current_site_name=str(payload.get("current_site_name") or default_setup.current_site_name).strip()
         or default_setup.current_site_name,
         job_number=str(payload.get("job_number") or "").strip(),
         site_address=str(payload.get("site_address") or "").strip(),
         client_name=str(payload.get("client_name") or default_setup.client_name).strip()
         or default_setup.client_name,
+        public_tunnel_url=str(payload.get("public_tunnel_url") or "").strip(),
+        site_latitude=_coerce_float(
+            payload.get("site_latitude"),
+            default_setup.site_latitude,
+        ),
+        site_longitude=_coerce_float(
+            payload.get("site_longitude"),
+            default_setup.site_longitude,
+        ),
+        geofence_radius_meters=max(
+            1,
+            int(
+                round(
+                    _coerce_float(
+                        payload.get("geofence_radius_meters"),
+                        float(default_setup.geofence_radius_meters),
+                    )
+                )
+            ),
+        ),
+        known_sites=known_sites,
+        )
+    )
+    return replace(
+        loaded_setup,
+        known_sites=_merge_known_site_profiles(loaded_setup, known_sites),
     )
 
 
-def _save_project_setup(project_setup: ProjectSetup) -> None:
+def _save_project_setup(project_setup: ProjectSetup) -> ProjectSetup:
     """Persist project metadata to a small JSON file."""
 
+    project_setup = _normalize_project_setup(project_setup)
+    project_setup_to_save = replace(
+        project_setup,
+        known_sites=_merge_known_site_profiles(project_setup),
+    )
     PROJECT_SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROJECT_SETUP_PATH.write_text(
         json.dumps(
             {
-                "current_site_name": project_setup.current_site_name,
-                "job_number": project_setup.job_number,
-                "site_address": project_setup.site_address,
-                "client_name": project_setup.client_name,
+                "current_site_name": project_setup_to_save.current_site_name,
+                "job_number": project_setup_to_save.job_number,
+                "site_address": project_setup_to_save.site_address,
+                "client_name": project_setup_to_save.client_name,
+                "public_tunnel_url": project_setup_to_save.public_tunnel_url,
+                "site_latitude": project_setup_to_save.site_latitude,
+                "site_longitude": project_setup_to_save.site_longitude,
+                "geofence_radius_meters": project_setup_to_save.geofence_radius_meters,
+                "known_sites": [
+                    {
+                        "site_name": profile.site_name,
+                        "site_address": profile.site_address,
+                        "client_name": profile.client_name,
+                        "job_number": profile.job_number,
+                        "site_latitude": profile.site_latitude,
+                        "site_longitude": profile.site_longitude,
+                        "geofence_radius_meters": profile.geofence_radius_meters,
+                        "last_used_at": profile.last_used_at,
+                    }
+                    for profile in project_setup_to_save.known_sites
+                ],
             },
             indent=2,
             sort_keys=True,
         ),
         encoding="utf-8",
     )
+    return project_setup_to_save
+
+
+def _load_site_diary_drafts_payload() -> Dict[str, Dict[str, str]]:
+    """Load any saved Site Diary draft text fields from disk."""
+
+    try:
+        payload = json.loads(SITE_DIARY_DRAFTS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_site_diary_drafts_payload(payload: Dict[str, Dict[str, str]]) -> None:
+    """Persist Site Diary draft text fields to disk."""
+
+    SITE_DIARY_DRAFTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SITE_DIARY_DRAFTS_PATH.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _build_site_diary_draft_storage_key(site_name: str, target_date: date) -> str:
+    """Return the stable storage key for one site/date diary draft."""
+
+    return f"{site_name.strip()}::{target_date.isoformat()}"
+
+
+def _load_site_diary_text_draft(
+    site_name: str,
+    target_date: date,
+) -> Dict[str, str]:
+    """Return any saved Site Diary draft text values for one site/date."""
+
+    payload = _load_site_diary_drafts_payload()
+    raw_entry = payload.get(_build_site_diary_draft_storage_key(site_name, target_date), {})
+    if not isinstance(raw_entry, dict):
+        return {}
+    return {
+        "incidents_details": str(raw_entry.get("incidents_details", "") or ""),
+        "area_handovers": str(raw_entry.get("area_handovers", "") or ""),
+        "todays_comments": str(raw_entry.get("todays_comments", "") or ""),
+    }
+
+
+def _save_site_diary_text_draft(
+    site_name: str,
+    target_date: date,
+    *,
+    incidents_details: str,
+    area_handovers: str,
+    todays_comments: str,
+) -> None:
+    """Persist the editable Site Diary text draft for one site/date."""
+
+    payload = _load_site_diary_drafts_payload()
+    payload[_build_site_diary_draft_storage_key(site_name, target_date)] = {
+        "incidents_details": str(incidents_details or ""),
+        "area_handovers": str(area_handovers or ""),
+        "todays_comments": str(todays_comments or ""),
+    }
+    _save_site_diary_drafts_payload(payload)
+
+
+def _clear_site_diary_text_draft(site_name: str, target_date: date) -> None:
+    """Remove any saved Site Diary draft text for one site/date."""
+
+    payload = _load_site_diary_drafts_payload()
+    draft_key = _build_site_diary_draft_storage_key(site_name, target_date)
+    if draft_key not in payload:
+        return
+    del payload[draft_key]
+    _save_site_diary_drafts_payload(payload)
+
+
+def _persist_site_diary_text_draft(
+    site_name: str,
+    target_date: date,
+    incidents_state_key: str,
+    handovers_state_key: str,
+    comments_state_key: str,
+) -> None:
+    """Persist the current diary text widgets as a recoverable draft."""
+
+    _save_site_diary_text_draft(
+        site_name,
+        target_date,
+        incidents_details=str(st.session_state.get(incidents_state_key, "") or ""),
+        area_handovers=str(st.session_state.get(handovers_state_key, "") or ""),
+        todays_comments=str(st.session_state.get(comments_state_key, "") or ""),
+    )
+
+
+def _site_diary_state_keys_for_date(target_date: date) -> Dict[str, str]:
+    """Return the widget/session-state keys used by one diary date."""
+
+    date_suffix = target_date.isoformat()
+    return {
+        "contractors": f"file2_site_diary_contractors_{date_suffix}",
+        "uplands_days": f"file2_site_diary_uplands_days_{date_suffix}",
+        "uplands_nights": f"file2_site_diary_uplands_nights_{date_suffix}",
+        "skip_exchange": f"file2_site_diary_skip_exchange_{date_suffix}",
+        "fire_day_on": f"file2_site_diary_fire_day_on_{date_suffix}",
+        "fire_day_off": f"file2_site_diary_fire_day_off_{date_suffix}",
+        "fire_night_on": f"file2_site_diary_fire_night_on_{date_suffix}",
+        "fire_night_off": f"file2_site_diary_fire_night_off_{date_suffix}",
+        "weather_dry": f"file2_site_diary_weather_dry_{date_suffix}",
+        "weather_mixed": f"file2_site_diary_weather_mixed_{date_suffix}",
+        "weather_wet": f"file2_site_diary_weather_wet_{date_suffix}",
+        "incidents": f"file2_site_diary_incidents_{date_suffix}",
+        "hs_reported_tick": f"file2_site_diary_hs_reported_tick_{date_suffix}",
+        "visitors": f"file2_site_diary_visitors_{date_suffix}",
+        "handovers": f"file2_site_diary_handovers_{date_suffix}",
+        "comments": f"file2_site_diary_comments_{date_suffix}",
+        "generate": f"file2_site_diary_generate_{date_suffix}",
+    }
+
+
+def _queue_site_diary_form_reset(target_date: date) -> None:
+    """Queue a safe reset of the diary widgets for one date."""
+
+    st.session_state["file2_site_diary_reset_pending"] = target_date.isoformat()
+
+
+def _apply_site_diary_form_reset_if_pending(site_name: str) -> None:
+    """Apply any queued diary reset before the widgets for that date are created."""
+
+    raw_pending_date = str(
+        st.session_state.pop("file2_site_diary_reset_pending", "") or ""
+    ).strip()
+    if not raw_pending_date:
+        return
+
+    try:
+        pending_date = date.fromisoformat(raw_pending_date)
+    except ValueError:
+        return
+
+    for state_key in _site_diary_state_keys_for_date(pending_date).values():
+        st.session_state.pop(state_key, None)
+    _clear_site_diary_text_draft(site_name, pending_date)
+    st.session_state["file2_site_diary_flash"] = (
+        f"Diary form reset for {pending_date:%d/%m/%Y}."
+    )
+
+
+def _coerce_float(raw_value: Any, fallback: float) -> float:
+    """Return a float value or the supplied fallback."""
+
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _extract_uk_postcode(raw_text: str) -> str:
+    """Return one UK postcode candidate from free text."""
+
+    postcode_matches = re.findall(
+        r"\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b",
+        str(raw_text or "").upper(),
+    )
+    if not postcode_matches:
+        return ""
+    compact_postcode = postcode_matches[-1].replace(" ", "")
+    if len(compact_postcode) < 5:
+        return ""
+    return f"{compact_postcode[:-3]} {compact_postcode[-3:]}".strip()
 
 
 def _get_project_setup() -> ProjectSetup:
@@ -411,8 +1234,48 @@ def _get_project_setup() -> ProjectSetup:
         return cached_setup
 
     loaded_setup = _load_project_setup()
+    root_settings = load_app_settings()
+    if not loaded_setup.public_tunnel_url and root_settings["public_tunnel_url"]:
+        loaded_setup = replace(
+            loaded_setup,
+            public_tunnel_url=root_settings["public_tunnel_url"],
+        )
     st.session_state["project_setup"] = loaded_setup
     return loaded_setup
+
+
+def _is_tunnel_running() -> bool:
+    """Return True when cloudflared is currently running."""
+
+    process_result = subprocess.run(
+        ["pgrep", "cloudflared"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return process_result.returncode == 0 and bool(process_result.stdout.strip())
+
+
+def _synchronise_public_tunnel_settings(project_setup: ProjectSetup) -> ProjectSetup:
+    """Keep the root settings file and project setup tunnel URL aligned."""
+
+    detected_tunnel_url = detect_public_tunnel_url_from_log()
+    saved_tunnel_url = load_app_settings()["public_tunnel_url"]
+    resolved_tunnel_url = (
+        detected_tunnel_url
+        or project_setup.public_tunnel_url.strip()
+        or saved_tunnel_url
+    )
+
+    if resolved_tunnel_url != saved_tunnel_url:
+        save_app_settings(public_tunnel_url=resolved_tunnel_url)
+
+    if resolved_tunnel_url != project_setup.public_tunnel_url:
+        project_setup = replace(project_setup, public_tunnel_url=resolved_tunnel_url)
+        project_setup = _save_project_setup(project_setup)
+        st.session_state["project_setup"] = project_setup
+
+    return project_setup
 
 
 def _reset_ladder_permit_form_state() -> None:
@@ -438,16 +1301,122 @@ def _reset_site_induction_form_state() -> None:
         "site_induction_full_name": "",
         "site_induction_home_address": "",
         "site_induction_contact_number": "",
-        "site_induction_company": "",
+        "site_induction_company_selection": "-- Select Company --",
+        "site_induction_new_company_name": "",
         "site_induction_occupation": "",
         "site_induction_emergency_contact": "",
         "site_induction_emergency_tel": "",
         "site_induction_medical": "",
         "site_induction_cscs_number": "",
+        "site_induction_cscs_expiry": None,
+        "site_induction_asbestos_cert": False,
+        "site_induction_asbestos_cert_choice": "No",
+        "site_induction_erect_scaffold": False,
+        "site_induction_erect_scaffold_choice": "No",
+        "site_induction_cisrs_no": "",
+        "site_induction_cisrs_expiry": None,
+        "site_induction_operate_plant": False,
+        "site_induction_operate_plant_choice": "No",
+        "site_induction_cpcs_no": "",
+        "site_induction_cpcs_expiry": None,
+        "site_induction_client_training_desc": "",
+        "site_induction_client_training_date": None,
+        "site_induction_client_training_expiry": None,
         "site_induction_first_aider": False,
+        "site_induction_first_aider_choice": "No",
         "site_induction_fire_warden": False,
+        "site_induction_fire_warden_choice": "No",
         "site_induction_supervisor": False,
+        "site_induction_supervisor_choice": "No",
         "site_induction_smsts": False,
+        "site_induction_smsts_choice": "No",
+        "site_induction_competency_expiry_date": date.today() + timedelta(days=365),
+    }
+    for state_key, state_value in state_defaults.items():
+        st.session_state[state_key] = state_value
+    for transient_key in (
+        "site_induction_competency_cards",
+        "site_induction_cscs_card_upload",
+        "site_induction_asbestos_card_upload",
+        "site_induction_cisrs_card_upload",
+        "site_induction_cpcs_card_upload",
+        "site_induction_client_training_upload",
+        "site_induction_first_aider_upload",
+        "site_induction_fire_warden_upload",
+        "site_induction_supervisor_upload",
+        "site_induction_smsts_upload",
+        "site_induction_view_doc_id",
+    ):
+        st.session_state.pop(transient_key, None)
+
+
+def _build_site_induction_competency_file_payloads(
+    labelled_uploads: List[tuple[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return saved-upload payloads from the labelled induction card uploaders."""
+
+    payloads: List[Dict[str, Any]] = []
+    for competency_label, uploaded_file in labelled_uploads:
+        if uploaded_file is None:
+            continue
+        file_name = Path(str(getattr(uploaded_file, "name", "") or "")).name
+        if not file_name:
+            continue
+        try:
+            file_bytes = uploaded_file.getvalue()
+        except Exception:
+            file_bytes = b""
+        if not file_bytes:
+            continue
+        payloads.append(
+            {
+                "label": competency_label,
+                "name": file_name,
+                "bytes": file_bytes,
+            }
+        )
+    return payloads
+
+
+def _render_site_induction_yes_no_field(
+    label: str,
+    *,
+    key: str,
+    disabled: bool = False,
+) -> bool:
+    """Render one induction yes/no control while keeping a clean boolean state value."""
+
+    choice_key = f"{key}_choice"
+    if st.session_state.get(choice_key) not in {"Yes", "No"}:
+        st.session_state[choice_key] = "Yes" if bool(st.session_state.get(key, False)) else "No"
+    st.markdown(
+        f"<div class='site-induction-binary-label'>{html.escape(label)}</div>",
+        unsafe_allow_html=True,
+    )
+    choice = st.radio(
+        label,
+        options=["No", "Yes"],
+        key=choice_key,
+        horizontal=True,
+        disabled=disabled,
+        label_visibility="collapsed",
+    )
+    resolved_value = choice == "Yes"
+    st.session_state[key] = resolved_value
+    return resolved_value
+
+
+def _reset_site_attendance_form_state() -> None:
+    """Reset the live UHSF16.09 sign-in/sign-out fields for the next operative."""
+
+    state_defaults = {
+        "site_attendance_action_mode": "sign_in",
+        "site_attendance_worker_search": "",
+        "site_attendance_selected_induction_doc_id": "",
+        "site_attendance_vehicle_registration_context_doc_id": "",
+        "site_attendance_vehicle_registration": "",
+        "site_attendance_distance_travelled": "",
+        "site_attendance_selected_sign_out_doc_id": "",
     }
     for state_key, state_value in state_defaults.items():
         st.session_state[state_key] = state_value
@@ -476,6 +1445,285 @@ def _get_station_label_from_query_params() -> Optional[str]:
     return None
 
 
+def _is_tbt_kiosk_requested() -> bool:
+    """Return True when the current URL explicitly requests the mobile TBT signer."""
+
+    raw_station_value = st.query_params.get("station")
+    if not raw_station_value:
+        return False
+    return str(raw_station_value).strip().casefold() == "tbt"
+
+
+def _get_tbt_topic_from_query_params() -> str:
+    """Return the requested toolbox talk topic from the current URL."""
+
+    raw_topic_value = st.query_params.get("topic")
+    if not raw_topic_value:
+        return ""
+    return str(raw_topic_value).strip()
+
+
+def _is_kiosk_mode_requested() -> bool:
+    """Return True when the current URL explicitly requests kiosk mode."""
+
+    raw_mode_value = st.query_params.get("mode")
+    if not raw_mode_value:
+        return False
+    return str(raw_mode_value).strip().casefold() == "kiosk"
+
+
+def _get_kiosk_view_from_query_params() -> str:
+    """Return the requested kiosk subview from the current URL."""
+
+    raw_kiosk_view = st.query_params.get("kiosk_view")
+    if not raw_kiosk_view:
+        return ""
+    resolved_kiosk_view = str(raw_kiosk_view).strip().casefold()
+    return resolved_kiosk_view if resolved_kiosk_view in {"attendance", "induction"} else ""
+
+
+def _clear_kiosk_geolocation_query_params() -> None:
+    """Remove any previously captured kiosk geolocation query params."""
+
+    for key in ("geo_lat", "geo_lng", "geo_acc", "geo_error", "geo_nonce"):
+        if key in st.query_params:
+            del st.query_params[key]
+
+
+def _clear_project_setup_geolocation_query_params() -> None:
+    """Remove any previously captured project-setup geolocation query params."""
+
+    for key in ("setup_geo_lat", "setup_geo_lng", "setup_geo_acc", "setup_geo_error"):
+        if key in st.query_params:
+            del st.query_params[key]
+
+
+def _clear_site_diary_dictation_query_params() -> None:
+    """Remove any previously captured Site Diary dictation query params."""
+
+    for key in (
+        "dictation_target",
+        "dictation_text",
+        "dictation_error",
+        "dictation_nonce",
+    ):
+        if key in st.query_params:
+            del st.query_params[key]
+
+
+def _get_file_2_view_from_query_params() -> str:
+    """Return the requested File 2 subview from the current URL, if valid."""
+
+    raw_file_2_view = st.query_params.get("file2_view")
+    if not raw_file_2_view:
+        return ""
+    resolved_view = str(raw_file_2_view).strip().casefold()
+    return resolved_view if resolved_view in FILE_2_VIEW_KEYS else ""
+
+
+def _sync_file_2_view_query_param(view_key: str) -> None:
+    """Persist the active File 2 subview into the current URL."""
+
+    if view_key in FILE_2_VIEW_KEYS:
+        st.query_params["file2_view"] = view_key
+    elif "file2_view" in st.query_params:
+        del st.query_params["file2_view"]
+
+
+def _sync_manager_station_query_params(station_label: str) -> None:
+    """Persist the active manager station into the current URL."""
+
+    matched_station = next(
+        (station for station in FILE_STATIONS if station.label == station_label),
+        None,
+    )
+    if matched_station is None:
+        return
+
+    st.query_params["station"] = matched_station.number
+    for transient_key in ("mode", "kiosk_view", "topic"):
+        if transient_key in st.query_params:
+            del st.query_params[transient_key]
+
+
+def _site_diary_dictation_friendly_label(target_state_key: str) -> str:
+    """Return the visible diary-field label for one dictation target key."""
+
+    lowered_key = target_state_key.casefold()
+    if "incidents" in lowered_key:
+        return "Incidents Details"
+    if "handovers" in lowered_key:
+        return "Area Handovers"
+    if "comments" in lowered_key:
+        return "Today's Comments"
+    return "Daily Site Diary"
+
+
+def _extract_site_diary_date_from_state_key(target_state_key: str) -> Optional[date]:
+    """Return the encoded diary date from one diary field state key, if present."""
+
+    match = re.search(r"(\d{4}-\d{2}-\d{2})$", target_state_key.strip())
+    if not match:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def _apply_site_diary_context_query_params() -> None:
+    """Seed the manager Site Diary context from the current URL when present."""
+
+    requested_file_2_view = _get_file_2_view_from_query_params()
+    if requested_file_2_view and "file2_active_view" not in st.session_state:
+        st.session_state["file2_active_view"] = requested_file_2_view
+
+    raw_diary_date = st.query_params.get("site_diary_date")
+    if not raw_diary_date:
+        return
+
+    try:
+        resolved_diary_date = date.fromisoformat(str(raw_diary_date).strip())
+    except ValueError:
+        return
+
+    if "file2_site_diary_date" not in st.session_state:
+        st.session_state["file2_site_diary_date"] = resolved_diary_date
+
+
+def _apply_site_diary_dictation_query_payload(site_name: str) -> None:
+    """Apply any popup dictation transcript returned through the current URL."""
+
+    raw_target = st.query_params.get("dictation_target")
+    raw_nonce = st.query_params.get("dictation_nonce")
+    if not raw_target or not raw_nonce:
+        return
+
+    target_state_key = str(raw_target).strip()
+    nonce = str(raw_nonce).strip()
+    file_2_station_label = next(
+        station.label for station in FILE_STATIONS if station.number == "FILE 2"
+    )
+    st.session_state["active_file_station"] = file_2_station_label
+    st.session_state["file2_active_view"] = "diary"
+    st.session_state["file2_site_diary_scroll_pending"] = True
+    diary_target_date = _extract_site_diary_date_from_state_key(target_state_key)
+    if diary_target_date is not None:
+        draft_text_fields = _load_site_diary_text_draft(site_name, diary_target_date)
+        for field_name, draft_value in draft_text_fields.items():
+            draft_state_key = (
+                f"file2_site_diary_{field_name.replace('incidents_details', 'incidents').replace('area_handovers', 'handovers').replace('todays_comments', 'comments')}_{diary_target_date.isoformat()}"
+            )
+            if draft_value and draft_state_key not in st.session_state:
+                st.session_state[draft_state_key] = draft_value
+        st.session_state["file2_site_diary_date"] = diary_target_date
+        st.query_params["site_diary_date"] = diary_target_date.isoformat()
+    _sync_manager_station_query_params(file_2_station_label)
+    _sync_file_2_view_query_param("diary")
+    transcript = str(st.query_params.get("dictation_text", "") or "").strip()
+    error_message = str(st.query_params.get("dictation_error", "") or "").strip()
+
+    try:
+        _apply_site_diary_dictation_result(
+            {
+                "target": target_state_key,
+                "transcript": transcript,
+                "error": error_message,
+                "nonce": nonce,
+            },
+            friendly_label=_site_diary_dictation_friendly_label(target_state_key),
+        )
+        if diary_target_date is not None:
+            _persist_site_diary_text_draft(
+                site_name,
+                diary_target_date,
+                f"file2_site_diary_incidents_{diary_target_date.isoformat()}",
+                f"file2_site_diary_handovers_{diary_target_date.isoformat()}",
+                f"file2_site_diary_comments_{diary_target_date.isoformat()}",
+            )
+    finally:
+        _clear_site_diary_dictation_query_params()
+
+
+def _build_kiosk_geolocation_capture_path(*, kiosk_view: str) -> str:
+    """Return the top-level GPS capture page URL for kiosk attendance."""
+
+    return_target = (
+        f"/?station=induction&mode=kiosk&kiosk_view={kiosk_view}"
+    )
+    return (
+        "/gps/geo-capture.html"
+        f"?v=20260314e&prefix=geo&return={quote(return_target, safe='')}"
+    )
+
+
+def _build_kiosk_geolocation_capture_url(
+    *,
+    public_url: str,
+    kiosk_view: str,
+) -> str:
+    """Return an absolute GPS-capture URL for the current environment."""
+
+    base_url = public_url.strip()
+    if base_url and "://" not in base_url:
+        base_url = f"https://{base_url}"
+    if not base_url:
+        base_url = get_site_induction_url()
+    parsed_base_url = urlparse(base_url)
+    normalized_base = parsed_base_url._replace(
+        path="",
+        params="",
+        query="",
+        fragment="",
+    )
+    return urlunparse(normalized_base) + _build_kiosk_geolocation_capture_path(
+        kiosk_view=kiosk_view
+    )
+
+
+def _build_project_setup_geolocation_capture_url(*, public_url: str) -> str:
+    """Return an absolute GPS-capture URL for project setup."""
+
+    base_url = public_url.strip()
+    if base_url and "://" not in base_url:
+        base_url = f"https://{base_url}"
+    if not base_url:
+        base_url = get_site_induction_url()
+    parsed_base_url = urlparse(base_url)
+    normalized_base = parsed_base_url._replace(
+        path="",
+        params="",
+        query="",
+        fragment="",
+    )
+    return (
+        urlunparse(normalized_base)
+        + "/gps/geo-capture.html?v=20260314e&prefix=setup_geo&return=%2F"
+    )
+
+
+def _sync_kiosk_query_params(*, kiosk_view: str) -> None:
+    """Force the current URL back onto the locked kiosk induction route."""
+
+    st.query_params["station"] = "induction"
+    st.query_params["mode"] = "kiosk"
+    st.query_params["kiosk_view"] = kiosk_view
+    if "topic" in st.query_params:
+        del st.query_params["topic"]
+
+
+def _route_kiosk_to_induction_station(*, kiosk_view: str) -> None:
+    """Force the app back onto the locked kiosk station and requested subview."""
+
+    st.session_state["site_kiosk_lock"] = True
+    st.session_state["is_kiosk"] = True
+    st.session_state["site_kiosk_active_view"] = kiosk_view
+    st.session_state["active_file_station"] = next(
+        station.label for station in FILE_STATIONS if station.number == "INDUCTION"
+    )
+    _sync_kiosk_query_params(kiosk_view=kiosk_view)
+
+
 def main() -> None:
     """Render the Streamlit portal."""
 
@@ -485,25 +1733,78 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     _inject_styles()
-
+    _apply_site_diary_context_query_params()
+    project_setup = _synchronise_public_tunnel_settings(_get_project_setup())
+    project_setup = _apply_project_setup_geolocation_query_payload(project_setup)
+    _apply_site_diary_dictation_query_payload(project_setup.current_site_name)
     repository = _build_repository()
-    project_setup = _get_project_setup()
     requested_station_label = _get_station_label_from_query_params()
+    requested_kiosk_view = _get_kiosk_view_from_query_params()
+    kiosk_active_view = (
+        requested_kiosk_view
+        or str(st.session_state.get("site_kiosk_active_view", "")).strip().lower()
+    )
+    kiosk_lock_active = bool(st.session_state.get("site_kiosk_lock", False))
+    is_kiosk = _is_kiosk_mode_requested() or kiosk_lock_active or kiosk_active_view in {
+        "attendance",
+        "induction",
+    }
+    is_tbt_kiosk = _is_tbt_kiosk_requested()
+    st.session_state["is_kiosk"] = is_kiosk or is_tbt_kiosk
+    if is_kiosk:
+        st.session_state["site_kiosk_lock"] = True
+        if kiosk_active_view not in {"attendance", "induction"}:
+            kiosk_active_view = "attendance"
+        st.session_state["site_kiosk_active_view"] = kiosk_active_view
+        if (
+            not _is_kiosk_mode_requested()
+            or requested_station_label
+            != next(
+                station.label
+                for station in FILE_STATIONS
+                if station.number == "INDUCTION"
+            )
+            or requested_kiosk_view != kiosk_active_view
+        ):
+            _sync_kiosk_query_params(kiosk_view=kiosk_active_view)
+    else:
+        st.session_state.pop("site_kiosk_lock", None)
+    if is_tbt_kiosk:
+        _render_toolbox_talk_kiosk(
+            repository,
+            project_setup,
+            topic=_get_tbt_topic_from_query_params(),
+        )
+        return
     if (
         "active_file_station" not in st.session_state
         or st.session_state["active_file_station"]
         not in {station.label for station in FILE_STATIONS}
     ):
         st.session_state["active_file_station"] = DEFAULT_FILE_STATION_LABEL
-    if requested_station_label is not None:
+    if is_kiosk:
+        st.session_state["active_file_station"] = next(
+            station.label for station in FILE_STATIONS if station.number == "INDUCTION"
+        )
+    elif requested_station_label is not None:
         st.session_state["active_file_station"] = requested_station_label
     active_station_label = str(st.session_state["active_file_station"])
 
-    with st.sidebar:
-        _render_sidebar(repository, active_station_label, project_setup)
+    if not is_kiosk:
+        with st.sidebar:
+            _render_sidebar(repository, active_station_label, project_setup)
+        _inject_sidebar_reopen_bridge(enabled=True)
+    else:
+        _inject_sidebar_reopen_bridge(enabled=False)
 
-    active_station_label = _render_file_station_navigation()
-    _render_active_station(repository, active_station_label, project_setup)
+    if not is_kiosk:
+        active_station_label = _render_file_station_navigation()
+    _render_active_station(
+        repository,
+        active_station_label,
+        project_setup,
+        is_kiosk=is_kiosk,
+    )
 
 
 def _build_repository() -> DocumentRepository:
@@ -517,6 +1818,7 @@ def _build_repository() -> DocumentRepository:
 def _inject_styles() -> None:
     """Apply the Lovedean portal styling."""
 
+    sidebar_width_rem = float(st.session_state.get("sidebar_width_rem", 24))
     st.markdown(
         f"""
         <style>
@@ -577,57 +1879,84 @@ def _inject_styles() -> None:
             section[data-testid="stSidebar"] {{
                 background: {SIDEBAR_BACKGROUND};
                 border-right: 1px solid #e7e9ee;
+                transition:
+                    box-shadow 180ms ease,
+                    border-color 180ms ease,
+                    min-width 180ms ease,
+                    max-width 180ms ease;
+            }}
+            section[data-testid="stSidebar"][aria-expanded="false"] {{
+                background: transparent !important;
+                border-right: none !important;
+                box-shadow: none !important;
             }}
             section[data-testid="stSidebar"] * {{
                 color: {TEXT_DARK};
             }}
+            section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
+                padding-top: 0.35rem;
+                padding-bottom: 1.25rem;
+            }}
             [data-testid="stSidebarCollapseButton"],
             [data-testid="collapsedControl"] {{
-                background: #f0f2f6 !important;
+                align-items: center !important;
+                backdrop-filter: blur(10px) !important;
+                background: rgba(255, 255, 255, 0.96) !important;
                 border: 1px solid #d9dde5 !important;
                 border-radius: 999px !important;
-                box-shadow: 0 6px 14px rgba(18, 24, 38, 0.1) !important;
-                color: #31333F !important;
-                -webkit-text-fill-color: #31333F !important;
+                box-shadow: 0 10px 24px rgba(18, 24, 38, 0.12) !important;
+                color: {TEXT_DARK} !important;
+                display: inline-flex !important;
+                height: 2.5rem !important;
+                justify-content: center !important;
+                -webkit-text-fill-color: {TEXT_DARK} !important;
                 opacity: 1 !important;
+                padding: 0 !important;
+                transition:
+                    transform 160ms ease,
+                    box-shadow 160ms ease,
+                    border-color 160ms ease,
+                    background-color 160ms ease !important;
+                width: 2.5rem !important;
                 z-index: 10000 !important;
             }}
-            [data-testid="stSidebarCollapseButton"] *,
-            [data-testid="collapsedControl"] *,
+            [data-testid="collapsedControl"] {{
+                left: 0.9rem !important;
+                margin: 0 !important;
+                position: fixed !important;
+                top: 0.95rem !important;
+            }}
+            [data-testid="stSidebarCollapseButton"]:hover,
+            [data-testid="collapsedControl"]:hover {{
+                background: #ffffff !important;
+                border-color: rgba(209, 34, 142, 0.42) !important;
+                box-shadow: 0 14px 28px rgba(18, 24, 38, 0.16) !important;
+                transform: translateY(-1px) !important;
+            }}
             [data-testid="stSidebarCollapseButton"] svg,
             [data-testid="collapsedControl"] svg,
             [data-testid="stSidebarCollapseButton"] path,
             [data-testid="collapsedControl"] path {{
-                color: #31333F !important;
-                fill: #31333F !important;
-                stroke: #31333F !important;
-                -webkit-text-fill-color: #31333F !important;
+                color: {TEXT_DARK} !important;
+                fill: {TEXT_DARK} !important;
+                stroke: {TEXT_DARK} !important;
+                -webkit-text-fill-color: {TEXT_DARK} !important;
+            }}
+            [data-testid="stSidebarCollapseButton"] svg,
+            [data-testid="collapsedControl"] svg {{
+                height: 1rem !important;
+                width: 1rem !important;
             }}
             @media (min-width: 768px) {{
-                [data-testid="collapsedControl"] {{
-                    display: none !important;
-                }}
-                section[data-testid="stSidebar"] {{
-                    min-width: 22rem !important;
-                    max-width: 22rem !important;
-                }}
-                section[data-testid="stSidebar"][aria-expanded="false"] {{
-                    min-width: 22rem !important;
-                    max-width: 22rem !important;
-                    transform: translateX(0) !important;
-                    margin-left: 0 !important;
+                section[data-testid="stSidebar"][aria-expanded="true"] {{
+                    min-width: {sidebar_width_rem:.1f}rem !important;
+                    max-width: {sidebar_width_rem:.1f}rem !important;
                 }}
             }}
             @media (max-width: 767.98px) {{
                 section[data-testid="stSidebar"] {{
                     min-width: auto !important;
                     max-width: none !important;
-                }}
-                section[data-testid="stSidebar"][aria-expanded="false"] {{
-                    min-width: 0 !important;
-                    max-width: 0 !important;
-                    transform: none !important;
-                    margin-left: 0 !important;
                 }}
                 [data-testid="stAppViewContainer"] > .main .block-container {{
                     padding-left: 1rem !important;
@@ -811,17 +2140,61 @@ def _inject_styles() -> None:
             [data-testid="stAppViewContainer"] > .main div[data-testid="stSelectbox"] > div[data-baseweb="select"] > div,
             [data-testid="stAppViewContainer"] > .main div[data-role="dropdown"],
             [data-testid="stAppViewContainer"] > .main textarea {{
-                background-color: #f0f2f6 !important;
+                background-color: #ffffff !important;
                 color: #31333F !important;
                 -webkit-text-fill-color: #31333F !important;
-                border: 1px solid #d9dde5 !important;
-                border-radius: 10px !important;
-                box-shadow: none !important;
+                border: 1.5px solid #d7dde8 !important;
+                border-radius: 12px !important;
+                box-shadow: 0 1px 2px rgba(18, 24, 38, 0.04) !important;
                 color-scheme: light !important;
                 background-clip: padding-box !important;
-                -webkit-box-shadow: 0 0 0 1000px #f0f2f6 inset !important;
-                box-shadow: inset 0 0 0 1000px #f0f2f6 !important;
+                -webkit-box-shadow: 0 0 0 1000px #ffffff inset !important;
+                box-shadow: inset 0 0 0 1000px #ffffff !important;
                 filter: none !important;
+            }}
+            [data-testid="stAppViewContainer"] > .main div[data-testid="stTextInput"] input,
+            [data-testid="stAppViewContainer"] > .main div[data-testid="stTextInput"] > div > div input,
+            [data-testid="stAppViewContainer"] > .main input[type="text"],
+            [data-testid="stAppViewContainer"] > .main input[type="search"],
+            [data-testid="stAppViewContainer"] > .main textarea,
+            section[data-testid="stSidebar"] input[type="text"],
+            section[data-testid="stSidebar"] input[type="search"],
+            section[data-testid="stSidebar"] textarea {{
+                font-size: 1rem !important;
+                line-height: 1.5 !important;
+                font-weight: 600 !important;
+                padding: 0.78rem 0.95rem !important;
+                letter-spacing: 0.01em !important;
+            }}
+            [data-testid="stAppViewContainer"] > .main textarea,
+            section[data-testid="stSidebar"] textarea {{
+                min-height: 8rem !important;
+            }}
+            [data-testid="stAppViewContainer"] > .main div[data-baseweb="input"] > div:focus-within,
+            [data-testid="stAppViewContainer"] > .main div[data-baseweb="base-input"] > div:focus-within,
+            [data-testid="stAppViewContainer"] > .main textarea:focus,
+            section[data-testid="stSidebar"] div[data-baseweb="input"] > div:focus-within,
+            section[data-testid="stSidebar"] div[data-baseweb="base-input"] > div:focus-within,
+            section[data-testid="stSidebar"] textarea:focus {{
+                border-color: rgba(209, 34, 142, 0.85) !important;
+                box-shadow: 0 0 0 0.2rem rgba(209, 34, 142, 0.12) !important;
+            }}
+            [data-testid="stAppViewContainer"] > .main input::placeholder,
+            [data-testid="stAppViewContainer"] > .main textarea::placeholder,
+            section[data-testid="stSidebar"] input::placeholder,
+            section[data-testid="stSidebar"] textarea::placeholder {{
+                color: #8a94a6 !important;
+                opacity: 1 !important;
+                font-weight: 500 !important;
+            }}
+            [data-testid="stAppViewContainer"] label,
+            [data-testid="stAppViewContainer"] label p,
+            [data-testid="stAppViewContainer"] div[data-testid="stMarkdownContainer"] label,
+            section[data-testid="stSidebar"] label,
+            section[data-testid="stSidebar"] label p {{
+                color: #344054 !important;
+                font-weight: 700 !important;
+                letter-spacing: 0.01em !important;
             }}
             [data-testid="stAppViewContainer"] > .main div[data-testid="stTextInput"] *,
             [data-testid="stAppViewContainer"] > .main div[data-testid="stSelectbox"] *,
@@ -842,12 +2215,13 @@ def _inject_styles() -> None:
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"],
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] {{
-                background: rgba(255, 255, 255, 0.92) !important;
-                border: 1px solid #eceef2 !important;
-                border-radius: 12px !important;
-                box-shadow: none !important;
+                background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(250,251,253,0.96)) !important;
+                border: 1px solid #e6eaf1 !important;
+                border-radius: 16px !important;
+                box-shadow: 0 10px 24px rgba(18, 24, 38, 0.05) !important;
                 color-scheme: light !important;
-                margin-top: 0.8rem;
+                margin-top: 0.9rem;
+                margin-bottom: 0.25rem;
                 overflow: hidden;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] > details,
@@ -855,48 +2229,61 @@ def _inject_styles() -> None:
                 background: #ffffff !important;
                 color-scheme: light !important;
             }}
+            section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"][open],
+            section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"]:has(details[open]) {{
+                border-color: rgba(209, 34, 142, 0.18) !important;
+                box-shadow: 0 14px 30px rgba(18, 24, 38, 0.08) !important;
+            }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary {{
-                background-color: #f0f2f6 !important;
-                border-bottom: 1px solid #d9dde5 !important;
-                color: #31333F !important;
+                background:
+                    radial-gradient(circle at top left, rgba(209, 34, 142, 0.08), transparent 34%),
+                    radial-gradient(circle at top right, rgba(91, 141, 239, 0.08), transparent 34%),
+                    linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,248,251,0.98)) !important;
+                border-bottom: 1px solid #e8ebf1 !important;
+                color: {TEXT_DARK} !important;
                 color-scheme: light !important;
-                padding: 0.35rem 0.65rem;
+                min-height: 3.25rem !important;
+                padding: 0.7rem 0.9rem !important;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary:hover,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary:focus,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary:hover,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary:focus {{
-                background-color: #e8edf4 !important;
-                color: #31333F !important;
+                background:
+                    radial-gradient(circle at top left, rgba(209, 34, 142, 0.11), transparent 36%),
+                    radial-gradient(circle at top right, rgba(91, 141, 239, 0.11), transparent 36%),
+                    linear-gradient(180deg, rgba(255,255,255,1), rgba(243,246,251,1)) !important;
+                color: {TEXT_DARK} !important;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary *,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary * {{
                 background-color: transparent !important;
-                color: #31333F !important;
-                -webkit-text-fill-color: #31333F !important;
+                color: {TEXT_DARK} !important;
+                -webkit-text-fill-color: {TEXT_DARK} !important;
                 opacity: 1 !important;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary p,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary p {{
-                color: #31333F !important;
-                font-size: 0.95rem;
-                font-weight: 800;
+                color: {TEXT_DARK} !important;
+                font-size: 0.97rem;
+                font-weight: 900;
+                letter-spacing: -0.01em;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary svg,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] summary path,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary svg,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] summary path {{
-                color: #31333F !important;
-                fill: #31333F !important;
-                stroke: #31333F !important;
+                color: {TEXT_MUTED} !important;
+                fill: {TEXT_MUTED} !important;
+                stroke: {TEXT_MUTED} !important;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] div[data-testid="stExpander"] .streamlit-expanderContent,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] details[data-testid="stExpander"] .streamlit-expanderContent {{
                 background: #ffffff !important;
                 border: none;
                 color-scheme: light !important;
-                padding-top: 0.15rem;
+                padding: 0.9rem 0.95rem 1rem !important;
             }}
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] input,
             section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] textarea,
@@ -1061,8 +2448,101 @@ def _inject_styles() -> None:
                 line-height: 1.45;
                 -webkit-text-fill-color: #31333F !important;
             }}
+            .sidebar-tool-card {{
+                background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(250,250,252,0.96) 100%);
+                border: 1px solid #e8ebf1;
+                border-radius: 14px;
+                box-shadow: 0 8px 18px rgba(18, 24, 38, 0.05);
+                padding: 0.9rem 0.95rem;
+                margin-top: 0.75rem;
+                margin-bottom: 0.9rem;
+            }}
+            .sidebar-section-card {{
+                background: rgba(255, 255, 255, 0.88);
+                border: 1px solid #eceef2;
+                border-radius: 16px;
+                box-shadow: 0 8px 20px rgba(18, 24, 38, 0.04);
+                margin-top: 0.9rem;
+                margin-bottom: 1rem;
+                padding: 0.95rem 1rem;
+            }}
+            .sidebar-section-title {{
+                color: {TEXT_DARK};
+                font-size: 0.88rem;
+                font-weight: 900;
+                letter-spacing: 0.02em;
+                margin-bottom: 0.2rem;
+            }}
+            .sidebar-section-copy {{
+                color: {TEXT_MUTED};
+                font-size: 0.87rem;
+                line-height: 1.5;
+                margin-bottom: 0.75rem;
+            }}
+            .sidebar-tool-title {{
+                color: {TEXT_DARK};
+                font-size: 0.92rem;
+                font-weight: 800;
+                margin-bottom: 0.28rem;
+            }}
+            .sidebar-tool-copy {{
+                color: {TEXT_MUTED};
+                font-size: 0.88rem;
+                line-height: 1.5;
+            }}
+            .form-section-kicker {{
+                color: #5c6884;
+                font-size: 0.74rem;
+                font-weight: 800;
+                letter-spacing: 0.12em;
+                margin-bottom: 0.35rem;
+                text-transform: uppercase;
+            }}
+            .form-section-copy {{
+                color: {TEXT_MUTED};
+                font-size: 0.92rem;
+                line-height: 1.5;
+                margin-bottom: 0.8rem;
+            }}
+            div[data-testid="stCodeBlock"] {{
+                border: 1px solid #e3e7ee !important;
+                border-radius: 14px !important;
+                overflow: hidden !important;
+                box-shadow: 0 8px 20px rgba(18, 24, 38, 0.05) !important;
+            }}
+            div[data-testid="stCodeBlock"] pre {{
+                font-size: 0.95rem !important;
+                line-height: 1.55 !important;
+                padding: 0.9rem 1rem !important;
+            }}
+            div[data-baseweb="tab-list"] {{
+                gap: 0.55rem !important;
+                margin-bottom: 0.9rem !important;
+            }}
+            button[role="tab"] {{
+                background: rgba(255,255,255,0.92) !important;
+                border: 1px solid #dde3ec !important;
+                border-radius: 999px !important;
+                box-shadow: 0 4px 12px rgba(18, 24, 38, 0.04) !important;
+                color: #344054 !important;
+                font-weight: 800 !important;
+                min-height: 2.6rem !important;
+                padding: 0.45rem 0.95rem !important;
+            }}
+            button[role="tab"][aria-selected="true"] {{
+                background: linear-gradient(135deg, rgba(209,34,142,0.10), rgba(91,141,239,0.12)) !important;
+                border-color: rgba(209, 34, 142, 0.45) !important;
+                color: {TEXT_DARK} !important;
+            }}
             .stProgress > div > div > div > div {{
                 background-color: {UPLANDS_PINK};
+            }}
+            .site-induction-binary-label {{
+                margin: 0.2rem 0 0.3rem;
+                color: {TEXT_DARK};
+                font-size: 0.98rem;
+                font-weight: 800;
+                line-height: 1.35;
             }}
             div[data-testid="stRadio"] > label {{
                 display: none;
@@ -1092,15 +2572,36 @@ def _inject_styles() -> None:
                 line-height: 1.35;
             }}
             .station-header {{
-                background: #ffffff;
-                border-radius: 16px;
-                box-shadow: 0 10px 24px rgba(18, 24, 38, 0.05);
+                align-items: stretch;
                 background:
+                    radial-gradient(circle at top left, rgba(209, 34, 142, 0.11), transparent 34%),
+                    radial-gradient(circle at top right, rgba(91, 141, 239, 0.11), transparent 30%),
                     linear-gradient(#ffffff, #ffffff) padding-box,
                     linear-gradient(135deg, rgba(209, 34, 142, 0.88), rgba(91, 141, 239, 0.88)) border-box;
                 border: 1px solid transparent;
-                margin-bottom: 1rem;
-                padding: 1.2rem 1.35rem;
+                border-radius: 20px;
+                box-shadow: 0 18px 38px rgba(18, 24, 38, 0.07);
+                display: grid;
+                gap: 1rem;
+                grid-template-columns: auto 1fr;
+                margin-bottom: 1.25rem;
+                padding: 1.35rem 1.45rem;
+            }}
+            .station-hero-icon {{
+                align-items: center;
+                background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,252,0.94));
+                border: 1px solid rgba(233, 236, 243, 0.95);
+                border-radius: 20px;
+                box-shadow: 0 12px 24px rgba(18, 24, 38, 0.06);
+                color: {TEXT_DARK};
+                display: inline-flex;
+                font-size: 2rem;
+                height: 4.6rem;
+                justify-content: center;
+                width: 4.6rem;
+            }}
+            .station-hero-copy {{
+                min-width: 0;
             }}
             .station-number {{
                 color: {TEXT_MUTED};
@@ -1122,6 +2623,7 @@ def _inject_styles() -> None:
                 color: {TEXT_MUTED};
                 font-size: 1rem;
                 line-height: 1.55;
+                margin-bottom: 0.1rem;
             }}
             .station-project-name {{
                 color: {TEXT_DARK};
@@ -1134,6 +2636,100 @@ def _inject_styles() -> None:
                 font-size: 0.93rem;
                 line-height: 1.5;
                 margin-top: 0.55rem;
+            }}
+            .workspace-hero {{
+                background:
+                    radial-gradient(circle at top left, rgba(209, 34, 142, 0.10), transparent 38%),
+                    radial-gradient(circle at top right, rgba(91, 141, 239, 0.10), transparent 32%),
+                    linear-gradient(180deg, rgba(255,255,255,0.98), rgba(252,250,252,0.98));
+                border: 1px solid #e8ebf1;
+                border-radius: 18px;
+                box-shadow: 0 14px 32px rgba(18, 24, 38, 0.06);
+                margin-bottom: 1rem;
+                padding: 1.15rem 1.2rem;
+            }}
+            .workspace-hero-top {{
+                align-items: center;
+                display: flex;
+                gap: 0.8rem;
+                margin-bottom: 0.65rem;
+            }}
+            .workspace-hero-icon {{
+                align-items: center;
+                background: rgba(255,255,255,0.88);
+                border: 1px solid #eceff4;
+                border-radius: 16px;
+                display: inline-flex;
+                font-size: 1.35rem;
+                height: 3rem;
+                justify-content: center;
+                width: 3rem;
+            }}
+            .workspace-hero-kicker {{
+                color: #5c6884;
+                font-size: 0.76rem;
+                font-weight: 800;
+                letter-spacing: 0.14em;
+                margin-bottom: 0.18rem;
+                text-transform: uppercase;
+            }}
+            .workspace-hero-title {{
+                color: {TEXT_DARK};
+                font-size: 1.35rem;
+                font-weight: 900;
+                letter-spacing: -0.03em;
+                line-height: 1.08;
+            }}
+            .workspace-hero-caption {{
+                color: {TEXT_MUTED};
+                font-size: 0.96rem;
+                line-height: 1.55;
+            }}
+            .broadcast-status-badge-row {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.55rem;
+                margin: 0.2rem 0 0.95rem 0;
+            }}
+            .broadcast-status-badge {{
+                align-items: center;
+                border-radius: 999px;
+                display: inline-flex;
+                font-size: 0.84rem;
+                font-weight: 800;
+                letter-spacing: 0.01em;
+                padding: 0.45rem 0.8rem;
+            }}
+            .broadcast-status-badge-success {{
+                background: rgba(22, 163, 74, 0.12);
+                border: 1px solid rgba(22, 163, 74, 0.22);
+                color: #15803d;
+            }}
+            .broadcast-status-badge-warning {{
+                background: rgba(245, 158, 11, 0.14);
+                border: 1px solid rgba(245, 158, 11, 0.24);
+                color: #b45309;
+            }}
+            .broadcast-status-badge-danger {{
+                background: rgba(217, 45, 32, 0.11);
+                border: 1px solid rgba(217, 45, 32, 0.2);
+                color: #b42318;
+            }}
+            .broadcast-status-badge-neutral {{
+                background: rgba(91, 141, 239, 0.1);
+                border: 1px solid rgba(91, 141, 239, 0.18);
+                color: #2456c7;
+            }}
+            .workspace-gap {{
+                height: 0.45rem;
+            }}
+            [data-testid="stAppViewContainer"] > .main div[data-testid="stExpander"] .streamlit-expanderContent,
+            [data-testid="stAppViewContainer"] > .main details[data-testid="stExpander"] .streamlit-expanderContent {{
+                padding: 0.55rem 0.15rem 0.2rem 0.15rem !important;
+            }}
+            [data-testid="stAppViewContainer"] > .main div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stExpander"]) {{
+                margin-top: 0.45rem;
+                margin-bottom: 0.45rem;
             }}
             .file-list-panel {{
                 background: #ffffff;
@@ -1223,8 +2819,8 @@ def _inject_styles() -> None:
                 font-weight: 800;
                 letter-spacing: 0.1em;
                 text-transform: uppercase;
-                margin-top: 1.4rem;
-                margin-bottom: 0.7rem;
+                margin-top: 1rem;
+                margin-bottom: 0.55rem;
             }}
             .sidebar-status-row {{
                 align-items: center;
@@ -1250,7 +2846,28 @@ def _inject_styles() -> None:
                 border: 1px solid #f3d4e8;
                 border-radius: 14px;
                 padding: 0.85rem 0.9rem;
-                margin-top: 0.8rem;
+                margin-top: 0.7rem;
+            }}
+            .sidebar-group-divider {{
+                background: linear-gradient(90deg, rgba(209, 34, 142, 0.08), rgba(91, 141, 239, 0.08));
+                border: 1px solid rgba(223, 227, 234, 0.92);
+                border-radius: 999px;
+                height: 0.4rem;
+                margin: 0.95rem 0 1rem;
+            }}
+            .station-nav-group-title {{
+                color: {TEXT_MUTED};
+                font-size: 0.78rem;
+                font-weight: 800;
+                letter-spacing: 0.14em;
+                margin-bottom: 0.55rem;
+                text-transform: uppercase;
+            }}
+            .station-nav-group-copy {{
+                color: {TEXT_MUTED};
+                font-size: 0.92rem;
+                line-height: 1.5;
+                margin-bottom: 0.85rem;
             }}
             .data-card {{
                 background-color: #ffffff;
@@ -1420,6 +3037,115 @@ def _inject_styles() -> None:
     )
 
 
+def _inject_sidebar_reopen_bridge(*, enabled: bool) -> None:
+    """Keep a reliable floating reopen control available for the manager sidebar."""
+
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const enabled = {str(enabled).lower()};
+            const doc = window.parent.document;
+            const buttonId = "uplands-sidebar-reopen";
+            const styleId = "uplands-sidebar-reopen-style";
+
+            function ensureStyle() {{
+                if (doc.getElementById(styleId)) return;
+                const style = doc.createElement("style");
+                style.id = styleId;
+                style.textContent = `
+                    #${{buttonId}} {{
+                        align-items: center;
+                        backdrop-filter: blur(14px);
+                        background: rgba(255, 255, 255, 0.97);
+                        border: 1px solid rgba(217, 221, 229, 0.96);
+                        border-radius: 999px;
+                        box-shadow: 0 14px 30px rgba(18, 24, 38, 0.14);
+                        color: {TEXT_DARK};
+                        cursor: pointer;
+                        display: none;
+                        font: 800 0.94rem/1 "Avenir Next", "Segoe UI", sans-serif;
+                        gap: 0.45rem;
+                        left: 0.95rem;
+                        min-height: 2.6rem;
+                        padding: 0.65rem 0.95rem;
+                        position: fixed;
+                        top: 0.95rem;
+                        transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+                        z-index: 10001;
+                    }}
+                    #${{buttonId}}:hover {{
+                        border-color: rgba(209, 34, 142, 0.42);
+                        box-shadow: 0 18px 36px rgba(18, 24, 38, 0.18);
+                        transform: translateY(-1px);
+                    }}
+                    #${{buttonId}} .uplands-sidebar-reopen-arrow {{
+                        font-size: 1rem;
+                        line-height: 1;
+                    }}
+                `;
+                doc.head.appendChild(style);
+            }}
+
+            function ensureButton() {{
+                let button = doc.getElementById(buttonId);
+                if (!button) {{
+                    button = doc.createElement("button");
+                    button.id = buttonId;
+                    button.type = "button";
+                    button.innerHTML = '<span class="uplands-sidebar-reopen-arrow">☰</span><span>Show Sidebar</span>';
+                    button.addEventListener("click", function() {{
+                        const nativeControl =
+                            doc.querySelector('[data-testid="stExpandSidebarButton"]') ||
+                            doc.querySelector('[data-testid="collapsedControl"]') ||
+                            doc.querySelector('[data-testid="stSidebarCollapseButton"]') ||
+                            doc.querySelector('button[data-testid="stExpandSidebarButton"]') ||
+                            doc.querySelector('button[aria-label*="sidebar" i]') ||
+                            doc.querySelector('button[title*="sidebar" i]');
+                        if (nativeControl) {{
+                            nativeControl.dispatchEvent(
+                                new MouseEvent("click", {{
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window.parent,
+                                }})
+                            );
+                        }}
+                    }});
+                    doc.body.appendChild(button);
+                }}
+                return button;
+            }}
+
+            function update() {{
+                const button = ensureButton();
+                if (!enabled) {{
+                    button.style.display = "none";
+                    return;
+                }}
+                const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
+                const isCollapsed = !!sidebar && sidebar.getAttribute("aria-expanded") === "false";
+                button.style.display = isCollapsed ? "inline-flex" : "none";
+            }}
+
+            ensureStyle();
+            update();
+            const observer = new MutationObserver(update);
+            observer.observe(doc.body, {{ childList: true, subtree: true, attributes: true }});
+            window.addEventListener("beforeunload", function() {{
+                observer.disconnect();
+            }});
+            window.setTimeout(update, 150);
+            window.setTimeout(update, 600);
+            window.setTimeout(update, 1200);
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def _render_sidebar(
     repository: DocumentRepository,
     station_label: str,
@@ -1427,12 +3153,27 @@ def _render_sidebar(
 ) -> None:
     """Render the branded sidebar and sync controls."""
 
+    station = _get_file_station(station_label)
     if UPLANDS_LOGO.exists():
         st.image(str(UPLANDS_LOGO), width=220)
     if NATIONAL_GRID_LOGO.exists():
         st.image(str(NATIONAL_GRID_LOGO), width=120)
 
-    if st.button("SYNC WORKSPACE", use_container_width=True):
+    _render_sidebar_overview_card(station, project_setup)
+
+    st.markdown(
+        (
+            "<div class='sidebar-section-card'>"
+            "<div class='sidebar-section-title'>Workspace Operations</div>"
+            "<div class='sidebar-section-copy'>"
+            "Run intake, check the live workspace state, and keep the command centre aligned before moving into station-specific work."
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🔄 SYNC WORKSPACE", width="stretch"):
         with st.spinner("Syncing Uplands workspace..."):
             filed_assets = file_and_index_all(repository)
         auto_capture_messages = [
@@ -1470,7 +3211,17 @@ def _render_sidebar(
             st.success("\n".join(sync_summary["auto_capture_messages"]))
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='sidebar-heading'>Workspace Status</div>", unsafe_allow_html=True)
+    st.markdown(
+        (
+            "<div class='sidebar-section-card'>"
+            "<div class='sidebar-section-title'>Workspace Status</div>"
+            "<div class='sidebar-section-copy'>"
+            "A quick sense check that each live file station is available before you drill into the detail."
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
     for label in (
         "📥 Ingest Inbox",
         "📁 File 1 Ready",
@@ -1488,10 +3239,24 @@ def _render_sidebar(
             unsafe_allow_html=True,
         )
 
+    st.markdown("<div class='sidebar-group-divider'></div>", unsafe_allow_html=True)
+
     _render_sidebar_project_setup(project_setup)
+    _render_sidebar_view_settings()
+    _render_sidebar_tunnel_status(project_setup)
     _render_workspace_doctor()
 
-    station = _get_file_station(station_label)
+    st.markdown(
+        (
+            "<div class='sidebar-section-card'>"
+            "<div class='sidebar-section-title'>Station Tools</div>"
+            "<div class='sidebar-section-copy'>"
+            "These controls change with the active workspace, so the left rail stays focused on the task you are doing right now."
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f"<div class='sidebar-heading'>Quick Actions · {station.number}</div>",
         unsafe_allow_html=True,
@@ -1502,21 +3267,107 @@ def _render_sidebar(
         _render_sidebar_tools(repository, project_setup)
     elif station.number == "FILE 3":
         _render_sidebar_file_3_quick_actions(repository, project_setup)
+    elif station.number == "BROADCAST":
+        _render_sidebar_site_broadcast_quick_actions(repository, project_setup)
     elif station.number == "INDUCTION":
         _render_sidebar_site_induction_quick_actions(project_setup)
     else:
         _render_sidebar_file_2_quick_actions(repository, project_setup)
 
 
+def _render_sidebar_overview_card(
+    station: FileStation,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render a compact manager overview card at the top of the sidebar."""
+
+    project_bits = [
+        project_setup.current_site_name or "Site not set",
+        f"Client: {project_setup.client_name}" if project_setup.client_name else "",
+        f"Job: {project_setup.job_number}" if project_setup.job_number else "",
+    ]
+    project_meta = " | ".join(bit for bit in project_bits if bit)
+    st.markdown(
+        (
+            "<div class='sidebar-tool-card'>"
+            "<div class='sidebar-tool-title'>Manager Console</div>"
+            f"<div class='sidebar-tool-copy'>Active workspace: <strong>{html.escape(station.number)}</strong> · "
+            f"{html.escape(station.title)}</div>"
+            f"<div class='sidebar-tool-copy'>{html.escape(project_meta)}</div>"
+            "<div class='sidebar-tool-copy'>"
+            "Use the sidebar for global controls only. Station-specific actions live inside each page so the workflow stays easier to follow."
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_sidebar_view_settings() -> None:
+    """Render sidebar layout controls for manager mode."""
+
+    if st.session_state.pop("sidebar_width_reset_pending", False):
+        st.session_state["sidebar_width_rem"] = 24
+
+    with st.expander("View Settings", expanded=False):
+        st.caption(
+            "Adjust the sidebar width for admin work. Collapse and re-open now use the cleaner native sidebar behavior."
+        )
+        sidebar_width = st.slider(
+            "Sidebar Width",
+            min_value=20,
+            max_value=32,
+            value=int(round(float(st.session_state.get("sidebar_width_rem", 24)))),
+            step=1,
+            key="sidebar_width_rem",
+        )
+        st.caption(f"Current width: {sidebar_width}rem")
+        if st.button(
+            "↺ Reset Sidebar Width",
+            key="reset_sidebar_width",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["sidebar_width_reset_pending"] = True
+            st.rerun()
+
+
 def _render_sidebar_project_setup(project_setup: ProjectSetup) -> None:
     """Render the persisted project metadata form."""
 
+    _flush_project_setup_postcode_state_clear()
+
     with st.expander("Project Setup", expanded=False):
+        st.markdown(
+            (
+                "<div class='sidebar-tool-card'>"
+                "<div class='sidebar-tool-title'>Live Project Controls</div>"
+                "<div class='sidebar-tool-copy'>"
+                "This is the operational source of truth for the active site, tunnel, and geo-fence. "
+                "Use the quick setup tools below when the job moves."
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
         flash_message = st.session_state.pop("project_setup_flash", None)
+        flash_level = str(st.session_state.pop("project_setup_flash_level", "success"))
         if flash_message is not None:
-            st.success(flash_message)
+            if flash_level == "error":
+                st.error(flash_message)
+            elif flash_level == "warning":
+                st.warning(flash_message)
+            elif flash_level == "info":
+                st.info(flash_message)
+            else:
+                st.success(flash_message)
 
         with st.form("project_setup_form", clear_on_submit=False):
+            st.markdown("<div class='form-section-kicker'>Project Identity</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='form-section-copy'>Set the live site details that drive the register headers, poster text, and document outputs.</div>",
+                unsafe_allow_html=True,
+            )
             current_site_name = st.text_input(
                 "Current Site Name",
                 value=project_setup.current_site_name,
@@ -1533,24 +3384,397 @@ def _render_sidebar_project_setup(project_setup: ProjectSetup) -> None:
                 "Client Name",
                 value=project_setup.client_name,
             )
+            public_tunnel_url = st.text_input(
+                "Public Tunnel URL",
+                value=project_setup.public_tunnel_url,
+                help="Optional public URL for Cloudflare Tunnel or Ngrok. The induction poster QR will use this when set.",
+            )
+            st.markdown("<div class='form-section-kicker'>Geo-Fence</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='form-section-copy'>These coordinates define where operatives are allowed to sign in. They can be set manually or by the quick tools below.</div>",
+                unsafe_allow_html=True,
+            )
+            geofence_columns = st.columns(3, gap="small")
+            with geofence_columns[0]:
+                site_latitude = st.number_input(
+                    "Site Latitude",
+                    value=float(project_setup.site_latitude),
+                    format="%.6f",
+                    help="Change this when the project moves to a different site.",
+                )
+            with geofence_columns[1]:
+                site_longitude = st.number_input(
+                    "Site Longitude",
+                    value=float(project_setup.site_longitude),
+                    format="%.6f",
+                    help="Change this when the project moves to a different site.",
+                )
+            with geofence_columns[2]:
+                geofence_radius_meters = st.number_input(
+                    "Geo-Fence Radius (m)",
+                    min_value=1,
+                    value=int(project_setup.geofence_radius_meters),
+                    step=25,
+                    help="Operatives must be within this distance to sign in or out.",
+                )
             submitted = st.form_submit_button(
-                "Save Project Setup",
-                use_container_width=True,
+                "💾 Save Project Setup",
+                width="stretch",
             )
 
-        if not submitted:
-            return
+        if submitted:
+            saved_setup = ProjectSetup(
+                current_site_name=current_site_name.strip() or PROJECT_NAME,
+                job_number=job_number.strip(),
+                site_address=site_address.strip(),
+                client_name=client_name.strip(),
+                public_tunnel_url=public_tunnel_url.strip(),
+                site_latitude=float(site_latitude),
+                site_longitude=float(site_longitude),
+                geofence_radius_meters=max(1, int(geofence_radius_meters)),
+                known_sites=project_setup.known_sites,
+            )
+            saved_setup = _save_project_setup(saved_setup)
+            save_app_settings(public_tunnel_url=saved_setup.public_tunnel_url)
+            st.session_state["project_setup"] = saved_setup
+            st.session_state["project_setup_flash"] = "Project setup saved."
+            st.session_state["project_setup_flash_level"] = "success"
+            st.rerun()
 
-        saved_setup = ProjectSetup(
-            current_site_name=current_site_name.strip() or PROJECT_NAME,
-            job_number=job_number.strip(),
-            site_address=site_address.strip(),
-            client_name=client_name.strip(),
+        st.markdown("<div class='form-section-kicker'>Quick Geo-Fence Setup</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='form-section-copy'>Use your current device location on site, or resolve a postcode before you arrive.</div>",
+            unsafe_allow_html=True,
         )
-        _save_project_setup(saved_setup)
-        st.session_state["project_setup"] = saved_setup
-        st.session_state["project_setup_flash"] = "Project setup saved."
-        st.rerun()
+        st.link_button(
+            "📍 Use Current Device Location",
+            _build_project_setup_geolocation_capture_url(
+                public_url=project_setup.public_tunnel_url
+            ),
+            type="secondary",
+            width="stretch",
+        )
+        st.markdown(
+            (
+                "<div class='sidebar-tool-card'>"
+                "<div class='sidebar-tool-title'>Current Geo-Fence</div>"
+                "<div class='sidebar-tool-copy'>"
+                f"Radius: <strong>{project_setup.geofence_radius_meters}m</strong><br>"
+                f"Lat: {project_setup.site_latitude:.5f}<br>"
+                f"Lng: {project_setup.site_longitude:.5f}"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+        with st.form("project_setup_postcode_lookup_form", clear_on_submit=False):
+            st.markdown(
+                "<div class='form-section-kicker'>Find Site by Postcode</div>",
+                unsafe_allow_html=True,
+            )
+            postcode_lookup = st.text_input(
+                "Search UK postcode",
+                key="project_setup_postcode_lookup",
+                placeholder="e.g. CF44 9TZ",
+                help=(
+                    "We will resolve the postcode first, then let you pick a known site "
+                    "or type the building / unit once before applying it."
+                ),
+            )
+            postcode_submitted = st.form_submit_button(
+                "🔎 Search Postcode",
+                width="stretch",
+            )
+
+        extracted_site_postcode = _extract_uk_postcode(project_setup.site_address)
+        if extracted_site_postcode:
+            st.caption(f"Detected site postcode: {extracted_site_postcode}")
+            if st.button(
+                "📍 Use Postcode from Site Address",
+                key="project_setup_use_site_address_postcode",
+                width="stretch",
+                type="secondary",
+            ):
+                postcode_result = lookup_uk_postcode_details(extracted_site_postcode)
+                if postcode_result is None:
+                    st.session_state["project_setup_flash"] = (
+                        f"Could not resolve postcode from Site Address: {extracted_site_postcode}"
+                    )
+                    st.session_state["project_setup_flash_level"] = "warning"
+                    st.rerun()
+
+                st.session_state["project_setup_postcode_result"] = postcode_result
+                prefilled_site_name = _strip_uk_postcode(project_setup.site_address)
+                if not prefilled_site_name:
+                    prefilled_site_name = project_setup.current_site_name
+                st.session_state["project_setup_postcode_site_name"] = prefilled_site_name
+                st.session_state["project_setup_flash"] = (
+                    f"Postcode resolved: {postcode_result['formatted_address']}"
+                )
+                st.session_state["project_setup_flash_level"] = "info"
+                st.rerun()
+
+        if postcode_submitted:
+            postcode_result = lookup_uk_postcode_details(postcode_lookup)
+            if postcode_result is None:
+                st.session_state["project_setup_flash"] = (
+                    "Postcode lookup failed. Check the postcode and try again."
+                )
+                st.session_state["project_setup_flash_level"] = "warning"
+                _clear_project_setup_postcode_state()
+                st.rerun()
+
+            st.session_state["project_setup_postcode_result"] = postcode_result
+            st.session_state["project_setup_postcode_site_name"] = ""
+            st.session_state["project_setup_flash"] = (
+                f"Postcode resolved: {postcode_result['formatted_address']}"
+            )
+            st.session_state["project_setup_flash_level"] = "info"
+            st.rerun()
+
+        postcode_result = st.session_state.get("project_setup_postcode_result")
+        if isinstance(postcode_result, dict) and postcode_result.get("postcode"):
+            normalized_postcode = str(postcode_result.get("postcode") or "").strip()
+            matching_known_sites = _matching_known_sites_for_postcode(
+                project_setup,
+                normalized_postcode,
+            )
+            st.markdown(
+                "<div class='form-section-kicker'>Resolve This Site</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                (
+                    "<div class='form-section-copy'>"
+                    "We found the postcode. Choose a remembered site at this postcode, "
+                    "or type the site / building name once and we will fill the rest of the address for you."
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                (
+                    "<div class='sidebar-tool-card'>"
+                    "<div class='sidebar-tool-title'>Resolved Postcode</div>"
+                    "<div class='sidebar-tool-copy'>"
+                    f"{html.escape(str(postcode_result.get('formatted_address') or normalized_postcode))}<br>"
+                    f"Lat: {float(postcode_result.get('latitude') or 0.0):.5f}<br>"
+                    f"Lng: {float(postcode_result.get('longitude') or 0.0):.5f}"
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            if matching_known_sites:
+                st.info(
+                    f"We already remember {len(matching_known_sites)} saved site"
+                    f"{'' if len(matching_known_sites) == 1 else 's'} at {normalized_postcode}. "
+                    "Pick one below or name a new building if this is a different compound."
+                )
+            else:
+                st.info(
+                    "This postcode is new to the command centre. Name the site or building once and "
+                    "we will remember it for future site moves."
+                )
+
+            resolution_options = ["🏢 New Site / Building"]
+            resolution_lookup: Dict[str, Optional[SavedSiteProfile]] = {
+                "🏢 New Site / Building": None
+            }
+            for profile in matching_known_sites:
+                option_label = f"🗂️ {profile.label}"
+                resolution_options.append(option_label)
+                resolution_lookup[option_label] = profile
+
+            resolution_choice_key = "project_setup_postcode_resolution_choice"
+            if (
+                resolution_choice_key not in st.session_state
+                or st.session_state[resolution_choice_key] not in resolution_lookup
+            ):
+                st.session_state[resolution_choice_key] = "🏢 New Site / Building"
+
+            selected_resolution_label = st.selectbox(
+                "Select exact site",
+                options=resolution_options,
+                key=resolution_choice_key,
+                help=(
+                    "If you have already used this postcode before, pick the saved site. "
+                    "Otherwise choose New Site / Building and name it once."
+                ),
+            )
+            selected_profile = resolution_lookup[selected_resolution_label]
+
+            clear_postcode_search = False
+            if selected_profile is None:
+                site_name_input = st.text_input(
+                    "Site / Building Name",
+                    key="project_setup_postcode_site_name",
+                    placeholder="e.g. Unit 4, Main Office, Substation Compound",
+                    help=(
+                        "This becomes the site name and the first line of the saved address."
+                    ),
+                )
+                preview_address = _build_site_address_from_postcode_result(
+                    postcode_result,
+                    site_name_input,
+                )
+                st.caption(
+                    "Address preview: "
+                    f"{preview_address or str(postcode_result.get('formatted_address') or normalized_postcode)}"
+                )
+                resolution_action_columns = st.columns(2, gap="small")
+                with resolution_action_columns[0]:
+                    apply_resolved_site = st.button(
+                        "📍 Use This Site Address",
+                        width="stretch",
+                        disabled=not site_name_input.strip(),
+                    )
+                with resolution_action_columns[1]:
+                    clear_postcode_search = st.button(
+                        "✖ Clear Search",
+                        key="project_setup_clear_postcode_search_new",
+                        width="stretch",
+                        type="secondary",
+                    )
+                if apply_resolved_site:
+                    resolved_site_name = site_name_input.strip()
+                    updated_setup = replace(
+                        project_setup,
+                        current_site_name=resolved_site_name,
+                        site_address=_build_site_address_from_postcode_result(
+                            postcode_result,
+                            resolved_site_name,
+                        ),
+                        site_latitude=float(postcode_result["latitude"]),
+                        site_longitude=float(postcode_result["longitude"]),
+                    )
+                    updated_setup = _save_project_setup(updated_setup)
+                    st.session_state["project_setup"] = updated_setup
+                    _clear_project_setup_postcode_state()
+                    st.session_state["project_setup_flash"] = (
+                        f"Saved site: {resolved_site_name} ({normalized_postcode})"
+                    )
+                    st.session_state["project_setup_flash_level"] = "success"
+                    st.rerun()
+            else:
+                st.caption(
+                    f"Saved address: {selected_profile.site_address or 'No address saved'}"
+                )
+                st.caption(
+                    f"Last used: {selected_profile.last_used_at or 'Unknown'} | "
+                    f"Radius: {selected_profile.geofence_radius_meters}m"
+                )
+                resolution_action_columns = st.columns(2, gap="small")
+                with resolution_action_columns[0]:
+                    load_matching_site = st.button(
+                        "🗂️ Load This Known Site",
+                        key="project_setup_load_postcode_known_site",
+                        width="stretch",
+                        type="primary",
+                    )
+                with resolution_action_columns[1]:
+                    clear_postcode_search = st.button(
+                        "✖ Clear Search",
+                        key="project_setup_clear_postcode_search_known",
+                        width="stretch",
+                        type="secondary",
+                    )
+                if load_matching_site:
+                    updated_setup = replace(
+                        project_setup,
+                        current_site_name=selected_profile.site_name,
+                        site_address=selected_profile.site_address,
+                        client_name=selected_profile.client_name or project_setup.client_name,
+                        job_number=selected_profile.job_number,
+                        site_latitude=selected_profile.site_latitude,
+                        site_longitude=selected_profile.site_longitude,
+                        geofence_radius_meters=selected_profile.geofence_radius_meters,
+                    )
+                    updated_setup = _save_project_setup(updated_setup)
+                    st.session_state["project_setup"] = updated_setup
+                    _clear_project_setup_postcode_state()
+                    st.session_state["project_setup_flash"] = (
+                        f"Loaded saved site: {selected_profile.site_name}"
+                    )
+                    st.session_state["project_setup_flash_level"] = "success"
+                    st.rerun()
+
+            if clear_postcode_search:
+                _clear_project_setup_postcode_state()
+                st.session_state["project_setup_flash"] = "Cleared postcode search."
+                st.session_state["project_setup_flash_level"] = "info"
+                st.rerun()
+
+        if project_setup.known_sites:
+            st.markdown("<div class='form-section-kicker'>Known Sites</div>", unsafe_allow_html=True)
+            st.markdown(
+                (
+                    "<div class='form-section-copy'>"
+                    "Previously used site profiles are remembered here so you can switch the command centre back to a known project quickly."
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            known_site_options = {
+                profile.label: profile for profile in project_setup.known_sites
+            }
+            selected_known_site_label = st.selectbox(
+                "Saved Site Profiles",
+                options=list(known_site_options),
+                key="project_setup_known_site",
+            )
+            selected_known_site = known_site_options[selected_known_site_label]
+            st.caption(
+                f"Last used: {selected_known_site.last_used_at or 'Unknown'} | "
+                f"Radius: {selected_known_site.geofence_radius_meters}m"
+            )
+            if st.button(
+                "🗂️ Load Selected Site",
+                key="project_setup_load_known_site",
+                width="stretch",
+                type="secondary",
+            ):
+                updated_setup = replace(
+                    project_setup,
+                    current_site_name=selected_known_site.site_name,
+                    site_address=selected_known_site.site_address,
+                    client_name=selected_known_site.client_name or project_setup.client_name,
+                    job_number=selected_known_site.job_number,
+                    site_latitude=selected_known_site.site_latitude,
+                    site_longitude=selected_known_site.site_longitude,
+                    geofence_radius_meters=selected_known_site.geofence_radius_meters,
+                )
+                updated_setup = _save_project_setup(updated_setup)
+                st.session_state["project_setup"] = updated_setup
+                st.session_state["project_setup_flash"] = (
+                    f"Loaded saved site: {selected_known_site.site_name}"
+                )
+                st.session_state["project_setup_flash_level"] = "success"
+                st.rerun()
+
+        st.markdown(
+            (
+                "<div class='sidebar-tool-card'>"
+                "<div class='sidebar-tool-title'>Tunnel Note</div>"
+                "<div class='sidebar-tool-copy'>"
+                "One-time setup: run <code>cloudflared tunnel login</code> in Terminal before using the named tunnel launcher."
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def _render_sidebar_tunnel_status(project_setup: ProjectSetup) -> None:
+    """Show the manager warning when the site tunnel is offline."""
+
+    if _is_tunnel_running():
+        return
+
+    st.warning("⚠️ Site Gate Offline - Check Tunnel.")
+    if project_setup.public_tunnel_url:
+        st.caption(project_setup.public_tunnel_url)
 
 
 def _render_workspace_doctor() -> None:
@@ -1558,8 +3782,8 @@ def _render_workspace_doctor() -> None:
 
     with st.expander("🏥 Workspace Doctor", expanded=False):
         if st.button(
-            "Re-scan Workspace",
-            use_container_width=True,
+            "🔄 Re-scan Workspace",
+            width="stretch",
             key="workspace_doctor_rescan",
         ):
             st.rerun()
@@ -1657,7 +3881,7 @@ def _render_sidebar_compliance_admin(
                 "Expiry Date",
                 value=default_expiry_date,
             )
-            submitted = st.form_submit_button("Update Status", use_container_width=True)
+            submitted = st.form_submit_button("💾 Update Status", width="stretch")
 
         if not submitted:
             return
@@ -1709,9 +3933,9 @@ def _render_sidebar_tools(
         if not project_setup.job_number.strip():
             st.warning("Enter the Job Number in Project Setup before generating permits.")
         if st.button(
-            "Refresh & Sync",
+            "🔄 Refresh & Sync",
             key="file_4_refresh_sync",
-            use_container_width=True,
+            width="stretch",
         ):
             sync_result = sync_file_4_permit_records(
                 repository,
@@ -1847,15 +4071,15 @@ def _render_sidebar_tools(
                     key="ladder_permit_inspection_comments",
                 )
             submitted = st.form_submit_button(
-                "Generate Ladder Permit",
-                use_container_width=True,
+                "🪜 Generate Ladder Permit",
+                width="stretch",
                 disabled=not project_setup.job_number.strip(),
             )
 
         if st.button(
-            "Clear Form",
+            "↺ Clear Form",
             key="ladder_permit_clear_form",
-            use_container_width=True,
+            width="stretch",
         ):
             _reset_ladder_permit_form_state()
             st.session_state["ladder_permit_flash"] = {
@@ -1991,46 +4215,117 @@ def _render_sidebar_file_3_quick_actions(
 
 
 def _render_sidebar_site_induction_quick_actions(project_setup: ProjectSetup) -> None:
-    """Render the induction kiosk sidebar hints."""
+    """Render the attendance station sidebar hints."""
 
-    with st.expander("Kiosk", expanded=False):
-        st.success("Live site induction form with signature capture is ready.")
+    with st.expander("UHSF16.09", expanded=False):
+        st.success("Daily sign-in / sign-out register is ready.")
         st.caption(f"Project: {project_setup.current_site_name}")
-        st.caption(f"Signatures folder: {FILE_3_SIGNATURES_DIR.name}")
-        st.caption(f"Completed docs: {FILE_3_COMPLETED_INDUCTIONS_DIR.name}")
+        st.caption(f"Attendance signatures: {FILE_2_ATTENDANCE_SIGNATURES_DIR.name}")
+        st.caption(ATTENDANCE_FORM_METADATA)
+
+
+def _render_sidebar_site_broadcast_quick_actions(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render the broadcast hub quick summary in the sidebar."""
+
+    live_contacts = build_live_site_broadcast_contacts(
+        repository,
+        site_name=project_setup.current_site_name,
+    )
+    with st.expander("Broadcast Hub", expanded=False):
+        st.success("Live fire roll audience is ready for Messages delivery.")
+        st.caption(f"Project: {project_setup.current_site_name}")
+        st.caption(f"Active phones on site: {len(live_contacts)}")
+        if live_contacts:
+            st.caption(
+                "Latest contact: "
+                f"{live_contacts[0].individual_name} | {live_contacts[0].mobile_number}"
+            )
+        else:
+            st.caption("No valid mobile numbers are currently available on site.")
+
+
+def _render_station_button_group(
+    title: str,
+    caption: str,
+    stations: List[FileStation],
+    *,
+    active_station_label: str,
+) -> Optional[str]:
+    """Render one grouped station button row and return any newly selected station."""
+
+    st.markdown(
+        f"<div class='station-nav-group-title'>{html.escape(title)}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='station-nav-group-copy'>{html.escape(caption)}</div>",
+        unsafe_allow_html=True,
+    )
+    selection: Optional[str] = None
+    station_columns = st.columns(len(stations), gap="small")
+    for station, station_column in zip(stations, station_columns):
+        with station_column:
+            if st.button(
+                station.label,
+                key=f"station_nav_{station.number}",
+                width="stretch",
+                type="primary" if active_station_label == station.label else "secondary",
+            ):
+                selection = station.label
+    return selection
 
 
 def _render_file_station_navigation() -> str:
-    """Render the top-level four-file navigator and return the active station."""
+    """Render the grouped station navigator and return the active station."""
 
-    current_label = str(st.session_state.get("active_file_station", DEFAULT_FILE_STATION_LABEL))
-    current_index = next(
-        (
-            index
-            for index, station in enumerate(FILE_STATIONS)
-            if station.label == current_label
-        ),
-        1,
+    active_station_label = str(st.session_state["active_file_station"])
+    core_stations = [
+        station
+        for station in FILE_STATIONS
+        if station.number in {"FILE 1", "FILE 2", "FILE 3", "FILE 4"}
+    ]
+    live_stations = [
+        station
+        for station in FILE_STATIONS
+        if station.number in {"INDUCTION", "BROADCAST"}
+    ]
+
+    core_selection = _render_station_button_group(
+        "Core Site Files",
+        "The formal project file spine. Keep these in order and use them as the compliance backbone.",
+        core_stations,
+        active_station_label=active_station_label,
     )
-    return st.radio(
-        "Site Files",
-        options=[station.label for station in FILE_STATIONS],
-        index=current_index,
-        key="active_file_station",
-        horizontal=True,
-        label_visibility="collapsed",
+    live_selection = _render_station_button_group(
+        "Live Operations",
+        "Daily sign-in, alerts, and operational actions that sit around the core file structure.",
+        live_stations,
+        active_station_label=active_station_label,
     )
+
+    selected_station = core_selection or live_selection
+    if selected_station is not None:
+        st.session_state["active_file_station"] = selected_station
+        _sync_manager_station_query_params(selected_station)
+        return selected_station
+    return active_station_label
 
 
 def _render_active_station(
     repository: DocumentRepository,
     station_label: str,
     project_setup: ProjectSetup,
+    *,
+    is_kiosk: bool = False,
 ) -> None:
     """Render the active file-station page."""
 
     station = _get_file_station(station_label)
-    _render_station_header(station, project_setup)
+    if not is_kiosk:
+        _render_station_header(station, project_setup)
 
     if station.number == "FILE 1":
         _render_file_1_station(repository, project_setup)
@@ -2041,8 +4336,11 @@ def _render_active_station(
     if station.number == "FILE 3":
         _render_file_3_station(repository, project_setup)
         return
+    if station.number == "BROADCAST":
+        _render_site_broadcast_station(repository, project_setup)
+        return
     if station.number == "INDUCTION":
-        _render_site_induction_station(repository, project_setup)
+        _render_site_induction_station(repository, project_setup, is_kiosk=is_kiosk)
         return
     _render_file_4_station(repository, project_setup)
 
@@ -2050,9 +4348,19 @@ def _render_active_station(
 def _render_station_header(station: FileStation, project_setup: ProjectSetup) -> None:
     """Render the file header card."""
 
+    station_icon = {
+        "FILE 1": "♻️",
+        "FILE 2": "📋",
+        "FILE 3": "🛡️",
+        "FILE 4": "⚡",
+        "INDUCTION": "🦺",
+        "BROADCAST": "📢",
+    }.get(station.number, "📁")
     st.markdown(
         (
             "<div class='station-header'>"
+            f"<div class='station-hero-icon'>{station_icon}</div>"
+            "<div class='station-hero-copy'>"
             f"<div class='station-number'>{station.number}</div>"
             f"<div class='station-title'>{station.title}</div>"
             f"<div class='station-project-name'>{project_setup.current_site_name}</div>"
@@ -2062,6 +4370,33 @@ def _render_station_header(station: FileStation, project_setup: ProjectSetup) ->
             f"{' | Job ' + project_setup.job_number if project_setup.job_number else ''}"
             f"{' | ' + project_setup.site_address if project_setup.site_address else ''}"
             "</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_workspace_hero(
+    *,
+    icon: str,
+    kicker: str,
+    title: str,
+    caption: str,
+) -> None:
+    """Render a premium hero block for one manager workspace tab."""
+
+    st.markdown(
+        (
+            "<div class='workspace-hero'>"
+            "<div class='workspace-hero-top'>"
+            f"<div class='workspace-hero-icon'>{icon}</div>"
+            "<div>"
+            f"<div class='workspace-hero-kicker'>{html.escape(kicker)}</div>"
+            f"<div class='workspace-hero-title'>{html.escape(title)}</div>"
+            "</div>"
+            "</div>"
+            f"<div class='workspace-hero-caption'>{html.escape(caption)}</div>"
             "</div>"
         ),
         unsafe_allow_html=True,
@@ -2074,6 +4409,12 @@ def _render_file_1_station(
 ) -> None:
     """Render File 1: Environment & Waste."""
 
+    _render_workspace_hero(
+        icon="♻️",
+        kicker="File 1",
+        title="Environment & Waste",
+        caption="Monitor live waste movement, keep carrier compliance tight, and turn the filed evidence into clean environmental records.",
+    )
     waste_notes = _get_lovedean_waste_notes(
         repository,
         site_name=project_setup.current_site_name,
@@ -2158,23 +4499,25 @@ def _render_file_1_station(
             ),
         )
 
-    columns = st.columns(2)
-    with columns[0]:
-        _render_carrier_compliance_panel(abucs_rows)
-    with columns[1]:
+    register_tab, scan_tab, compliance_tab = st.tabs(
+        ["Waste Register", "Smart Scan & Updates", "Carrier Compliance"]
+    )
+    with register_tab:
         _render_file_1_waste_register_panel(
             repository,
             project_setup=project_setup,
             waste_notes=active_waste_notes,
             waste_kpi_metadata=waste_kpi_metadata,
         )
-
-    _render_file_1_waste_log_panel(
-        repository,
-        project_setup=project_setup,
-        waste_kpi_metadata=waste_kpi_metadata,
-        waste_notes=active_waste_notes,
-    )
+    with scan_tab:
+        _render_file_1_waste_log_panel(
+            repository,
+            project_setup=project_setup,
+            waste_kpi_metadata=waste_kpi_metadata,
+            waste_notes=active_waste_notes,
+        )
+    with compliance_tab:
+        _render_carrier_compliance_panel(abucs_rows)
 
 
 def _render_file_1_waste_register_panel(
@@ -2183,40 +4526,62 @@ def _render_file_1_waste_register_panel(
     project_setup: ProjectSetup,
     waste_notes: List[WasteTransferNoteDocument],
     waste_kpi_metadata: Any,
-) -> None:
+    ) -> None:
     """Render the live File 1 waste register and print action."""
 
-    st.markdown(
-        (
-            "<div class='panel-card'>"
-            "<div class='panel-heading'>Waste Register</div>"
-            "<div class='panel-title'>Live Waste Removal History</div>"
-            "<div class='panel-caption'>"
-            "Full File 1 Tab 17 history used by the printable UHSF50.0 register."
-            "</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
+    register_rows = _build_live_waste_register_rows(waste_notes)
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric("Register Rows", str(len(register_rows)), icon="🧾")
+    with summary_columns[1]:
+        _render_inline_metric(
+            "Logged Tonnage",
+            f"{sum(note.quantity_tonnes for note in waste_notes):.2f} t",
+            icon="♻️",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "KPI Source",
+            waste_kpi_metadata.workbook_path.name
+            if waste_kpi_metadata.workbook_path is not None
+            else "Fallback",
+            icon="📊",
+        )
+
+    _render_workspace_hero(
+        icon="♻️",
+        kicker="Waste Register",
+        title="Live Waste Removal History",
+        caption="This view holds the active File 1 waste history and feeds the official UHSF50.0 register output.",
     )
     if waste_kpi_metadata.workbook_path is not None:
         st.caption(f"KPI source: {waste_kpi_metadata.workbook_path.name}")
     else:
         st.caption("KPI source: not found in FILE_1_Environment/Waste_Reports.")
 
-    register_rows = _build_live_waste_register_rows(waste_notes)
+    st.divider()
+    _render_workspace_zone_heading(
+        "Live Register",
+        "This table is the active waste history that drives the physical File 1 register.",
+    )
     if register_rows:
         st.dataframe(
             pd.DataFrame(register_rows),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info("No waste register rows have been logged yet.")
 
+    st.divider()
+    _render_workspace_zone_heading(
+        "Export / Print",
+        "Generate the official UHSF50.0 register from the live File 1 waste history.",
+    )
     if st.button(
         "🖨️ Print Waste Register",
         key="print_waste_register",
-        use_container_width=True,
+        width="stretch",
     ):
         try:
             generated_register = generate_waste_register_document(
@@ -2256,17 +4621,27 @@ def _render_file_1_waste_log_panel(
 ) -> None:
     """Render the File 1 WTN smart-scan form for already-filed notes."""
 
-    st.markdown(
-        (
-            "<div class='panel-card'>"
-            "<div class='panel-heading'>Smart Scan</div>"
-            "<div class='panel-title'>Filed Waste Transfer Notes</div>"
-            "<div class='panel-caption'>"
-            "Use the WTNs already synced from the ingest folder, bridge the File 1 KPI workbook header, and update the live waste register."
-            "</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric("Filed WTNs", str(len(waste_notes)), icon="📥")
+    with summary_columns[1]:
+        _render_inline_metric(
+            "KPI Workbook",
+            "Connected" if waste_kpi_metadata.workbook_path is not None else "Fallback",
+            icon="📊",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Project",
+            project_setup.job_number or "Not set",
+            icon="🏷️",
+        )
+
+    _render_workspace_hero(
+        icon="🔎",
+        kicker="Smart Scan",
+        title="Filed Waste Transfer Notes",
+        caption="Review the filed WTNs, trust the smart scan where it is strong, and correct the live register before printing.",
     )
 
     flash_message = st.session_state.pop("waste_log_flash", None)
@@ -2331,6 +4706,11 @@ def _render_file_1_waste_log_panel(
             "No File 1 KPI workbook was found. The form is using the current Project Setup values."
         )
 
+    st.divider()
+    _render_workspace_zone_heading(
+        "Primary Action",
+        "Select a filed WTN, review the smart scan values, and save the corrected live record back into File 1.",
+    )
     scan_columns = st.columns(3)
     with scan_columns[0]:
         st.text_input(
@@ -2435,10 +4815,15 @@ def _render_file_1_waste_log_panel(
                 value=default_destination_facility,
             )
 
-        submitted = st.form_submit_button("Log Waste", use_container_width=True)
+        submitted = st.form_submit_button("➕ Log Waste", width="stretch")
 
     if not submitted:
         if scanned_waste_note is not None and scanned_waste_note.extracted_text.strip():
+            st.divider()
+            _render_workspace_zone_heading(
+                "Scan Preview",
+                "Use this OCR preview when the scanned values need checking before you save.",
+            )
             with st.expander("Scanned text preview", expanded=False):
                 st.text(scanned_waste_note.extracted_text[:3000])
         return
@@ -2492,6 +4877,12 @@ def _render_file_2_station(
 ) -> None:
     """Render File 2: Registers & Diary."""
 
+    _render_workspace_hero(
+        icon="📋",
+        kicker="File 2",
+        title="Registers & Diary",
+        caption="Keep the live site record moving: checks, attendance, plant, and daily operating registers in one controlled workspace.",
+    )
     attendance_register = _get_lovedean_attendance_register(
         repository,
         site_name=project_setup.current_site_name,
@@ -2570,14 +4961,54 @@ def _render_file_2_station(
             ),
         )
 
-    columns = st.columns(2)
-    with columns[0]:
+    selected_file_2_view = str(
+        st.session_state.get("file2_active_view", _get_file_2_view_from_query_params() or "checks")
+    ).strip().casefold()
+    if selected_file_2_view not in FILE_2_VIEW_KEYS:
+        selected_file_2_view = "checks"
+    st.session_state["file2_active_view"] = selected_file_2_view
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Workspace View",
+        "Move between the main File 2 workspaces without losing your place. The Daily Site Diary view is now sticky for dictation returns.",
+    )
+    selected_file_2_view = str(
+        st.radio(
+            "File 2 Workspace View",
+            options=[view_key for view_key, _ in FILE_2_VIEW_OPTIONS],
+            format_func=lambda view_key: FILE_2_VIEW_LABELS.get(view_key, view_key),
+            key="file2_active_view",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+    ).strip().casefold()
+    _sync_file_2_view_query_param(selected_file_2_view)
+
+    if selected_file_2_view == "checks":
         _render_file_2_site_checks_panel(
             repository,
             site_name=project_setup.current_site_name,
             latest_site_check=latest_site_check,
         )
-    with columns[1]:
+    elif selected_file_2_view == "attendance":
+        st.markdown(
+            (
+                "<div class='panel-card'>"
+                "<div class='panel-heading'>Attendance Snapshot</div>"
+                "<div class='panel-title'>Today at a Glance</div>"
+                "<div class='panel-caption'>"
+                "This is the quick File 2 snapshot. Use the live attendance station for sign-in, sign-out, fire roll, and print actions."
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        st.divider()
+        _render_workspace_zone_heading(
+            "Live Register / History",
+            "This is the quick on-page attendance snapshot. The dedicated attendance station handles live sign-in, sign-out, fire roll, and printing.",
+        )
         _render_file_list_panel(
             heading="Attendance Register",
             title="Today's Workforce",
@@ -2592,14 +5023,21 @@ def _render_file_2_station(
             ],
             empty_message="No workers are listed on today's attendance register.",
         )
-
-    register_columns = st.columns(2)
-    with register_columns[0]:
+    elif selected_file_2_view == "diary":
+        _render_file_2_site_diary_panel(
+            repository,
+            project_setup=project_setup,
+        )
+    elif selected_file_2_view == "plant":
         _render_file_2_plant_register_panel(
             repository,
             project_setup=project_setup,
         )
-    with register_columns[1]:
+    else:
+        _render_workspace_zone_heading(
+            "Primary Action",
+            "Toolbox Talk creation, remote signing, and register export now live in the Broadcast station so operational messaging stays in one place.",
+        )
         _render_file_2_register_link(
             title="Toolbox Talk Register",
             caption="Open the live File 2 toolbox talk register folder.",
@@ -2614,6 +5052,12 @@ def _render_file_3_station(
 ) -> None:
     """Render File 3: Contractor Master."""
 
+    _render_workspace_hero(
+        icon="🛡️",
+        kicker="File 3",
+        title="Contractor Master",
+        caption="Track contractor competence, safety paperwork, and roster coverage so site assurance is always visible and current.",
+    )
     roster = build_site_worker_roster(site_name=project_setup.current_site_name)
     companies = sorted({worker.company for worker in roster}, key=str.casefold)
     latest_roster_date = (
@@ -2673,202 +5117,3813 @@ def _render_file_3_station(
             ),
         )
 
-    _render_file_3_safety_panel(
-        repository,
-        project_setup=project_setup,
-    )
-
-    columns = st.columns(2)
-    with columns[0]:
-        _render_site_worker_roster_table(roster)
-    with columns[1]:
-        _render_file_list_panel(
-            heading="Company Summary",
-            title="Contractor Master Feed",
-            caption="Unique companies derived automatically from the KPI backup roster.",
-            items=[
-                (
-                    f"{company} | workers {sum(1 for worker in roster if worker.company == company)} | "
-                    f"last on site {max(worker.last_on_site_date for worker in roster if worker.company == company).strftime('%d/%m/%Y')}"
-                )
-                for company in companies
-            ],
-            empty_message="No contractor roster entries are available yet.",
+    safety_tab, roster_tab = st.tabs(["Safety Inventory", "Contractor Roster"])
+    with safety_tab:
+        _render_file_3_safety_panel(
+            repository,
+            project_setup=project_setup,
         )
+    with roster_tab:
+        columns = st.columns(2)
+        with columns[0]:
+            _render_site_worker_roster_table(roster)
+        with columns[1]:
+            _render_file_list_panel(
+                heading="Company Summary",
+                title="Contractor Master Feed",
+                caption="Unique companies derived automatically from the KPI backup roster.",
+                items=[
+                    (
+                        f"{company} | workers {sum(1 for worker in roster if worker.company == company)} | "
+                        f"last on site {max(worker.last_on_site_date for worker in roster if worker.company == company).strftime('%d/%m/%Y')}"
+                    )
+                    for company in companies
+                ],
+                empty_message="No contractor roster entries are available yet.",
+            )
 
 
 def _render_file_3_safety_panel(
     repository: DocumentRepository,
     project_setup: ProjectSetup,
 ) -> None:
-    """Render the live File 3 RAMS and COSHH inventories."""
+    """Render File 3 as a document-first safety vault."""
+
+    st.session_state.pop("file3_safety_wipe_count", None)
+    st.session_state.pop("file3_manual_review_saved", None)
+    st.session_state.pop("file3_manual_review_parked", None)
+    st.session_state.pop("file3_safety_rebuild_result", None)
+
+    rams_files = _list_workspace_files(RAMS_DESTINATION)
+    coshh_files = _list_workspace_files(COSHH_DESTINATION)
+    review_files = _list_workspace_files(FILE_3_REVIEW_DIR)
+    induction_files = _list_workspace_files(FILE_3_COMPLETED_INDUCTIONS_DIR)
+    competency_files = _list_workspace_files(FILE_3_COMPETENCY_CARDS_DIR)
+    register_archive_files = _list_workspace_files(FILE_3_OUTPUT_DIR)
+
+    _render_workspace_hero(
+        icon="🗃️",
+        kicker="Safety Vault",
+        title="Filed Safety Documents",
+        caption="File 3 is now document-first: keep approved RAMS, COSHH, review packs, inductions, and supporting evidence visible without asking the app to guess safety metadata for you.",
+    )
+
+    summary_columns = st.columns(5)
+    with summary_columns[0]:
+        _render_inline_metric("RAMS Files", str(len(rams_files)), icon="📘")
+    with summary_columns[1]:
+        _render_inline_metric("COSHH Files", str(len(coshh_files)), icon="🧪")
+    with summary_columns[2]:
+        _render_inline_metric("Review Packs", str(len(review_files)), icon="🧾")
+    with summary_columns[3]:
+        _render_inline_metric("Inductions", str(len(induction_files)), icon="🦺")
+    with summary_columns[4]:
+        _render_inline_metric("Competency Cards", str(len(competency_files)), icon="🎫")
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Primary Action",
+        "Use File 3 as the controlled document vault. Open the live folders, check what has been filed, and rely on the approved paperwork rather than automatic register generation.",
+    )
+    action_columns = st.columns(4)
+    with action_columns[0]:
+        if st.button("📂 Open RAMS Folder", key="file3-open-rams-folder", width="stretch"):
+            _open_workspace_path(RAMS_DESTINATION)
+    with action_columns[1]:
+        if st.button("📂 Open COSHH Folder", key="file3-open-coshh-folder", width="stretch"):
+            _open_workspace_path(COSHH_DESTINATION)
+    with action_columns[2]:
+        if st.button("📂 Open Review Packs", key="file3-open-review-folder", width="stretch"):
+            _open_workspace_path(FILE_3_REVIEW_DIR)
+    with action_columns[3]:
+        if st.button("📂 Open Induction Output", key="file3-open-inductions-folder", width="stretch"):
+            _open_workspace_path(FILE_3_COMPLETED_INDUCTIONS_DIR)
+
+    st.caption(
+        "The old RAMS/COSHH auto-register workflow has been retired from the manager view because it was creating more checking work than value on live jobs."
+    )
+
+    st.divider()
+    rams_tab, coshh_tab, review_tab, inductions_tab, archive_tab = st.tabs(
+        ["RAMS Files", "COSHH Files", "Review Packs", "Inductions", "Registers Archive"]
+    )
+    with rams_tab:
+        _render_file_3_vault_tab(
+            heading="Live Register / History",
+            caption="Approved RAMS documents currently filed in File 3.",
+            directory=RAMS_DESTINATION,
+            files=rams_files,
+            selection_key="file3-rams-vault-select",
+            open_folder_label="📂 Open RAMS Folder",
+            empty_message="No RAMS files are currently filed in the File 3 RAMS folder.",
+        )
+    with coshh_tab:
+        _render_file_3_vault_tab(
+            heading="Live Register / History",
+            caption="Approved COSHH documents currently filed in File 3.",
+            directory=COSHH_DESTINATION,
+            files=coshh_files,
+            selection_key="file3-coshh-vault-select",
+            open_folder_label="📂 Open COSHH Folder",
+            empty_message="No COSHH files are currently filed in the File 3 COSHH folder.",
+        )
+    with review_tab:
+        _render_file_3_vault_tab(
+            heading="Live Register / History",
+            caption="RAMS review forms, construction plans, and held safety files that should stay visible but out of any auto-generated live register.",
+            directory=FILE_3_REVIEW_DIR,
+            files=review_files,
+            selection_key="file3-review-vault-select",
+            open_folder_label="📂 Open Review Packs",
+            empty_message="No review forms or held safety files are currently parked in File 3.",
+        )
+    with inductions_tab:
+        induction_summary_columns = st.columns(2)
+        with induction_summary_columns[0]:
+            _render_file_3_vault_tab(
+                heading="Live Register / History",
+                caption="Completed induction packs filed to File 3.",
+                directory=FILE_3_COMPLETED_INDUCTIONS_DIR,
+                files=induction_files,
+                selection_key="file3-induction-vault-select",
+                open_folder_label="📂 Open Completed Inductions",
+                empty_message="No completed induction DOCX files are currently filed in File 3.",
+            )
+        with induction_summary_columns[1]:
+            _render_file_3_vault_tab(
+                heading="Supporting Evidence",
+                caption="Competency card uploads captured during induction.",
+                directory=FILE_3_COMPETENCY_CARDS_DIR,
+                files=competency_files,
+                selection_key="file3-competency-vault-select",
+                open_folder_label="📂 Open Competency Cards",
+                empty_message="No competency card files are currently filed in File 3.",
+            )
+    with archive_tab:
+        _render_file_3_vault_tab(
+            heading="Export / Print",
+            caption="Legacy File 3 register outputs already generated earlier in the project. Kept visible here as archive only, not as a live automation workflow.",
+            directory=FILE_3_OUTPUT_DIR,
+            files=register_archive_files,
+            selection_key="file3-archive-vault-select",
+            open_folder_label="📂 Open Register Archive",
+            empty_message="No legacy File 3 register exports are currently filed in the archive folder.",
+        )
+
+
+def _build_induction_picker_records(
+    induction_documents: List[InductionDocument],
+) -> List[InductionDocument]:
+    """Return one latest induction record per operative/company pairing."""
+
+    latest_records: Dict[tuple[str, str], InductionDocument] = {}
+    for induction_document in induction_documents:
+        record_key = (
+            induction_document.individual_name.casefold(),
+            induction_document.contractor_name.casefold(),
+        )
+        existing_record = latest_records.get(record_key)
+        if (
+            existing_record is None
+            or induction_document.created_at > existing_record.created_at
+        ):
+            latest_records[record_key] = induction_document
+    return sorted(
+        latest_records.values(),
+        key=lambda induction_document: (
+            induction_document.individual_name.casefold(),
+            induction_document.contractor_name.casefold(),
+        ),
+    )
+
+
+def _build_induction_company_options(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    induction_documents: List[InductionDocument],
+) -> List[str]:
+    """Return the smart company dropdown options for the induction form."""
+
+    company_names_by_key: Dict[str, str] = {}
+
+    def _remember_company(raw_company_name: str) -> None:
+        cleaned_company_name = raw_company_name.strip()
+        if not cleaned_company_name:
+            return
+        company_names_by_key.setdefault(
+            cleaned_company_name.casefold(),
+            cleaned_company_name,
+        )
+
+    for induction_document in induction_documents:
+        _remember_company(induction_document.contractor_name)
+
+    for attendance_document in repository.list_documents(
+        document_type=DailyAttendanceEntryDocument.document_type,
+        site_name=site_name,
+    ):
+        if isinstance(attendance_document, DailyAttendanceEntryDocument):
+            _remember_company(attendance_document.contractor_name)
+
+    current_site_roster = build_site_worker_roster(site_name=site_name)
+    for worker in current_site_roster:
+        _remember_company(worker.company)
+
+    # If the active site is brand new or just being used for testing, fall back to the
+    # wider KPI roster so the induction company picker is still useful immediately.
+    if not company_names_by_key:
+        for worker in build_site_worker_roster():
+            _remember_company(worker.company)
+
+    unique_contractors = sorted(company_names_by_key.values(), key=str.casefold)
+    return [
+        "-- Select Company --",
+        *unique_contractors,
+        "🏢 New Company (Type Below)",
+    ]
+
+
+def _attendance_picker_label(induction_document: InductionDocument) -> str:
+    """Return the operative label shown in the UHSF16.09 picker."""
+
+    return (
+        f"{induction_document.individual_name} "
+        f"({induction_document.contractor_name})"
+    )
+
+
+def _attendance_sign_out_label(attendance_entry: DailyAttendanceEntryDocument) -> str:
+    """Return the sign-out label for one live operative."""
+
+    return (
+        f"{attendance_entry.individual_name} "
+        f"({attendance_entry.contractor_name}) · "
+        f"In {attendance_entry.time_in.strftime('%H:%M')}"
+    )
+
+
+def _is_uplands_company(company_name: str) -> bool:
+    """Return True when the company should count as an Uplands employee."""
+
+    lowered_company_name = company_name.casefold()
+    return any(
+        alias in lowered_company_name
+        for alias in ("uplands", "url", "uplands retail")
+    )
+
+
+def _build_live_fire_roll_rows(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> List[Dict[str, str]]:
+    """Return manager-facing live fire-roll rows."""
+
+    return [
+        {
+            "Name": attendance_entry.individual_name,
+            "Company": attendance_entry.contractor_name,
+            "Time In": attendance_entry.time_in.strftime("%H:%M"),
+            "Vehicle Reg": attendance_entry.vehicle_registration or "—",
+            "Distance Travelled": attendance_entry.distance_travelled or "—",
+            "Category": (
+                "Uplands Employee"
+                if attendance_entry.is_uplands_employee
+                else "Subcontractor / Visitor"
+            ),
+        }
+        for attendance_entry in attendance_entries
+    ]
+
+
+def _build_live_vehicle_rows(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> List[Dict[str, str]]:
+    """Return the active vehicle-clearing rows for emergency use."""
+
+    vehicle_rows: List[Dict[str, str]] = []
+    for attendance_entry in attendance_entries:
+        if not attendance_entry.vehicle_registration:
+            continue
+        vehicle_rows.append(
+            {
+                "Vehicle Reg": attendance_entry.vehicle_registration,
+                "Name": attendance_entry.individual_name,
+                "Company": attendance_entry.contractor_name,
+            }
+        )
+    return vehicle_rows
+
+
+def _build_competency_compliance_rows(
+    repository: DocumentRepository,
+    active_attendance_entries: List[DailyAttendanceEntryDocument],
+) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Return expired and expiring competency rows for operatives currently on site."""
+
+    expired_rows: List[Dict[str, str]] = []
+    expiring_rows: List[Dict[str, str]] = []
+    today = date.today()
+
+    for attendance_entry in active_attendance_entries:
+        linked_doc_id = attendance_entry.linked_induction_doc_id
+        if not linked_doc_id:
+            continue
+        try:
+            linked_document = repository.get(linked_doc_id)
+        except Exception:
+            continue
+        if not isinstance(linked_document, InductionDocument):
+            continue
+        if linked_document.status == DocumentStatus.ARCHIVED:
+            continue
+        if linked_document.competency_expiry_date is None:
+            continue
+
+        days_remaining = (linked_document.competency_expiry_date - today).days
+        warning_row = {
+            "Name": attendance_entry.individual_name,
+            "Company": attendance_entry.contractor_name,
+            "Expiry Date": linked_document.competency_expiry_date.strftime("%d/%m/%Y"),
+            "Days Remaining": str(days_remaining),
+        }
+        if days_remaining < 0:
+            expired_rows.append(warning_row)
+        elif days_remaining <= 30:
+            expiring_rows.append(warning_row)
+
+    expired_rows.sort(key=lambda row: int(row["Days Remaining"]))
+    expiring_rows.sort(key=lambda row: int(row["Days Remaining"]))
+    return expired_rows, expiring_rows
+
+
+def _render_competency_compliance_radar(
+    repository: DocumentRepository,
+    active_attendance_entries: List[DailyAttendanceEntryDocument],
+) -> None:
+    """Render live competency expiry warnings for personnel currently on site."""
+
+    expired_rows, expiring_rows = _build_competency_compliance_rows(
+        repository,
+        active_attendance_entries,
+    )
+    with st.expander(
+        "⚠️ Compliance Warnings",
+        expanded=bool(expired_rows or expiring_rows),
+    ):
+        if not expired_rows and not expiring_rows:
+            st.success(
+                "No active on-site operatives currently have competency cards expired or expiring within 30 days."
+            )
+            return
+
+        for warning_row in expired_rows:
+            st.error(
+                "🚨 ACTION REQUIRED: "
+                f"{warning_row['Name']} has an expired card "
+                f"({warning_row['Expiry Date']})."
+            )
+        for warning_row in expiring_rows:
+            st.warning(
+                f"⚠️ {warning_row['Name']} has a card expiring in "
+                f"{warning_row['Days Remaining']} days "
+                f"({warning_row['Expiry Date']})."
+            )
+
+        st.dataframe(
+            pd.DataFrame(expired_rows + expiring_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _build_todays_attendance_log_rows(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> List[Dict[str, str]]:
+    """Return today's UHSF16.09 activity rows for manager visibility."""
+
+    return [
+        {
+            "Name": attendance_entry.individual_name,
+            "Company": attendance_entry.contractor_name,
+            "Time In": attendance_entry.time_in.strftime("%H:%M"),
+            "Time Out": (
+                attendance_entry.time_out.strftime("%H:%M")
+                if attendance_entry.time_out is not None
+                else "—"
+            ),
+            "Hours Worked": (
+                f"{attendance_entry.hours_worked:.2f}"
+                if attendance_entry.hours_worked is not None
+                else "—"
+            ),
+            "Status": "On Site" if attendance_entry.is_on_site else "Signed Out",
+            "Vehicle Reg": attendance_entry.vehicle_registration or "—",
+        }
+        for attendance_entry in sorted(
+            attendance_entries,
+            key=lambda attendance_entry: attendance_entry.time_in,
+            reverse=True,
+        )
+    ]
+
+
+def _extract_browser_geolocation_coordinates(
+    geolocation_payload: Any,
+) -> Optional[tuple[float, float, Optional[float]]]:
+    """Return latitude, longitude, and accuracy from the browser geolocation payload."""
+
+    if not isinstance(geolocation_payload, dict):
+        return None
+
+    coordinates = geolocation_payload.get("coords")
+    source_payload = coordinates if isinstance(coordinates, dict) else geolocation_payload
+    latitude = source_payload.get("latitude")
+    longitude = source_payload.get("longitude")
+    accuracy = source_payload.get("accuracy")
+    if latitude is None or longitude is None:
+        return None
+    try:
+        resolved_latitude = float(latitude)
+        resolved_longitude = float(longitude)
+        resolved_accuracy = float(accuracy) if accuracy is not None else None
+    except (TypeError, ValueError):
+        return None
+    return resolved_latitude, resolved_longitude, resolved_accuracy
+
+
+def _get_kiosk_geolocation_query_payload(
+) -> tuple[Optional[tuple[float, float, Optional[float]]], str]:
+    """Return GPS coordinates or error text captured in the kiosk URL."""
+
+    raw_geo_error = st.query_params.get("geo_error")
+    geo_error = str(raw_geo_error).strip() if raw_geo_error else ""
+    raw_latitude = st.query_params.get("geo_lat")
+    raw_longitude = st.query_params.get("geo_lng")
+    raw_accuracy = st.query_params.get("geo_acc")
+    if not raw_latitude or not raw_longitude:
+        return None, geo_error
+    try:
+        resolved_latitude = float(raw_latitude)
+        resolved_longitude = float(raw_longitude)
+        resolved_accuracy = float(raw_accuracy) if raw_accuracy else None
+    except (TypeError, ValueError):
+        return None, geo_error
+    return (resolved_latitude, resolved_longitude, resolved_accuracy), geo_error
+
+
+def _apply_project_setup_geolocation_query_payload(
+    project_setup: ProjectSetup,
+) -> ProjectSetup:
+    """Persist site coordinates returned from the manager GPS capture page."""
+
+    raw_latitude = st.query_params.get("setup_geo_lat")
+    raw_longitude = st.query_params.get("setup_geo_lng")
+    raw_error = st.query_params.get("setup_geo_error")
+    if not raw_latitude or not raw_longitude:
+        if raw_error:
+            st.session_state["project_setup_flash"] = (
+                f"GPS update failed: {str(raw_error).strip()}"
+            )
+            st.session_state["project_setup_flash_level"] = "warning"
+            _clear_project_setup_geolocation_query_params()
+        return project_setup
+
+    try:
+        resolved_latitude = float(raw_latitude)
+        resolved_longitude = float(raw_longitude)
+    except (TypeError, ValueError):
+        _clear_project_setup_geolocation_query_params()
+        return project_setup
+
+    updated_setup = replace(
+        project_setup,
+        site_latitude=resolved_latitude,
+        site_longitude=resolved_longitude,
+    )
+    updated_setup = _save_project_setup(updated_setup)
+    st.session_state["project_setup"] = updated_setup
+    st.session_state["project_setup_flash"] = (
+        f"Site coordinates updated from this device: "
+        f"{resolved_latitude:.6f}, {resolved_longitude:.6f}"
+    )
+    st.session_state["project_setup_flash_level"] = "success"
+    _clear_project_setup_geolocation_query_params()
+    return updated_setup
+
+
+def _render_kiosk_geofence_gate(
+    *,
+    public_url: str,
+    project_setup: ProjectSetup,
+) -> tuple[bool, Optional[float]]:
+    """Return whether kiosk attendance actions should be enabled by GPS verification."""
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Allow Location Access</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Before signing in or out, allow GPS access so the register can confirm you are at "
+        f"{project_setup.current_site_name}."
+    )
+    geolocation_payload, geo_error = _get_kiosk_geolocation_query_payload()
+    capture_url = _build_kiosk_geolocation_capture_url(
+        public_url=public_url,
+        kiosk_view="attendance",
+    )
+    geofence_link_columns = st.columns(2, gap="medium")
+    with geofence_link_columns[0]:
+        st.link_button(
+            "📍 Allow GPS Access",
+            capture_url,
+            type="primary",
+            width="stretch",
+        )
+    with geofence_link_columns[1]:
+        st.link_button(
+            "🔄 Retry GPS Check",
+            capture_url,
+            type="secondary",
+            width="stretch",
+        )
+
+    if geolocation_payload is None and not geo_error:
+        st.info(
+            "Tap “Allow GPS Access” to open the secure GPS check page. Once approved, you will return here automatically."
+        )
+        st.caption(
+            "This uses a full-page browser location request for better support on iPhone, Android, tablets, and laptops."
+        )
+        return False, None
+
+    if geolocation_payload is None:
+        st.warning(
+            "⚠️ Geo-Fence Active: "
+            + (geo_error or "Location access has not been granted yet.")
+        )
+        st.caption(
+            "iPhone tip: Safari > aA menu > Website Settings > Location should be set to Allow."
+        )
+        return False, None
+
+    latitude, longitude, accuracy = geolocation_payload
+    st.session_state["site_attendance_geofence_requested"] = True
+    distance_meters = calculate_haversine_distance_meters(
+        latitude,
+        longitude,
+        project_setup.site_latitude,
+        project_setup.site_longitude,
+    )
+    if distance_meters > project_setup.geofence_radius_meters:
+        accuracy_suffix = (
+            f" GPS accuracy ±{accuracy:.0f}m." if accuracy is not None else ""
+        )
+        st.error(
+            "⚠️ Geo-Fence Active: You are currently "
+            f"{distance_meters:.0f} meters away. You must be on-site to sign the register."
+            f"{accuracy_suffix}"
+        )
+        st.caption(
+            f"Current site fence: {project_setup.current_site_name} "
+            f"({project_setup.geofence_radius_meters}m radius)."
+        )
+        return False, distance_meters
+
+    accuracy_suffix = f" GPS accuracy ±{accuracy:.0f}m." if accuracy is not None else ""
+    st.success(f"✅ GPS Verified: You are on site.{accuracy_suffix}")
+    return True, distance_meters
+
+
+def _render_kiosk_new_starter_call_to_action() -> None:
+    """Render the top-of-page route for new starters entering kiosk mode."""
+
+    st.markdown(
+        "<div class='file-2-section-heading'>New Starter?</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "If this is your first day on site and your name is not in the attendance list yet, complete your induction first."
+    )
+    if st.button(
+        "🆕 First time on site? Click here to complete your Induction",
+        key="route_kiosk_to_induction",
+        width="stretch",
+        type="secondary",
+    ):
+        _route_kiosk_to_induction_station(kiosk_view="induction")
+        st.session_state["site_induction_reset_pending"] = True
+        st.session_state["site_induction_canvas_revision"] = (
+            int(st.session_state.get("site_induction_canvas_revision", 0)) + 1
+        )
+        components.html(
+            """
+            <script>
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set("station", "induction");
+            url.searchParams.set("mode", "kiosk");
+            url.searchParams.set("kiosk_view", "induction");
+            window.parent.location.href = url.toString();
+            </script>
+            """,
+            height=0,
+        )
+        st.stop()
+    st.divider()
+
+
+def _render_site_attendance_console(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+    site_name: str,
+    public_url: str,
+    induction_picker_records: List[InductionDocument],
+    active_attendance_entries: List[DailyAttendanceEntryDocument],
+    is_kiosk: bool,
+) -> None:
+    """Render the UHSF16.09 daily sign-in/sign-out controls."""
+
+    try:
+        from streamlit_drawable_canvas import st_canvas
+    except ImportError:
+        st.error(
+            "streamlit-drawable-canvas is not installed. Install dependencies and restart the app."
+        )
+        return
+
+    kiosk_gps_verified = True
+    if is_kiosk:
+        kiosk_gps_verified, _ = _render_kiosk_geofence_gate(
+            public_url=public_url,
+            project_setup=project_setup,
+        )
+        if not kiosk_gps_verified:
+            st.info("The sign-in and sign-out controls will unlock once GPS is verified on site.")
+
+    action_mode = str(
+        st.session_state.get("site_attendance_action_mode", "sign_in")
+    ).strip().lower()
+    if action_mode not in {"sign_in", "sign_out"}:
+        action_mode = "sign_in"
+        st.session_state["site_attendance_action_mode"] = action_mode
+
+    mode_columns = st.columns(2, gap="medium")
+    with mode_columns[0]:
+        if st.button(
+            "📥 Daily Sign-In",
+            key="attendance_mode_sign_in",
+            width="stretch",
+            type="primary" if action_mode == "sign_in" else "secondary",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        ):
+            st.session_state["site_attendance_action_mode"] = "sign_in"
+            st.rerun()
+    with mode_columns[1]:
+        if st.button(
+            "📤 Sign Out",
+            key="attendance_mode_sign_out",
+            width="stretch",
+            type="primary" if action_mode == "sign_out" else "secondary",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        ):
+            st.session_state["site_attendance_action_mode"] = "sign_out"
+            st.rerun()
+
+    if action_mode == "sign_in":
+        search_term = st.text_input(
+            "Search Existing Induction",
+            key="site_attendance_worker_search",
+            placeholder="Type a name or company",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        )
+        filtered_records = induction_picker_records
+        if search_term.strip():
+            lowered_search_term = search_term.strip().casefold()
+            filtered_records = [
+                induction_document
+                for induction_document in induction_picker_records
+                if lowered_search_term
+                in _attendance_picker_label(induction_document).casefold()
+            ]
+
+        picker_options = [""] + [record.doc_id for record in filtered_records]
+        if (
+            st.session_state.get("site_attendance_selected_induction_doc_id")
+            not in picker_options
+        ):
+            st.session_state["site_attendance_selected_induction_doc_id"] = ""
+        selected_induction_doc_id = st.selectbox(
+            "Name & Company",
+            options=picker_options,
+            key="site_attendance_selected_induction_doc_id",
+            disabled=is_kiosk and not kiosk_gps_verified,
+            format_func=lambda doc_id: (
+                "Select operative"
+                if not doc_id
+                else _attendance_picker_label(
+                    next(
+                        record
+                        for record in induction_picker_records
+                        if record.doc_id == doc_id
+                    )
+                )
+            ),
+        )
+        selected_induction = next(
+            (
+                record
+                for record in induction_picker_records
+                if record.doc_id == selected_induction_doc_id
+            ),
+            None,
+        )
+        if selected_induction is not None:
+            st.caption(
+                f"Selected operative: {selected_induction.individual_name} | "
+                f"{selected_induction.contractor_name}"
+            )
+        elif not filtered_records:
+            st.info("No inducted operatives matched that search.")
+
+        remembered_vehicle_registration = ""
+        if selected_induction is not None:
+            latest_attendance_entry = _get_latest_daily_attendance_entry_for_induction(
+                repository,
+                selected_induction,
+                site_name=site_name,
+            )
+            if latest_attendance_entry is not None:
+                remembered_vehicle_registration = latest_attendance_entry.vehicle_registration
+        vehicle_registration_context_key = (
+            "site_attendance_vehicle_registration_context_doc_id"
+        )
+        if (
+            st.session_state.get(vehicle_registration_context_key, "")
+            != selected_induction_doc_id
+        ):
+            st.session_state["site_attendance_vehicle_registration"] = (
+                remembered_vehicle_registration
+            )
+            st.session_state[vehicle_registration_context_key] = (
+                selected_induction_doc_id
+            )
+
+        detail_columns = st.columns(2, gap="large")
+        with detail_columns[0]:
+            vehicle_registration = st.text_input(
+                "Vehicle Details",
+                key="site_attendance_vehicle_registration",
+                placeholder="e.g. AB12 CDE",
+                disabled=is_kiosk and not kiosk_gps_verified,
+            )
+            if remembered_vehicle_registration:
+                st.caption(
+                    f"Last known vehicle: {remembered_vehicle_registration}. Change it only if today's vehicle is different."
+                )
+        with detail_columns[1]:
+            distance_travelled = st.text_input(
+                "Distance Travelled",
+                key="site_attendance_distance_travelled",
+                placeholder="e.g. 14 miles",
+                disabled=is_kiosk and not kiosk_gps_verified,
+            )
+        st.caption(
+            f"Time In will be stamped automatically at {datetime.now().strftime('%H:%M')}."
+        )
+    else:
+        if active_attendance_entries:
+            sign_out_options = [""] + [entry.doc_id for entry in active_attendance_entries]
+            if (
+                st.session_state.get("site_attendance_selected_sign_out_doc_id")
+                not in sign_out_options
+            ):
+                st.session_state["site_attendance_selected_sign_out_doc_id"] = ""
+            selected_sign_out_doc_id = st.selectbox(
+                "Currently On Site",
+                options=sign_out_options,
+                key="site_attendance_selected_sign_out_doc_id",
+                disabled=is_kiosk and not kiosk_gps_verified,
+                format_func=lambda doc_id: (
+                    "Select operative"
+                    if not doc_id
+                    else _attendance_sign_out_label(
+                        next(
+                            entry
+                            for entry in active_attendance_entries
+                            if entry.doc_id == doc_id
+                        )
+                    )
+                ),
+            )
+        else:
+            selected_sign_out_doc_id = ""
+            st.info("Nobody is currently signed in.")
+        st.caption(
+            f"Time Out will be stamped automatically at {datetime.now().strftime('%H:%M')}."
+        )
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Safety Signature</div>",
+        unsafe_allow_html=True,
+    )
+    canvas_revision = int(st.session_state.get("site_attendance_canvas_revision", 0))
+    canvas_result = st_canvas(
+        update_streamlit=True,
+        key=f"site_attendance_canvas_{canvas_revision}",
+        height=200,
+        width=420,
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#ffffff",
+        drawing_mode="freedraw",
+        display_toolbar=False,
+    )
+
+    action_columns = (
+        st.columns([0.28, 0.28, 0.44], gap="medium")
+        if is_kiosk
+        else st.columns([0.22, 0.22, 0.56], gap="large")
+    )
+    with action_columns[0]:
+        if st.button(
+            "🧽 Clear Signature",
+            key="clear_site_attendance_signature",
+            width="stretch",
+            type="secondary",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        ):
+            st.session_state["site_attendance_canvas_revision"] = canvas_revision + 1
+            st.rerun()
+    with action_columns[1]:
+        if st.button(
+            "↺ Reset Form",
+            key="reset_site_attendance_form",
+            width="stretch",
+            type="secondary",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        ):
+            st.session_state["site_attendance_reset_pending"] = True
+            st.session_state["site_attendance_canvas_revision"] = canvas_revision + 1
+            st.rerun()
+
+    submit_label = (
+        "✅ Complete Sign-In"
+        if action_mode == "sign_in"
+        else "✅ Complete Sign-Out"
+    )
+    with action_columns[2]:
+        if st.button(
+            submit_label,
+            key="submit_site_attendance",
+            width="stretch",
+            disabled=is_kiosk and not kiosk_gps_verified,
+        ):
+            try:
+                if action_mode == "sign_in":
+                    if selected_induction is None:
+                        raise ValidationError("Select an inducted operative before signing in.")
+                    logged_entry = create_daily_attendance_sign_in(
+                        repository,
+                        site_name=site_name,
+                        induction_document=selected_induction,
+                        vehicle_registration=vehicle_registration,
+                        distance_travelled=distance_travelled,
+                        signature_image_data=canvas_result.image_data,
+                    )
+                    flash_message = (
+                        f"{logged_entry.attendance_entry.individual_name} signed in at "
+                        f"{logged_entry.attendance_entry.time_in.strftime('%H:%M')}."
+                    )
+                    kiosk_message = (
+                        f"Welcome to Site, {logged_entry.attendance_entry.individual_name}!"
+                    )
+                else:
+                    if not selected_sign_out_doc_id:
+                        raise ValidationError("Select an operative before signing out.")
+                    logged_entry = complete_daily_attendance_sign_out(
+                        repository,
+                        attendance_doc_id=selected_sign_out_doc_id,
+                        signature_image_data=canvas_result.image_data,
+                    )
+                    flash_message = (
+                        f"{logged_entry.attendance_entry.individual_name} signed out at "
+                        f"{logged_entry.attendance_entry.time_out.strftime('%H:%M')} "
+                        f"({logged_entry.attendance_entry.hours_worked:.2f} hrs)."
+                    )
+                    kiosk_message = (
+                        f"Signed Out. Safe journey, {logged_entry.attendance_entry.individual_name}."
+                    )
+            except ValidationError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unable to update the attendance register: {exc}")
+            else:
+                st.session_state["site_attendance_reset_pending"] = True
+                st.session_state["site_attendance_canvas_revision"] = canvas_revision + 1
+                if is_kiosk:
+                    st.session_state["site_attendance_kiosk_complete_message"] = kiosk_message
+                    st.session_state["site_attendance_kiosk_complete_at"] = time.time()
+                else:
+                    st.session_state["site_attendance_flash"] = flash_message
+                st.rerun()
+
+    st.caption(ATTENDANCE_FORM_METADATA)
+
+
+def _render_live_fire_roll_panel(
+    active_attendance_entries: List[DailyAttendanceEntryDocument],
+) -> None:
+    """Render the manager-facing live fire roll metrics and tables."""
+
+    subcontractor_count = sum(
+        1
+        for attendance_entry in active_attendance_entries
+        if not attendance_entry.is_uplands_employee
+    )
+    uplands_employee_count = sum(
+        1 for attendance_entry in active_attendance_entries if attendance_entry.is_uplands_employee
+    )
+    active_vehicle_rows = _build_live_vehicle_rows(active_attendance_entries)
+    fire_roll_rows = _build_live_fire_roll_rows(active_attendance_entries)
+
+    fire_roll_metric_columns = st.columns(3, gap="large")
+    with fire_roll_metric_columns[0]:
+        _render_metric_card(
+            title="On Site",
+            icon="🔥",
+            value=str(len(active_attendance_entries)),
+            caption="Operatives currently signed in and available on the fire roll.",
+            body_html=(
+                "<div class='data-card-subtext'>"
+                f"Vehicle regs live: <strong>{len(active_vehicle_rows)}</strong>"
+                "</div>"
+            ),
+        )
+    with fire_roll_metric_columns[1]:
+        _render_metric_card(
+            title="Subcontractors & Visitors",
+            icon="👷",
+            value=str(subcontractor_count),
+            caption="Non-Uplands personnel currently on site.",
+            body_html="<div class='data-card-subtext'>Live fire roll</div>",
+        )
+    with fire_roll_metric_columns[2]:
+        _render_metric_card(
+            title="Uplands Employees",
+            icon="🏗️",
+            value=str(uplands_employee_count),
+            caption="Uplands personnel currently on site.",
+            body_html="<div class='data-card-subtext'>Live fire roll</div>",
+        )
+
+    table_columns = st.columns([1.65, 1], gap="large")
+    with table_columns[0]:
+        st.markdown(
+            "<div class='file-2-section-heading'>Live Fire Roll</div>",
+            unsafe_allow_html=True,
+        )
+        if fire_roll_rows:
+            st.dataframe(pd.DataFrame(fire_roll_rows), width="stretch", hide_index=True)
+        else:
+            st.info("Nobody is currently signed in on today's live fire roll.")
+    with table_columns[1]:
+        st.markdown(
+            "<div class='file-2-section-heading'>Active Vehicle Regs</div>",
+            unsafe_allow_html=True,
+        )
+        if active_vehicle_rows:
+            st.dataframe(
+                pd.DataFrame(active_vehicle_rows),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("No vehicle registrations are currently active on site.")
+
+
+def _render_todays_attendance_activity_panel(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+) -> None:
+    """Render today's full attendance activity including signed-out operatives."""
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Today's Attendance Activity</div>",
+        unsafe_allow_html=True,
+    )
+    if attendance_entries:
+        st.dataframe(
+            pd.DataFrame(_build_todays_attendance_log_rows(attendance_entries)),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("No UHSF16.09 attendance activity has been logged for today yet.")
+
+
+def _coerce_site_diary_table_rows(
+    raw_rows: Any,
+    *,
+    columns: List[str],
+) -> List[Dict[str, Any]]:
+    """Return clean row dictionaries from one Streamlit data editor value."""
+
+    if isinstance(raw_rows, pd.DataFrame):
+        records = raw_rows.to_dict("records")
+    elif isinstance(raw_rows, list):
+        records = raw_rows
+    else:
+        records = []
+
+    cleaned_rows: List[Dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        cleaned_rows.append({column: record.get(column, "") for column in columns})
+    return cleaned_rows
+
+
+def _render_browser_dictation_button(
+    *,
+    target_state_key: str,
+    component_key: str,
+    field_label: str,
+) -> None:
+    """Render one browser-native speech-to-text control for a diary text field."""
+
+    component_id = f"dictation-{component_key}"
+    target_diary_date = _extract_site_diary_date_from_state_key(target_state_key)
+    return_path = "/?station=FILE%202&file2_view=diary"
+    if target_diary_date is not None:
+        return_path += (
+            f"&site_diary_date={quote(target_diary_date.isoformat(), safe='')}"
+        )
+    popup_url = (
+        "/gps/voice-capture.html"
+        f"?v=20260315c&target={quote(target_state_key, safe='')}"
+        f"&label={quote(field_label, safe='')}"
+        f"&return={quote(return_path, safe='/?=&')}"
+    )
+    js_expression = f"""
+    (() => {{
+        setFrameHeight(88);
+        const targetKey = {json.dumps(target_state_key)};
+        const rootId = {json.dumps(component_id)};
+        const popupBaseUrl = {json.dumps(popup_url)};
+        document.body.style.margin = "0";
+        document.body.style.background = "transparent";
+
+        if (!document.getElementById(rootId)) {{
+            document.body.innerHTML = `
+                <style>
+                    .dictation-shell {{
+                        display: flex;
+                        flex-direction: column;
+                        gap: 0.35rem;
+                        align-items: stretch;
+                        font-family: "Avenir Next", "Segoe UI", sans-serif;
+                    }}
+                    .dictation-button {{
+                        appearance: none;
+                        border: 1px solid rgba(209, 34, 142, 0.18);
+                        border-radius: 999px;
+                        background: linear-gradient(135deg, rgba(209,34,142,0.12), rgba(91,141,239,0.14));
+                        color: {TEXT_DARK};
+                        cursor: pointer;
+                        font: 800 0.9rem/1.1 "Avenir Next", "Segoe UI", sans-serif;
+                        padding: 0.72rem 0.95rem;
+                        transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+                        width: 100%;
+                    }}
+                    .dictation-button:hover {{
+                        border-color: rgba(209, 34, 142, 0.28);
+                        box-shadow: 0 10px 22px rgba(18, 24, 38, 0.10);
+                        transform: translateY(-1px);
+                    }}
+                    .dictation-button:disabled {{
+                        cursor: not-allowed;
+                        opacity: 0.68;
+                        transform: none;
+                        box-shadow: none;
+                    }}
+                    .dictation-status {{
+                        color: {TEXT_MUTED};
+                        font-size: 0.74rem;
+                        line-height: 1.35;
+                        min-height: 1.15rem;
+                        text-align: center;
+                    }}
+                </style>
+                <div class="dictation-shell">
+                    <button id="${{rootId}}" class="dictation-button" type="button">🎙️ Dictate</button>
+                    <div id="${{rootId}}-status" class="dictation-status">Open a secure dictation window to speak into this diary field.</div>
+                </div>
+            `;
+        }}
+
+        const button = document.getElementById(rootId);
+        const status = document.getElementById(`${{rootId}}-status`);
+        if (!button.dataset.bound) {{
+            button.dataset.bound = "true";
+            button.addEventListener("click", () => {{
+                const hostWindow = window.top || window.parent || window;
+                const popupUrl = popupBaseUrl;
+                const popup = hostWindow.open(
+                    popupUrl,
+                    `uplands-dictation-${{targetKey.replace(/[^a-z0-9]+/gi, "-")}}`,
+                    "popup=yes,width=620,height=760,resizable=yes,scrollbars=yes"
+                );
+                if (!popup) {{
+                    const message = "Dictation window was blocked. Allow pop-ups for this site and try again.";
+                    status.textContent = message;
+                    return;
+                }}
+                status.textContent = "Dictation window opened. Speak there, then it will send the transcript back here.";
+                try {{
+                    popup.focus();
+                }} catch (error) {{
+                    console.error(error);
+                }}
+            }});
+        }}
+        return null;
+    }})()
+    """
+    streamlit_js_eval(js_expressions=js_expression, key=component_key)
+
+
+def _apply_site_diary_dictation_result(
+    dictation_result: Any,
+    *,
+    friendly_label: str,
+) -> None:
+    """Append fresh dictation text into the requested Site Diary field."""
+
+    if not isinstance(dictation_result, dict):
+        return
+
+    target_state_key = str(dictation_result.get("target", "")).strip()
+    if not target_state_key.startswith("file2_site_diary_"):
+        return
+
+    nonce = str(dictation_result.get("nonce", "")).strip()
+    if not nonce:
+        return
+
+    handled_nonce_key = f"{target_state_key}__dictation_nonce"
+    if st.session_state.get(handled_nonce_key) == nonce:
+        return
+    st.session_state[handled_nonce_key] = nonce
+
+    error_message = str(dictation_result.get("error", "")).strip()
+    if error_message:
+        st.session_state["file2_site_diary_dictation_warning"] = error_message
+        return
+
+    transcript = str(dictation_result.get("transcript", "")).strip()
+    if not transcript:
+        return
+
+    existing_text = str(st.session_state.get(target_state_key, "")).strip()
+    if existing_text:
+        st.session_state[target_state_key] = f"{existing_text}\n{transcript}"
+    else:
+        st.session_state[target_state_key] = transcript
+    st.session_state["file2_site_diary_dictation_flash"] = (
+        f"Dictation added to {friendly_label}."
+    )
+
+
+def _derive_uplands_site_diary_counts(
+    contractor_rows: List[Dict[str, Any]],
+) -> tuple[int, int]:
+    """Return the Uplands day/night counts derived from the contractor table."""
+
+    uplands_days = 0
+    uplands_nights = 0
+    for contractor_row in contractor_rows:
+        company_name = str(contractor_row.get("company", "")).strip()
+        if not company_name or not _is_uplands_company(company_name):
+            continue
+        try:
+            uplands_days += int(contractor_row.get("days", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            uplands_nights += int(contractor_row.get("nights", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return uplands_days, uplands_nights
+
+
+def _get_latest_site_diary_document(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    target_date: date,
+) -> Optional[SiteDiaryDocument]:
+    """Return the latest saved UHSF15.63 diary for one site/date."""
+
+    matching_diaries = [
+        document
+        for document in repository.list_documents(
+            document_type=SiteDiaryDocument.document_type,
+            site_name=site_name,
+        )
+        if isinstance(document, SiteDiaryDocument) and document.date == target_date
+    ]
+    if not matching_diaries:
+        return None
+    return max(
+        matching_diaries,
+        key=lambda diary_document: diary_document.created_at,
+    )
+
+
+def _build_site_diary_history_rows(
+    site_diary_documents: List[SiteDiaryDocument],
+) -> List[Dict[str, str]]:
+    """Return UI rows for the saved UHSF15.63 diary history."""
+
+    return [
+        {
+            "Date": site_diary_document.date.strftime("%d/%m/%Y"),
+            "Uplands Days": str(site_diary_document.uplands_days),
+            "Uplands Nights": str(site_diary_document.uplands_nights),
+            "Contractors": str(len(site_diary_document.contractors)),
+            "Visitors": str(len(site_diary_document.visitors)),
+            "Saved": site_diary_document.created_at.strftime("%d/%m/%Y %H:%M"),
+        }
+        for site_diary_document in sorted(
+            site_diary_documents,
+            key=lambda site_diary_document: (
+                site_diary_document.date,
+                site_diary_document.created_at,
+            ),
+            reverse=True,
+        )
+    ]
+
+
+def _render_file_2_site_diary_panel(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render the UHSF15.63 Daily Site Diary manager station."""
 
     site_name = project_setup.current_site_name
-    rams_documents = sorted(
-        [
-            document
-            for document in repository.list_documents(
-                document_type=RAMSDocument.document_type,
-                site_name=site_name,
-            )
-            if isinstance(document, RAMSDocument)
-            and document.status != DocumentStatus.ARCHIVED
-        ],
-        key=lambda document: (
-            document.review_date or date.min,
-            document.reference.casefold(),
-            document.activity_description.casefold(),
-        ),
-        reverse=True,
+    _apply_site_diary_form_reset_if_pending(site_name)
+    diary_flash_message = st.session_state.pop("file2_site_diary_flash", "")
+    if diary_flash_message:
+        st.success(diary_flash_message)
+    dictation_flash_message = st.session_state.pop(
+        "file2_site_diary_dictation_flash",
+        "",
     )
-    coshh_documents = sorted(
-        [
-            document
-            for document in repository.list_documents(
-                document_type=COSHHDocument.document_type,
-                site_name=site_name,
-            )
-            if isinstance(document, COSHHDocument)
-            and document.status != DocumentStatus.ARCHIVED
-        ],
-        key=lambda document: (
-            document.review_date or date.min,
-            document.reference.casefold(),
-            document.substance_name.casefold(),
-        ),
-        reverse=True,
+    if dictation_flash_message:
+        st.success(dictation_flash_message)
+    dictation_warning_message = st.session_state.pop(
+        "file2_site_diary_dictation_warning",
+        "",
     )
+    if dictation_warning_message:
+        st.warning(dictation_warning_message)
+    target_date = st.date_input(
+        "Diary Date",
+        value=date.today(),
+        key="file2_site_diary_date",
+    )
+    contractor_snapshot = get_daily_contractor_headcount(
+        repository,
+        site_name,
+        target_date,
+    )
+    saved_diary = _get_latest_site_diary_document(
+        repository,
+        site_name=site_name,
+        target_date=target_date,
+    )
+    all_site_diaries = [
+        document
+        for document in repository.list_documents(
+            document_type=SiteDiaryDocument.document_type,
+            site_name=site_name,
+        )
+        if isinstance(document, SiteDiaryDocument)
+    ]
+    draft_text_fields = _load_site_diary_text_draft(site_name, target_date)
+    contractor_editor_default = (
+        saved_diary.contractors if saved_diary is not None else contractor_snapshot
+    )
+    visitor_editor_default = saved_diary.visitors if saved_diary is not None else []
+    default_uplands_days, default_uplands_nights = _derive_uplands_site_diary_counts(
+        contractor_editor_default
+    )
+    incidents_state_key = f"file2_site_diary_incidents_{target_date.isoformat()}"
+    handovers_state_key = f"file2_site_diary_handovers_{target_date.isoformat()}"
+    comments_state_key = f"file2_site_diary_comments_{target_date.isoformat()}"
+    if incidents_state_key not in st.session_state:
+        st.session_state[incidents_state_key] = (
+            draft_text_fields.get("incidents_details")
+            or (saved_diary.incidents_details if saved_diary is not None else "")
+        )
+    if handovers_state_key not in st.session_state:
+        st.session_state[handovers_state_key] = (
+            draft_text_fields.get("area_handovers")
+            or (saved_diary.area_handovers if saved_diary is not None else "")
+        )
+    if comments_state_key not in st.session_state:
+        st.session_state[comments_state_key] = (
+            draft_text_fields.get("todays_comments")
+            or (saved_diary.todays_comments if saved_diary is not None else "")
+        )
+
+    _render_workspace_hero(
+        icon="📔",
+        kicker="UHSF15.63",
+        title="Daily Site Diary",
+        caption="Capture the daily site story, pull contractor numbers from the live gate, and save the official diary into File 2.",
+    )
+
+    summary_columns = st.columns(4)
+    with summary_columns[0]:
+        _render_inline_metric(
+            "Gate Companies",
+            str(len(contractor_snapshot)),
+            icon="🏢",
+        )
+    with summary_columns[1]:
+        _render_inline_metric(
+            "Gate Headcount",
+            str(sum(int(row.get("days", 0) or 0) for row in contractor_snapshot)),
+            icon="👷",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Saved Diaries",
+            str(len(all_site_diaries)),
+            icon="📚",
+        )
+    with summary_columns[3]:
+        _render_inline_metric(
+            "Loaded Record",
+            target_date.strftime("%d/%m/%Y") if saved_diary is not None else "New",
+            icon="📝",
+        )
+
+    if saved_diary is not None:
+        st.caption(
+            f"Loaded the latest saved diary for {target_date:%d/%m/%Y}. Regenerate it to refresh the file."
+        )
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Primary Action",
+        "The contractor table is pulled straight from the live attendance gate for the selected day. Review it, add visitors, complete the diary notes, then generate the official Word document.",
+    )
+    st.markdown("<div id='site-diary-editor'></div>", unsafe_allow_html=True)
+    st.markdown("**Live Gate Snapshot**")
+    if contractor_snapshot:
+        st.dataframe(
+            pd.DataFrame(contractor_snapshot),
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("No active sign-ins were found for that date. You can still complete the diary manually.")
+
+    contractor_rows = st.data_editor(
+        pd.DataFrame(
+            contractor_editor_default or [{"company": "", "days": 0, "nights": 0}]
+        ),
+        key=f"file2_site_diary_contractors_{target_date.isoformat()}",
+        hide_index=True,
+        width="stretch",
+        num_rows="dynamic",
+        column_config={
+            "company": st.column_config.TextColumn("Company"),
+            "days": st.column_config.NumberColumn("Days", min_value=0, step=1),
+            "nights": st.column_config.NumberColumn("Nights", min_value=0, step=1),
+        },
+    )
+
+    personnel_columns = st.columns(3, gap="large")
+    with personnel_columns[0]:
+        uplands_days = st.number_input(
+            "Uplands Days",
+            min_value=0,
+            step=1,
+            value=saved_diary.uplands_days if saved_diary is not None else default_uplands_days,
+            key=f"file2_site_diary_uplands_days_{target_date.isoformat()}",
+        )
+    with personnel_columns[1]:
+        uplands_nights = st.number_input(
+            "Uplands Nights",
+            min_value=0,
+            step=1,
+            value=saved_diary.uplands_nights if saved_diary is not None else default_uplands_nights,
+            key=f"file2_site_diary_uplands_nights_{target_date.isoformat()}",
+        )
+    with personnel_columns[2]:
+        skip_exchange = st.text_input(
+            "Skip Exchange",
+            value=saved_diary.skip_exchange if saved_diary is not None else "",
+            placeholder="Type / reference",
+            key=f"file2_site_diary_skip_exchange_{target_date.isoformat()}",
+        )
+
+    fire_columns = st.columns(4, gap="medium")
+    with fire_columns[0]:
+        fire_day_on = st.checkbox(
+            "Fire Day On",
+            value=saved_diary.fire_day_on if saved_diary is not None else False,
+            key=f"file2_site_diary_fire_day_on_{target_date.isoformat()}",
+        )
+    with fire_columns[1]:
+        fire_day_off = st.checkbox(
+            "Fire Day Off",
+            value=saved_diary.fire_day_off if saved_diary is not None else False,
+            key=f"file2_site_diary_fire_day_off_{target_date.isoformat()}",
+        )
+    with fire_columns[2]:
+        fire_night_on = st.checkbox(
+            "Fire Night On",
+            value=saved_diary.fire_night_on if saved_diary is not None else False,
+            key=f"file2_site_diary_fire_night_on_{target_date.isoformat()}",
+        )
+    with fire_columns[3]:
+        fire_night_off = st.checkbox(
+            "Fire Night Off",
+            value=saved_diary.fire_night_off if saved_diary is not None else False,
+            key=f"file2_site_diary_fire_night_off_{target_date.isoformat()}",
+        )
+
+    weather_columns = st.columns(3, gap="medium")
+    with weather_columns[0]:
+        weather_dry = st.checkbox(
+            "Weather Dry",
+            value=saved_diary.weather_dry if saved_diary is not None else True,
+            key=f"file2_site_diary_weather_dry_{target_date.isoformat()}",
+        )
+    with weather_columns[1]:
+        weather_mixed = st.checkbox(
+            "Weather Mixed",
+            value=saved_diary.weather_mixed if saved_diary is not None else False,
+            key=f"file2_site_diary_weather_mixed_{target_date.isoformat()}",
+        )
+    with weather_columns[2]:
+        weather_wet = st.checkbox(
+            "Weather Wet",
+            value=saved_diary.weather_wet if saved_diary is not None else False,
+            key=f"file2_site_diary_weather_wet_{target_date.isoformat()}",
+        )
+
+    incidents_header_columns = st.columns([4.3, 1.7], gap="medium")
+    with incidents_header_columns[0]:
+        st.markdown("**Incidents Details**")
+    with incidents_header_columns[1]:
+        _render_browser_dictation_button(
+            target_state_key=incidents_state_key,
+            component_key=f"site_diary_incidents_dictation_{target_date.isoformat()}",
+            field_label="Incidents Details",
+        )
+    incidents_details = st.text_area(
+        "Incidents Details",
+        key=incidents_state_key,
+        height=110,
+        label_visibility="collapsed",
+        placeholder="Speak or type any incidents, near misses, or notable safety events here.",
+        on_change=_persist_site_diary_text_draft,
+        args=(
+            site_name,
+            target_date,
+            incidents_state_key,
+            handovers_state_key,
+            comments_state_key,
+        ),
+    )
+    hs_reported_tick = st.checkbox(
+        "Sent to H&S Department",
+        value=saved_diary.hs_reported_tick if saved_diary is not None else False,
+        key=f"file2_site_diary_hs_reported_tick_{target_date.isoformat()}",
+    )
+
+    st.markdown("**Visitors**")
+    visitor_rows = st.data_editor(
+        pd.DataFrame(visitor_editor_default or [{"name": "", "company": ""}]),
+        key=f"file2_site_diary_visitors_{target_date.isoformat()}",
+        hide_index=True,
+        width="stretch",
+        num_rows="dynamic",
+        column_config={
+            "name": st.column_config.TextColumn("Name"),
+            "company": st.column_config.TextColumn("Company"),
+        },
+    )
+
+    handovers_header_columns = st.columns([4.3, 1.7], gap="medium")
+    with handovers_header_columns[0]:
+        st.markdown("**Area Handovers**")
+    with handovers_header_columns[1]:
+        _render_browser_dictation_button(
+            target_state_key=handovers_state_key,
+            component_key=f"site_diary_handovers_dictation_{target_date.isoformat()}",
+            field_label="Area Handovers",
+        )
+    area_handovers = st.text_area(
+        "Area Handovers",
+        key=handovers_state_key,
+        height=100,
+        label_visibility="collapsed",
+        placeholder="Speak or type any area handovers, access changes, or outstanding points.",
+        on_change=_persist_site_diary_text_draft,
+        args=(
+            site_name,
+            target_date,
+            incidents_state_key,
+            handovers_state_key,
+            comments_state_key,
+        ),
+    )
+
+    comments_header_columns = st.columns([4.3, 1.7], gap="medium")
+    with comments_header_columns[0]:
+        st.markdown("**Today's Comments**")
+    with comments_header_columns[1]:
+        _render_browser_dictation_button(
+            target_state_key=comments_state_key,
+            component_key=f"site_diary_comments_dictation_{target_date.isoformat()}",
+            field_label="Today's Comments",
+        )
+    todays_comments = st.text_area(
+        "Today's Comments",
+        key=comments_state_key,
+        height=120,
+        label_visibility="collapsed",
+        placeholder="Use this space for progress, constraints, deliveries, or end-of-day narrative.",
+        on_change=_persist_site_diary_text_draft,
+        args=(
+            site_name,
+            target_date,
+            incidents_state_key,
+            handovers_state_key,
+            comments_state_key,
+        ),
+    )
+
+    if st.session_state.pop("file2_site_diary_scroll_pending", False):
+        scroll_expression = """
+        (() => {
+            const hostWindow = window.top || window.parent || window;
+            const attemptScroll = () => {
+                const target = hostWindow.document.getElementById("site-diary-editor");
+                if (target) {
+                    target.scrollIntoView({ behavior: "smooth", block: "start" });
+                    const top =
+                        target.getBoundingClientRect().top + hostWindow.scrollY - 24;
+                    hostWindow.scrollTo({
+                        top: Math.max(0, top),
+                        behavior: "smooth",
+                    });
+                }
+            };
+            [120, 420, 900].forEach((delay) => {
+                window.setTimeout(attemptScroll, delay);
+            });
+            return null;
+        })()
+        """
+        streamlit_js_eval(
+            js_expressions=scroll_expression,
+            key=f"site_diary_scroll_{target_date.isoformat()}_{int(time.time() * 1000)}",
+        )
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Export / Print",
+        "Generate the tagged UHSF15.63 diary document and save it into the File 2 diary folder.",
+    )
+    diary_action_columns = st.columns(2, gap="medium")
+    with diary_action_columns[0]:
+        generate_diary = st.button(
+            "🖨️ Generate Daily Site Diary",
+            width="stretch",
+            key=f"file2_site_diary_generate_{target_date.isoformat()}",
+        )
+    with diary_action_columns[1]:
+        if st.button(
+            "↺ Reset Diary Form",
+            width="stretch",
+            key=f"file2_site_diary_reset_{target_date.isoformat()}",
+        ):
+            _queue_site_diary_form_reset(target_date)
+            st.rerun()
+
+    if generate_diary:
+        try:
+            cleaned_contractor_rows = _coerce_site_diary_table_rows(
+                contractor_rows,
+                columns=["company", "days", "nights"],
+            )
+            cleaned_visitor_rows = _coerce_site_diary_table_rows(
+                visitor_rows,
+                columns=["name", "company"],
+            )
+            site_diary_document = SiteDiaryDocument(
+                doc_id=(
+                    f"SITE-DIARY-{_slugify_identifier(site_name)}-{target_date:%Y%m%d}"
+                ),
+                site_name=site_name,
+                created_at=datetime.now().replace(second=0, microsecond=0),
+                status=DocumentStatus.ACTIVE,
+                date=target_date,
+                uplands_days=int(uplands_days),
+                uplands_nights=int(uplands_nights),
+                skip_exchange=skip_exchange,
+                fire_day_on=fire_day_on,
+                fire_day_off=fire_day_off,
+                fire_night_on=fire_night_on,
+                fire_night_off=fire_night_off,
+                weather_dry=weather_dry,
+                weather_mixed=weather_mixed,
+                weather_wet=weather_wet,
+                contractors=cleaned_contractor_rows,
+                visitors=cleaned_visitor_rows,
+                incidents_details=incidents_details,
+                hs_reported_tick=hs_reported_tick,
+                area_handovers=area_handovers,
+                todays_comments=todays_comments,
+            )
+            generated_diary = generate_site_diary_document(
+                repository,
+                site_diary_document=site_diary_document,
+            )
+        except (TemplateValidationError, ValidationError, ValueError, RuntimeError) as exc:
+            st.error(f"Unable to generate the daily site diary: {exc}")
+        else:
+            _clear_site_diary_text_draft(site_name, target_date)
+            st.session_state["file2_site_diary_flash"] = (
+                f"Daily site diary saved to {generated_diary.output_path}"
+            )
+            st.rerun()
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Live Register / History",
+        "Previously generated UHSF15.63 diaries for the active site.",
+    )
+    if all_site_diaries:
+        sorted_diaries = sorted(
+            all_site_diaries,
+            key=lambda site_diary_document: (
+                site_diary_document.date,
+                site_diary_document.created_at,
+            ),
+            reverse=True,
+        )
+        st.dataframe(
+            pd.DataFrame(_build_site_diary_history_rows(sorted_diaries)),
+            hide_index=True,
+            width="stretch",
+        )
+        selected_diary = st.selectbox(
+            "Open Saved Diary",
+            options=sorted_diaries,
+            key="file2_site_diary_history_select",
+            format_func=lambda diary_document: (
+                f"{diary_document.date:%d/%m/%Y} | saved {diary_document.created_at:%H:%M}"
+            ),
+        )
+        selected_diary_path = Path(selected_diary.generated_document_path)
+        history_columns = st.columns(3)
+        with history_columns[0]:
+            if st.button("📂 Open Diary Output Folder", key="file2-open-diary-folder", width="stretch"):
+                _open_workspace_path(FILE_2_DIARY_OUTPUT_DIR)
+        with history_columns[1]:
+            if selected_diary.generated_document_path and selected_diary_path.exists() and st.button(
+                "📂 Open Saved Diary",
+                key="file2-open-selected-diary",
+                width="stretch",
+            ):
+                _open_workspace_path(selected_diary_path)
+        with history_columns[2]:
+            if selected_diary.generated_document_path and selected_diary_path.exists():
+                st.download_button(
+                    "📥 Download Saved Diary",
+                    data=selected_diary_path.read_bytes(),
+                    file_name=selected_diary_path.name,
+                    mime=_guess_download_mime_type(selected_diary_path),
+                    key="file2-download-selected-diary",
+                    width="stretch",
+                )
+        delete_diary_flag_key = "file2_site_diary_delete_confirm"
+        if st.button(
+            "🗑️ Remove Selected Saved Diary",
+            key="file2-remove-selected-diary",
+            width="stretch",
+        ):
+            st.session_state[delete_diary_flag_key] = selected_diary.doc_id
+            st.rerun()
+        pending_delete_doc_id = str(st.session_state.get(delete_diary_flag_key, "") or "").strip()
+        if pending_delete_doc_id == selected_diary.doc_id:
+            st.warning(
+                "Remove this saved diary and its generated Word file from File 2?"
+            )
+            confirm_columns = st.columns(2, gap="medium")
+            with confirm_columns[0]:
+                if st.button(
+                    "Confirm Remove Diary",
+                    key="file2-confirm-remove-selected-diary",
+                    width="stretch",
+                    type="primary",
+                ):
+                    repository.delete_document_and_files(selected_diary.doc_id)
+                    st.session_state.pop(delete_diary_flag_key, None)
+                    if selected_diary.date == target_date:
+                        _queue_site_diary_form_reset(target_date)
+                    st.session_state["file2_site_diary_flash"] = (
+                        f"Removed saved diary for {selected_diary.date:%d/%m/%Y}."
+                    )
+                    st.rerun()
+            with confirm_columns[1]:
+                if st.button(
+                    "Cancel Remove",
+                    key="file2-cancel-remove-selected-diary",
+                    width="stretch",
+                ):
+                    st.session_state.pop(delete_diary_flag_key, None)
+                    st.rerun()
+    else:
+        st.info("No UHSF15.63 diary documents have been generated for this site yet.")
+
+
+def _build_site_broadcast_rows(
+    live_contacts: List[SiteBroadcastContact],
+) -> List[Dict[str, str]]:
+    """Return the manager-facing broadcast table rows."""
+
+    return [
+        {
+            "Name": contact.individual_name,
+            "Company": contact.contractor_name,
+            "Mobile": contact.mobile_number,
+            "Vehicle Reg": contact.vehicle_registration or "—",
+        }
+        for contact in live_contacts
+    ]
+
+
+def _build_toolbox_talk_completion_rows(
+    completions: List[ToolboxTalkCompletionDocument],
+) -> List[Dict[str, str]]:
+    """Return manager-facing UHSF16.2 completion rows."""
+
+    return [
+        {
+            "Name": completion.individual_name,
+            "Company": completion.contractor_name,
+            "Topic": completion.topic,
+            "Signed": completion.completed_at.strftime("%d/%m/%Y %H:%M"),
+        }
+        for completion in completions
+    ]
+
+
+def _build_broadcast_dispatch_rows(
+    dispatches: List[BroadcastDispatchDocument],
+) -> List[Dict[str, str]]:
+    """Return manager-facing broadcast dispatch history rows."""
+
+    return [
+        {
+            "Sent": dispatch.dispatched_at.strftime("%d/%m/%Y %H:%M"),
+            "Type": dispatch.dispatch_kind.replace("_", " ").title(),
+            "Subject": dispatch.subject,
+            "Audience": dispatch.audience_label,
+            "Recipients": str(len(dispatch.recipient_numbers)),
+            "Chunks": str(dispatch.chunk_count or 1),
+            "Status": "Opened" if dispatch.launched_successfully else "Needs attention",
+        }
+        for dispatch in dispatches
+    ]
+
+
+def _build_broadcast_company_options(
+    live_contacts: List[SiteBroadcastContact],
+) -> List[str]:
+    """Return sorted live company options for audience filtering."""
+
+    return sorted(
+        {contact.contractor_name for contact in live_contacts if contact.contractor_name},
+        key=str.casefold,
+    )
+
+
+def _filter_site_broadcast_contacts(
+    live_contacts: List[SiteBroadcastContact],
+    *,
+    audience_filter: str,
+    selected_companies: List[str],
+) -> List[SiteBroadcastContact]:
+    """Return the filtered live audience for the broadcast station."""
+
+    if audience_filter == "uplands":
+        return [
+            contact
+            for contact in live_contacts
+            if _is_uplands_company(contact.contractor_name)
+        ]
+    if audience_filter == "subcontractors":
+        return [
+            contact
+            for contact in live_contacts
+            if not _is_uplands_company(contact.contractor_name)
+        ]
+    if audience_filter == "companies":
+        selected_company_set = {company for company in selected_companies if company}
+        return [
+            contact
+            for contact in live_contacts
+            if contact.contractor_name in selected_company_set
+        ]
+    return live_contacts
+
+
+def _filter_active_attendance_entries(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+    *,
+    audience_filter: str,
+    selected_companies: List[str],
+) -> List[DailyAttendanceEntryDocument]:
+    """Return live attendance entries matching the chosen audience filter."""
+
+    if audience_filter == "uplands":
+        return [
+            entry for entry in attendance_entries if _is_uplands_company(entry.contractor_name)
+        ]
+    if audience_filter == "subcontractors":
+        return [
+            entry
+            for entry in attendance_entries
+            if not _is_uplands_company(entry.contractor_name)
+        ]
+    if audience_filter == "companies":
+        selected_company_set = {company for company in selected_companies if company}
+        return [
+            entry
+            for entry in attendance_entries
+            if entry.contractor_name in selected_company_set
+        ]
+    return attendance_entries
+
+
+def _count_missing_broadcast_numbers(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+    live_contacts: List[SiteBroadcastContact],
+) -> int:
+    """Return how many targeted active operatives still lack a reachable mobile."""
+
+    attendance_identities = {
+        (
+            entry.linked_induction_doc_id or entry.individual_name.casefold(),
+            entry.contractor_name.casefold(),
+        )
+        for entry in attendance_entries
+    }
+    reachable_identities = {
+        (
+            contact.linked_induction_doc_id or contact.individual_name.casefold(),
+            contact.contractor_name.casefold(),
+        )
+        for contact in live_contacts
+    }
+    return max(len(attendance_identities - reachable_identities), 0)
+
+
+def _describe_broadcast_audience(
+    audience_filter: str,
+    selected_companies: List[str],
+) -> str:
+    """Return one human-readable audience label for dispatch logs."""
+
+    if audience_filter == "uplands":
+        return "Uplands Employees"
+    if audience_filter == "subcontractors":
+        return "Subcontractors / Visitors"
+    if audience_filter == "companies":
+        if not selected_companies:
+            return "Selected Companies"
+        return "Companies: " + ", ".join(selected_companies)
+    return "Everyone On Site"
+
+
+def _get_recent_site_values(
+    site_name: str,
+    *,
+    settings_key: str,
+) -> List[str]:
+    """Return recent site-specific workflow values from root settings."""
+
+    resolved_site_name = site_name.strip() or PROJECT_NAME
+    settings_payload = load_app_settings()
+    history_by_site = settings_payload.get(settings_key, {})
+    if not isinstance(history_by_site, dict):
+        return []
+    recent_values = history_by_site.get(resolved_site_name, [])
+    if not isinstance(recent_values, list):
+        return []
+    return [str(value).strip() for value in recent_values if str(value).strip()]
+
+
+def _remember_recent_site_value(
+    site_name: str,
+    value: str,
+    *,
+    settings_key: str,
+    max_entries: int = 6,
+) -> None:
+    """Persist one recent workflow value against the current site."""
+
+    resolved_site_name = site_name.strip() or PROJECT_NAME
+    cleaned_value = value.strip()
+    if not cleaned_value:
+        return
+
+    settings_payload = load_app_settings()
+    history_by_site = dict(settings_payload.get(settings_key, {}) or {})
+    existing_values = [
+        str(item).strip()
+        for item in history_by_site.get(resolved_site_name, [])
+        if str(item).strip()
+    ]
+    deduped_values = [cleaned_value] + [
+        existing_value
+        for existing_value in existing_values
+        if existing_value.casefold() != cleaned_value.casefold()
+    ]
+    history_by_site[resolved_site_name] = deduped_values[:max_entries]
+
+    save_kwargs: Dict[str, Any] = {}
+    if settings_key == "broadcast_message_history_by_site":
+        save_kwargs["broadcast_message_history_by_site"] = history_by_site
+    elif settings_key == "tbt_topic_history_by_site":
+        save_kwargs["tbt_topic_history_by_site"] = history_by_site
+    else:
+        return
+    save_app_settings(**save_kwargs)
+
+
+def _build_broadcast_message_presets(site_name: str) -> Dict[str, str]:
+    """Return premium quick-start broadcast copy presets."""
+
+    resolved_site_name = site_name.strip() or PROJECT_NAME
+    return {
+        "Safety Alert": (
+            f"⚠️ Safety Alert: [update required]. "
+            f"All operatives at {resolved_site_name} must stop, review the instruction, "
+            "and report to their supervisor immediately."
+        ),
+        "Stand Down": (
+            f"🛑 Stand Down: Stop work now and report to the canteen / welfare point at "
+            f"{resolved_site_name} for a site-wide briefing."
+        ),
+        "Toolbox Talk": (
+            f"🦺 Toolbox Talk: A new site briefing is live for {resolved_site_name}. "
+            "Open the link provided by the site team, read the document, and sign the register."
+        ),
+        "Welfare": (
+            f"☕ Welfare Update: Please report to the canteen / welfare area at "
+            f"{resolved_site_name} for a briefing in 5 minutes."
+        ),
+    }
+
+
+def _build_company_reachability_rows(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+    live_contacts: List[SiteBroadcastContact],
+) -> List[Dict[str, Any]]:
+    """Return per-company audience stats for the broadcast reachability heatmap."""
+
+    company_stats: Dict[str, Dict[str, int]] = {}
+    for attendance_entry in attendance_entries:
+        company_name = attendance_entry.contractor_name or "Unknown"
+        stats = company_stats.setdefault(
+            company_name,
+            {"on_site": 0, "reachable": 0},
+        )
+        stats["on_site"] += 1
+    for contact in live_contacts:
+        company_name = contact.contractor_name or "Unknown"
+        stats = company_stats.setdefault(
+            company_name,
+            {"on_site": 0, "reachable": 0},
+        )
+        stats["reachable"] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for company_name, stats in sorted(company_stats.items(), key=lambda item: item[0].casefold()):
+        on_site_count = stats["on_site"]
+        reachable_count = stats["reachable"]
+        missing_count = max(on_site_count - reachable_count, 0)
+        reachability_percent = (
+            round((reachable_count / on_site_count) * 100, 1)
+            if on_site_count
+            else 0.0
+        )
+        rows.append(
+            {
+                "Company": company_name,
+                "On Site": on_site_count,
+                "Reachable": reachable_count,
+                "Missing": missing_count,
+                "Reachability %": reachability_percent,
+                "Status": (
+                    "Fully covered"
+                    if missing_count == 0 and on_site_count > 0
+                    else "Patchy"
+                    if reachable_count > 0
+                    else "Needs mobiles"
+                ),
+            }
+        )
+    return rows
+
+
+def _render_broadcast_status_badges(
+    badges: List[tuple[str, str]],
+) -> None:
+    """Render premium inline resend/status badges for the broadcast station."""
+
+    badge_markup = "".join(
+        (
+            "<span class='broadcast-status-badge "
+            f"broadcast-status-badge-{html.escape(tone, quote=True)}'>"
+            f"{html.escape(label)}"
+            "</span>"
+        )
+        for label, tone in badges
+    )
+    st.markdown(
+        f"<div class='broadcast-status-badge-row'>{badge_markup}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _toolbox_talk_signer_label(attendance_entry: DailyAttendanceEntryDocument) -> str:
+    """Return the mobile TBT signer label for one active operative."""
+
+    return (
+        f"{attendance_entry.individual_name} "
+        f"({attendance_entry.contractor_name}) · "
+        f"In {attendance_entry.time_in.strftime('%H:%M')}"
+    )
+
+
+def _render_site_broadcast_station(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render the manager-facing broadcast and toolbox talk hub."""
+
+    live_contacts = build_live_site_broadcast_contacts(
+        repository,
+        site_name=project_setup.current_site_name,
+    )
+    active_attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=date.today(),
+        active_only=True,
+    )
+    existing_tbt_documents = list_toolbox_talk_documents(
+        repository,
+        site_name=project_setup.current_site_name,
+    )
+    existing_tbt_completions = list_toolbox_talk_completions(
+        repository,
+        site_name=project_setup.current_site_name,
+    )
+    known_topics = sorted(
+        {
+            *(completion.topic for completion in existing_tbt_completions),
+            *(document.topic for document in existing_tbt_documents),
+        },
+        key=str.casefold,
+    )
+    missing_mobile_count = _count_missing_broadcast_numbers(
+        active_attendance_entries,
+        live_contacts,
+    )
+
+    _render_workspace_hero(
+        icon="📢",
+        kicker="Live Operations",
+        title="Site Alerts & TBTs",
+        caption=(
+            "Reach the live fire roll through Messages, launch remote toolbox talks, "
+            "and chase only the unsigned names without leaving the app."
+        ),
+    )
+
+    metric_columns = st.columns(4, gap="large")
+    with metric_columns[0]:
+        _render_metric_card(
+            title="Active Phones on Site",
+            icon="📱",
+            value=str(len(live_contacts)),
+            caption="Unique mobile numbers currently available from the live fire roll.",
+            body_html=(
+                "<div class='data-card-subtext'>"
+                f"Operatives signed in: <strong>{len(active_attendance_entries)}</strong>"
+                "</div>"
+            ),
+        )
+    with metric_columns[1]:
+        _render_metric_card(
+            title="Missing Mobile Records",
+            icon="⚠️",
+            value=str(missing_mobile_count),
+            caption="Active operatives still missing a reachable mobile number.",
+            body_html="<div class='data-card-subtext'>Fix these in UHSF16.01 inductions</div>",
+        )
+    with metric_columns[2]:
+        _render_metric_card(
+            title="Subcontractors / Visitors",
+            icon="👷",
+            value=str(
+                sum(
+                    1
+                    for attendance_entry in active_attendance_entries
+                    if not attendance_entry.is_uplands_employee
+                )
+            ),
+            caption="Live non-Uplands count currently signed in.",
+            body_html="<div class='data-card-subtext'>Live audience</div>",
+        )
+    with metric_columns[3]:
+        _render_metric_card(
+            title="Uplands Employees",
+            icon="🏗️",
+            value=str(
+                sum(
+                    1
+                    for attendance_entry in active_attendance_entries
+                    if attendance_entry.is_uplands_employee
+                )
+            ),
+            caption="Live Uplands personnel currently signed in.",
+            body_html="<div class='data-card-subtext'>Live audience</div>",
+        )
+
+    broadcast_tab, tbt_tab = st.tabs(["Mass Broadcast", "Toolbox Talks"])
+
+    with broadcast_tab:
+        pending_broadcast_preset_key = "site_broadcast_message_pending"
+        if pending_broadcast_preset_key in st.session_state:
+            st.session_state["site_broadcast_message"] = st.session_state.pop(
+                pending_broadcast_preset_key
+            )
+
+        st.markdown(
+            "<div class='file-2-section-heading'>Mass Broadcast</div>",
+            unsafe_allow_html=True,
+        )
+        audience_labels = {
+            "Everyone On Site": "all",
+            "Subcontractors / Visitors": "subcontractors",
+            "Uplands Employees": "uplands",
+            "Specific Companies": "companies",
+        }
+        selected_audience_label = st.radio(
+            "Audience",
+            options=list(audience_labels.keys()),
+            horizontal=True,
+            key="site_broadcast_audience_label",
+        )
+        selected_company_options = _build_broadcast_company_options(live_contacts)
+        selected_companies = (
+            st.multiselect(
+                "Choose companies to include",
+                options=selected_company_options,
+                key="site_broadcast_companies",
+                placeholder="Select one or more live contractors",
+            )
+            if audience_labels[selected_audience_label] == "companies"
+            else []
+        )
+        filtered_contacts = _filter_site_broadcast_contacts(
+            live_contacts,
+            audience_filter=audience_labels[selected_audience_label],
+            selected_companies=selected_companies,
+        )
+        filtered_attendance_entries = _filter_active_attendance_entries(
+            active_attendance_entries,
+            audience_filter=audience_labels[selected_audience_label],
+            selected_companies=selected_companies,
+        )
+        filtered_missing_mobile_count = _count_missing_broadcast_numbers(
+            filtered_attendance_entries,
+            filtered_contacts,
+        )
+
+        audience_metric_columns = st.columns(3, gap="large")
+        with audience_metric_columns[0]:
+            st.metric("📱 Reachable Phones", len(filtered_contacts))
+        with audience_metric_columns[1]:
+            st.metric("⚠️ Missing Mobile Records", filtered_missing_mobile_count)
+        with audience_metric_columns[2]:
+            st.metric(
+                "🏢 Companies in Audience",
+                len(
+                    {
+                        contact.contractor_name
+                        for contact in filtered_contacts
+                        if contact.contractor_name
+                    }
+                ),
+            )
+
+        st.divider()
+        st.caption("Quick-start presets")
+        preset_messages = _build_broadcast_message_presets(
+            project_setup.current_site_name
+        )
+        preset_columns = st.columns(4, gap="small")
+        for preset_column, preset_name in zip(preset_columns, preset_messages.keys()):
+            with preset_column:
+                if st.button(
+                    preset_name,
+                    key=f"broadcast_preset_{preset_name.lower().replace(' ', '_')}",
+                    width="stretch",
+                ):
+                    st.session_state[pending_broadcast_preset_key] = preset_messages[
+                        preset_name
+                    ]
+                    st.rerun()
+
+        recent_broadcast_messages = _get_recent_site_values(
+            project_setup.current_site_name,
+            settings_key="broadcast_message_history_by_site",
+        )
+        if recent_broadcast_messages:
+            st.caption("Recent site messages")
+            recent_message_columns = st.columns(
+                min(3, len(recent_broadcast_messages)),
+                gap="small",
+            )
+            for message_index, recent_message in enumerate(recent_broadcast_messages):
+                with recent_message_columns[message_index % len(recent_message_columns)]:
+                    recent_label = (
+                        recent_message
+                        if len(recent_message) <= 38
+                        else recent_message[:35].rstrip() + "..."
+                    )
+                    if st.button(
+                        f"↺ {recent_label}",
+                        key=f"broadcast_recent_message_{message_index}",
+                        width="stretch",
+                        help=recent_message,
+                    ):
+                        st.session_state[pending_broadcast_preset_key] = recent_message
+                        st.rerun()
+
+        st.caption(
+            "Messages on this Mac will open ready-to-send SMS draft(s) automatically. "
+            "Start from a preset, then tune the wording if needed."
+        )
+        st.divider()
+        st.caption(
+            f"Audience ready now: {len(filtered_contacts)} reachable phone(s), "
+            f"{filtered_missing_mobile_count} missing mobile record(s)."
+        )
+        broadcast_message = st.text_area(
+            "Broadcast Message",
+            key="site_broadcast_message",
+            placeholder="⚠️ High winds. Crane operations are suspended until further notice.",
+            help="Write the message once and the app will open it in Messages for the selected live audience.",
+            height=150,
+        )
+
+        if st.button(
+            "📨 Send Broadcast in Messages",
+            key="send_site_broadcast_messages",
+            width="stretch",
+        ):
+            resolved_message = broadcast_message.strip()
+            if not filtered_contacts:
+                st.session_state["site_broadcast_flash"] = {
+                    "level": "error",
+                    "message": "No reachable mobiles are available for the selected audience.",
+                }
+            elif not resolved_message:
+                st.session_state["site_broadcast_flash"] = {
+                    "level": "error",
+                    "message": "Type the broadcast message before sending it.",
+                }
+            else:
+                launch_result = launch_messages_sms_broadcast(
+                    [contact.mobile_number for contact in filtered_contacts],
+                    message=resolved_message,
+                )
+                log_broadcast_dispatch(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    dispatch_kind="mass_broadcast",
+                    audience_label=_describe_broadcast_audience(
+                        audience_labels[selected_audience_label],
+                        selected_companies,
+                    ),
+                    subject=resolved_message[:80],
+                    message_body=resolved_message,
+                    recipient_numbers=[
+                        contact.mobile_number for contact in filtered_contacts
+                    ],
+                    recipient_names=[
+                        contact.individual_name for contact in filtered_contacts
+                    ],
+                    launch_result=launch_result,
+                )
+                _remember_recent_site_value(
+                    project_setup.current_site_name,
+                    resolved_message,
+                    settings_key="broadcast_message_history_by_site",
+                )
+                st.session_state["site_broadcast_flash"] = {
+                    "level": "success" if launch_result.launched_successfully else "warning",
+                    "message": (
+                        f"Opened {launch_result.chunk_count} Messages draft(s) for "
+                        f"{launch_result.recipient_count} recipient(s)."
+                    ),
+                    "detail": launch_result.error_message,
+                }
+            st.rerun()
+
+        broadcast_flash = st.session_state.pop("site_broadcast_flash", None)
+        if broadcast_flash:
+            if broadcast_flash["level"] == "success":
+                st.success(broadcast_flash["message"])
+            elif broadcast_flash["level"] == "warning":
+                st.warning(broadcast_flash["message"])
+            else:
+                st.error(broadcast_flash["message"])
+            if broadcast_flash.get("detail"):
+                st.caption(broadcast_flash["detail"])
+
+        st.divider()
+        st.markdown(
+            "<div class='file-2-section-heading'>Live Audience</div>",
+            unsafe_allow_html=True,
+        )
+        if filtered_contacts:
+            st.dataframe(
+                pd.DataFrame(_build_site_broadcast_rows(filtered_contacts)),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "Nobody in the selected live audience currently has a valid mobile number attached."
+            )
+
+        st.divider()
+        st.markdown(
+            "<div class='file-2-section-heading'>Per-Company Reachability</div>",
+            unsafe_allow_html=True,
+        )
+        company_heatmap_rows = _build_company_reachability_rows(
+            filtered_attendance_entries,
+            filtered_contacts,
+        )
+        if company_heatmap_rows:
+            company_heatmap_frame = pd.DataFrame(company_heatmap_rows)
+            st.dataframe(
+                company_heatmap_frame,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Company": st.column_config.TextColumn(
+                        "Company",
+                        width="medium",
+                    ),
+                    "On Site": st.column_config.NumberColumn(
+                        "On Site",
+                        format="%d",
+                        width="small",
+                    ),
+                    "Reachable": st.column_config.NumberColumn(
+                        "Reachable",
+                        format="%d",
+                        width="small",
+                    ),
+                    "Missing": st.column_config.NumberColumn(
+                        "Missing",
+                        format="%d",
+                        width="small",
+                    ),
+                    "Reachability %": st.column_config.ProgressColumn(
+                        "Reachability %",
+                        help="Higher is better. This shows how much of each company audience is reachable right now.",
+                        format="%.0f%%",
+                        min_value=0,
+                        max_value=100,
+                        width="medium",
+                    ),
+                    "Status": st.column_config.TextColumn(
+                        "Status",
+                        width="small",
+                    ),
+                },
+            )
+            st.caption(
+                "This native readiness grid stays dependency-free and shows which companies are fully covered before you send."
+            )
+        else:
+            st.caption("No company audience data is available for the current filter yet.")
+
+        st.divider()
+        st.markdown(
+            "<div class='file-2-section-heading'>Dispatch History</div>",
+            unsafe_allow_html=True,
+        )
+        broadcast_dispatches = list_broadcast_dispatches(
+            repository,
+            site_name=project_setup.current_site_name,
+            dispatch_kind="mass_broadcast",
+        )
+        if broadcast_dispatches:
+            st.dataframe(
+                pd.DataFrame(_build_broadcast_dispatch_rows(broadcast_dispatches[:12])),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("No broadcast batches have been launched yet.")
+
+    with tbt_tab:
+        pending_tbt_topic_key = "site_tbt_topic_pending"
+        if pending_tbt_topic_key in st.session_state:
+            st.session_state["site_broadcast_tbt_topic"] = st.session_state.pop(
+                pending_tbt_topic_key
+            )
+
+        st.markdown(
+            "<div class='file-2-section-heading'>Start New Toolbox Talk</div>",
+            unsafe_allow_html=True,
+        )
+        recent_tbt_topics = _get_recent_site_values(
+            project_setup.current_site_name,
+            settings_key="tbt_topic_history_by_site",
+        )
+        if recent_tbt_topics:
+            st.caption("Recent toolbox talk topics")
+            recent_topic_columns = st.columns(min(3, len(recent_tbt_topics)), gap="small")
+            for topic_index, recent_topic in enumerate(recent_tbt_topics):
+                with recent_topic_columns[topic_index % len(recent_topic_columns)]:
+                    recent_topic_label = (
+                        recent_topic
+                        if len(recent_topic) <= 34
+                        else recent_topic[:31].rstrip() + "..."
+                    )
+                    if st.button(
+                        f"↺ {recent_topic_label}",
+                        key=f"recent_tbt_topic_{topic_index}",
+                        width="stretch",
+                        help=recent_topic,
+                    ):
+                        st.session_state[pending_tbt_topic_key] = recent_topic
+                        st.rerun()
+        tbt_topic = st.text_input(
+            "TBT Topic / Subject",
+            key="site_broadcast_tbt_topic",
+            placeholder="e.g. Working in high winds",
+        )
+        uploaded_tbt_document = st.file_uploader(
+            "Upload TBT Document",
+            type=["pdf", "doc", "docx"],
+            key="site_broadcast_tbt_document",
+            help="Upload the toolbox talk file the operatives must read before signing.",
+        )
+        if st.button(
+            "➕ Create Toolbox Talk",
+            key="create_remote_tbt_link",
+            width="stretch",
+        ):
+            resolved_topic = tbt_topic.strip()
+            if not resolved_topic:
+                st.session_state["site_tbt_flash"] = {
+                    "level": "error",
+                    "message": "Enter a toolbox talk topic before creating the remote link.",
+                }
+            elif uploaded_tbt_document is None:
+                st.session_state["site_tbt_flash"] = {
+                    "level": "error",
+                    "message": "Upload the toolbox talk document before creating the remote link.",
+                }
+            else:
+                saved_document = save_toolbox_talk_document(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    topic=resolved_topic,
+                    uploaded_file_name=uploaded_tbt_document.name,
+                    uploaded_file_bytes=uploaded_tbt_document.getvalue(),
+                )
+                tbt_link = build_toolbox_talk_url(
+                    resolved_topic,
+                    public_url=project_setup.public_tunnel_url,
+                )
+                st.session_state["site_tbt_flash"] = {
+                    "level": "success",
+                    "message": (
+                        "Remote toolbox talk link created and the source document is now live."
+                    ),
+                }
+                st.session_state["site_tbt_active_topic"] = resolved_topic
+                st.session_state["site_tbt_active_link"] = tbt_link
+                st.session_state["site_tbt_active_document_name"] = (
+                    saved_document.toolbox_talk_document.original_file_name
+                )
+                st.session_state["site_tbt_message_template"] = build_toolbox_talk_sms_message(
+                    resolved_topic,
+                    tbt_link,
+                )
+                _remember_recent_site_value(
+                    project_setup.current_site_name,
+                    resolved_topic,
+                    settings_key="tbt_topic_history_by_site",
+                )
+            st.rerun()
+
+        tbt_flash = st.session_state.pop("site_tbt_flash", None)
+        if tbt_flash is not None:
+            if tbt_flash["level"] == "success":
+                st.success(tbt_flash["message"])
+            else:
+                st.error(tbt_flash["message"])
+
+        active_tbt_topic = str(st.session_state.get("site_tbt_active_topic", "")).strip()
+        if active_tbt_topic and active_tbt_topic not in known_topics:
+            topic_options = [active_tbt_topic] + known_topics
+        else:
+            topic_options = known_topics
+        if topic_options:
+            default_topic = active_tbt_topic if active_tbt_topic in topic_options else topic_options[0]
+            selected_tbt_topic = st.selectbox(
+                "Current / Previous TBT Topic",
+                options=topic_options,
+                index=topic_options.index(default_topic),
+                key="site_tbt_selected_topic",
+            )
+        else:
+            selected_tbt_topic = active_tbt_topic
+
+        selected_tbt_document = (
+            get_latest_toolbox_talk_document(
+                repository,
+                site_name=project_setup.current_site_name,
+                topic=selected_tbt_topic,
+            )
+            if selected_tbt_topic
+            else None
+        )
+
+        selected_tbt_link = (
+            build_toolbox_talk_url(
+                selected_tbt_topic,
+                public_url=project_setup.public_tunnel_url,
+            )
+            if selected_tbt_topic
+            else ""
+        )
+        selected_tbt_message = (
+            build_toolbox_talk_sms_message(selected_tbt_topic, selected_tbt_link)
+            if selected_tbt_topic and selected_tbt_link
+            else ""
+        )
+        topic_completions = (
+            list_toolbox_talk_completions(
+                repository,
+                site_name=project_setup.current_site_name,
+                topic=selected_tbt_topic,
+            )
+            if selected_tbt_topic
+            else []
+        )
+        pending_contacts = (
+            build_pending_toolbox_talk_contacts(
+                repository,
+                site_name=project_setup.current_site_name,
+                topic=selected_tbt_topic,
+                on_date=date.today(),
+            )
+            if selected_tbt_topic
+            else []
+        )
+
+        if selected_tbt_document is not None:
+            try:
+                document_bytes, mime_type = read_toolbox_talk_document_bytes(
+                    selected_tbt_document
+                )
+            except FileNotFoundError:
+                st.warning("The uploaded toolbox talk document is missing from disk.")
+            else:
+                document_columns = st.columns([1.3, 0.7], gap="large")
+                with document_columns[0]:
+                    st.caption(
+                        f"Attached TBT document: {selected_tbt_document.original_file_name}"
+                    )
+                    st.caption(
+                        f"Storage folder: {FILE_2_TBT_ACTIVE_DOCS_DIR.name}"
+                    )
+                with document_columns[1]:
+                    st.download_button(
+                        "📥 Download / View TBT Document",
+                        data=document_bytes,
+                        file_name=selected_tbt_document.original_file_name,
+                        mime=mime_type,
+                        width="stretch",
+                        key=f"download_tbt_doc_{selected_tbt_document.doc_id}",
+                    )
+
+        tbt_dispatches = (
+            list_broadcast_dispatches(
+                repository,
+                site_name=project_setup.current_site_name,
+                topic=selected_tbt_topic,
+            )
+            if selected_tbt_topic
+            else []
+        )
+        if selected_tbt_topic:
+            st.divider()
+            tbt_metric_columns = st.columns(4, gap="large")
+            with tbt_metric_columns[0]:
+                st.metric("📱 Reachable Live Audience", len(live_contacts))
+            with tbt_metric_columns[1]:
+                st.metric("✍️ Signed", len(topic_completions))
+            with tbt_metric_columns[2]:
+                st.metric("🔁 Pending Live Signers", len(pending_contacts))
+            with tbt_metric_columns[3]:
+                st.metric("⚠️ Missing Mobiles", missing_mobile_count)
+
+            _render_broadcast_status_badges(
+                [
+                    (f"Live {len(live_contacts)}", "neutral"),
+                    (f"Signed {len(topic_completions)}", "success"),
+                    (
+                        f"Pending {len(pending_contacts)}",
+                        "warning" if pending_contacts else "success",
+                    ),
+                    (
+                        f"Missing mobiles {missing_mobile_count}",
+                        "danger" if missing_mobile_count else "neutral",
+                    ),
+                ]
+            )
+            st.caption(
+                f"Current toolbox talk: {selected_tbt_topic} | Live link stays pinned to the active site audience."
+            )
+
+            if selected_tbt_link:
+                action_columns = st.columns([1, 1, 1], gap="large")
+                with action_columns[0]:
+                    if st.button(
+                        "📨 Send TBT in Messages",
+                        key="send_toolbox_talk_messages",
+                        width="stretch",
+                    ):
+                        if not live_contacts:
+                            st.session_state["site_tbt_delivery_flash"] = {
+                                "level": "error",
+                                "message": "No reachable live audience is currently signed in.",
+                            }
+                        else:
+                            launch_result = launch_messages_sms_broadcast(
+                                [contact.mobile_number for contact in live_contacts],
+                                message=selected_tbt_message,
+                            )
+                            log_broadcast_dispatch(
+                                repository,
+                                site_name=project_setup.current_site_name,
+                                dispatch_kind="toolbox_talk",
+                                audience_label="Everyone On Site",
+                                subject=selected_tbt_topic,
+                                message_body=selected_tbt_message,
+                                recipient_numbers=[
+                                    contact.mobile_number for contact in live_contacts
+                                ],
+                                recipient_names=[
+                                    contact.individual_name for contact in live_contacts
+                                ],
+                                launch_result=launch_result,
+                                topic=selected_tbt_topic,
+                            )
+                            st.session_state["site_tbt_delivery_flash"] = {
+                                "level": "success"
+                                if launch_result.launched_successfully
+                                else "warning",
+                                "message": (
+                                    f"Opened {launch_result.chunk_count} Messages draft(s) "
+                                    f"for {launch_result.recipient_count} live recipient(s)."
+                                ),
+                                "detail": launch_result.error_message,
+                            }
+                        st.rerun()
+                with action_columns[1]:
+                    if st.button(
+                        "🔁 Remind Pending Only",
+                        key="remind_pending_tbt_messages",
+                        width="stretch",
+                    ):
+                        if not pending_contacts:
+                            st.session_state["site_tbt_delivery_flash"] = {
+                                "level": "error",
+                                "message": "Nobody on the live fire roll is currently pending this toolbox talk.",
+                            }
+                        else:
+                            launch_result = launch_messages_sms_broadcast(
+                                [contact.mobile_number for contact in pending_contacts],
+                                message=selected_tbt_message,
+                            )
+                            log_broadcast_dispatch(
+                                repository,
+                                site_name=project_setup.current_site_name,
+                                dispatch_kind="toolbox_talk_reminder",
+                                audience_label="Pending Live Signers",
+                                subject=selected_tbt_topic,
+                                message_body=selected_tbt_message,
+                                recipient_numbers=[
+                                    contact.mobile_number for contact in pending_contacts
+                                ],
+                                recipient_names=[
+                                    contact.individual_name for contact in pending_contacts
+                                ],
+                                launch_result=launch_result,
+                                topic=selected_tbt_topic,
+                            )
+                            st.session_state["site_tbt_delivery_flash"] = {
+                                "level": "success"
+                                if launch_result.launched_successfully
+                                else "warning",
+                                "message": (
+                                    f"Opened {launch_result.chunk_count} reminder draft(s) "
+                                    f"for {launch_result.recipient_count} pending signer(s)."
+                                ),
+                                "detail": launch_result.error_message,
+                            }
+                        st.rerun()
+                with action_columns[2]:
+                    st.link_button(
+                        "🔗 Open Live Signing Link",
+                        url=selected_tbt_link,
+                        width="stretch",
+                    )
+
+            tbt_delivery_flash = st.session_state.pop("site_tbt_delivery_flash", None)
+            if tbt_delivery_flash is not None:
+                if tbt_delivery_flash["level"] == "success":
+                    st.success(tbt_delivery_flash["message"])
+                elif tbt_delivery_flash["level"] == "warning":
+                    st.warning(tbt_delivery_flash["message"])
+                else:
+                    st.error(tbt_delivery_flash["message"])
+                if tbt_delivery_flash.get("detail"):
+                    st.caption(tbt_delivery_flash["detail"])
+
+            st.divider()
+            st.markdown(
+                "<div class='file-2-section-heading'>Remote Signature Register</div>",
+                unsafe_allow_html=True,
+            )
+            if topic_completions:
+                st.dataframe(
+                    pd.DataFrame(_build_toolbox_talk_completion_rows(topic_completions)),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.info("No remote signatures have been logged for this toolbox talk yet.")
+
+            st.divider()
+            st.markdown(
+                "<div class='file-2-section-heading'>Delivery History</div>",
+                unsafe_allow_html=True,
+            )
+            if tbt_dispatches:
+                st.dataframe(
+                    pd.DataFrame(_build_broadcast_dispatch_rows(tbt_dispatches[:12])),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.caption("No TBT delivery batches have been launched for this topic yet.")
+
+            st.divider()
+            if st.button(
+                "🖨️ Export TBT Register",
+                key="export_toolbox_talk_register",
+                width="stretch",
+            ):
+                try:
+                    generated_register = generate_toolbox_talk_register_document(
+                        repository,
+                        site_name=project_setup.current_site_name,
+                        topic=selected_tbt_topic,
+                    )
+                except TemplateValidationError as exc:
+                    st.error(f"Official UHSF16.2 template failed validation: {exc}")
+                except Exception as exc:
+                    st.error(f"Unable to export toolbox talk register: {exc}")
+                else:
+                    _open_file_for_printing(generated_register.output_path)
+                    st.success(f"✅ Register saved to {generated_register.output_path}")
+                    st.caption(
+                        f"Rows printed: {generated_register.row_count} | Output folder: {FILE_2_TBT_OUTPUT_DIR.name}"
+                    )
+        else:
+            st.info("Create a toolbox talk link or wait for completions to appear here.")
+
+
+def _render_toolbox_talk_kiosk(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+    *,
+    topic: str,
+) -> None:
+    """Render the mobile remote UHSF16.2 signer kiosk."""
+
+    try:
+        from streamlit_drawable_canvas import st_canvas
+    except ImportError:
+        st.error(
+            "streamlit-drawable-canvas is not installed. Install dependencies and restart the app."
+        )
+        return
+
+    resolved_topic = topic.strip()
+    if not resolved_topic:
+        st.error("Toolbox talk topic missing from the link. Ask the manager to generate a fresh TBT link.")
+        return
+
+    source_document = get_latest_toolbox_talk_document(
+        repository,
+        site_name=project_setup.current_site_name,
+        topic=resolved_topic,
+    )
+    if source_document is None:
+        st.error(
+            "No toolbox talk document is attached to this link yet. Ask the manager to generate a fresh TBT link."
+        )
+        return
+
+    if st.session_state.pop("toolbox_talk_reset_pending", False):
+        st.session_state["toolbox_talk_selected_attendance_doc_id"] = ""
+        st.session_state["toolbox_talk_read_confirmed"] = False
+    completed_message = str(st.session_state.get("toolbox_talk_kiosk_complete_message", "")).strip()
+    completed_at = float(st.session_state.get("toolbox_talk_kiosk_complete_at", 0.0))
+    if completed_message and completed_at and (time.time() - completed_at) >= 8:
+        st.session_state.pop("toolbox_talk_kiosk_complete_message", None)
+        st.session_state.pop("toolbox_talk_kiosk_complete_at", None)
+        st.session_state["toolbox_talk_reset_pending"] = True
+        st.session_state["toolbox_talk_canvas_revision"] = (
+            int(st.session_state.get("toolbox_talk_canvas_revision", 0)) + 1
+        )
+        st.rerun()
+
+    active_attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=date.today(),
+        active_only=True,
+    )
+
+    if UPLANDS_LOGO.exists():
+        logo_columns = st.columns([1, 1.2, 1])
+        with logo_columns[1]:
+            st.image(str(UPLANDS_LOGO), width="stretch")
 
     st.markdown(
         (
             "<div class='panel-card'>"
-            "<div class='panel-heading'>Safety Inventory</div>"
-            "<div class='panel-title'>Live RAMS & COSHH Records</div>"
+            "<div class='panel-heading'>UHSF16.2 TOOLBOX TALK</div>"
+            f"<div class='panel-title'>{html.escape(resolved_topic)}</div>"
             "<div class='panel-caption'>"
-            "File 3 safety assets synced from the ingest folder, including PDF and Word submissions."
+            "Select your name, sign on screen, and submit your remote toolbox talk acknowledgement."
             "</div>"
             "</div>"
         ),
         unsafe_allow_html=True,
     )
-    wiped_count = st.session_state.pop("file3_safety_wipe_count", None)
-    if wiped_count is not None:
-        st.success(f"Deleted {wiped_count} File 3 safety record(s) from the database.")
 
-    rams_tab, coshh_tab = st.tabs(["RAMS", "COSHH"])
-    with rams_tab:
-        rams_assets = [document.as_safety_asset() for document in rams_documents]
-        if rams_assets:
-            st.dataframe(
-                pd.DataFrame(_build_file_3_rams_rows(rams_assets)),
-                hide_index=True,
-                use_container_width=True,
+    try:
+        source_document_bytes, source_document_mime_type = read_toolbox_talk_document_bytes(
+            source_document
+        )
+    except FileNotFoundError:
+        st.error("The attached toolbox talk document is missing. Ask the manager to upload it again.")
+        return
+
+    st.download_button(
+        "📥 Download / View TBT Document",
+        data=source_document_bytes,
+        file_name=source_document.original_file_name,
+        mime=source_document_mime_type,
+        width="stretch",
+        key=f"toolbox_talk_source_doc_{source_document.doc_id}",
+    )
+    st.info("Open the toolbox talk document, read it fully, then return here to confirm and sign.")
+
+    if completed_message:
+        st.success(completed_message)
+        st.info("This form will reset automatically for the next operative.")
+        components.html(
+            """
+            <script>
+            setTimeout(function () {
+                window.parent.location.reload();
+            }, 8000);
+            </script>
+            """,
+            height=0,
+        )
+        return
+
+    if not active_attendance_entries:
+        st.info("Nobody is currently on the live fire roll, so the toolbox talk signer is paused.")
+        return
+
+    signer_options = [""] + [entry.doc_id for entry in active_attendance_entries]
+    if (
+        st.session_state.get("toolbox_talk_selected_attendance_doc_id")
+        not in signer_options
+    ):
+        st.session_state["toolbox_talk_selected_attendance_doc_id"] = ""
+    selected_attendance_doc_id = st.selectbox(
+        "Select Your Name",
+        options=signer_options,
+        key="toolbox_talk_selected_attendance_doc_id",
+        format_func=lambda doc_id: (
+            "Choose operative"
+            if not doc_id
+            else _toolbox_talk_signer_label(
+                next(
+                    entry
+                    for entry in active_attendance_entries
+                    if entry.doc_id == doc_id
+                )
             )
-        else:
-            st.info("No RAMS documents are filed for this site yet.")
+        ),
+    )
+    selected_attendance_entry = next(
+        (
+            entry
+            for entry in active_attendance_entries
+            if entry.doc_id == selected_attendance_doc_id
+        ),
+        None,
+    )
 
-        if st.button(
-            "🖨️ Print RAMS Register",
-            key="print_rams_register",
-            use_container_width=True,
-        ):
-            try:
-                generated_register = generate_rams_register_document(
-                    repository,
-                    site_name=site_name,
-                )
-            except TemplateValidationError as exc:
-                st.error(f"Official RAMS register template failed validation: {exc}")
-            except Exception as exc:
-                st.error(f"Unable to generate RAMS register: {exc}")
-            else:
-                _open_file_for_printing(generated_register.output_path)
-                st.success(f"RAMS register ready: {generated_register.output_path}")
-                st.caption(
-                    f"Rows printed: {generated_register.row_count} | Output folder: {FILE_3_OUTPUT_DIR.name}"
-                )
-
-    with coshh_tab:
-        coshh_assets = [document.as_safety_asset() for document in coshh_documents]
-        if coshh_assets:
-            st.dataframe(
-                pd.DataFrame(_build_file_3_coshh_rows(coshh_assets)),
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.info("No COSHH documents are filed for this site yet.")
-
-        if st.button(
-            "🖨️ Print COSHH Register",
-            key="print_coshh_register",
-            use_container_width=True,
-        ):
-            try:
-                generated_register = generate_coshh_register_document(
-                    repository,
-                    site_name=site_name,
-                )
-            except TemplateValidationError as exc:
-                st.error(f"Official COSHH register template failed validation: {exc}")
-            except Exception as exc:
-                st.error(f"Unable to generate COSHH register: {exc}")
-            else:
-                _open_file_for_printing(generated_register.output_path)
-                st.success(f"COSHH register ready: {generated_register.output_path}")
-                st.caption(
-                    f"Rows printed: {generated_register.row_count} | Output folder: {FILE_3_OUTPUT_DIR.name}"
-                )
+    read_confirmed = st.checkbox(
+        "I confirm I have read and understood the attached Toolbox Talk document.",
+        key="toolbox_talk_read_confirmed",
+    )
+    if not read_confirmed:
+        st.warning("Read the attached toolbox talk and tick the confirmation box before signing.")
 
     st.markdown(
-        """
-        <style>
-        .st-key-file3_wipe_safety_database button {
-            background: #D92D20 !important;
-            color: #FFFFFF !important;
-            border: 1px solid #D92D20 !important;
-        }
-        .st-key-file3_wipe_safety_database button:hover {
-            background: #B42318 !important;
-            color: #FFFFFF !important;
-            border: 1px solid #B42318 !important;
-        }
-        </style>
-        """,
+        "<div class='file-2-section-heading'>Signature</div>",
         unsafe_allow_html=True,
     )
-    st.warning(
-        "DEV tool: this deletes all RAMS and COSHH records from SQLite. Re-syncing File 3 will rebuild them from the filed source documents."
+    canvas_revision = int(st.session_state.get("toolbox_talk_canvas_revision", 0))
+    canvas_result = st_canvas(
+        update_streamlit=True,
+        key=f"toolbox_talk_canvas_{canvas_revision}",
+        height=200,
+        width=420,
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#ffffff",
+        drawing_mode="freedraw",
+        display_toolbar=False,
     )
-    if st.button(
-        "⚠️ DEV: Wipe Safety Database",
-        key="file3_wipe_safety_database",
-        use_container_width=True,
+
+    action_columns = st.columns([0.35, 0.65], gap="medium")
+    with action_columns[0]:
+        if st.button(
+            "🧽 Clear Signature",
+            key="clear_toolbox_talk_signature",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["toolbox_talk_canvas_revision"] = canvas_revision + 1
+            st.rerun()
+    with action_columns[1]:
+        if st.button(
+            "✅ Submit",
+            key="submit_toolbox_talk_completion",
+            width="stretch",
+            disabled=not read_confirmed,
+        ):
+            try:
+                if selected_attendance_entry is None:
+                    raise ValidationError("Select your name before submitting the toolbox talk.")
+                logged_completion = log_toolbox_talk_completion(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    topic=resolved_topic,
+                    attendance_entry=selected_attendance_entry,
+                    signature_image_data=canvas_result.image_data,
+                    document_read_confirmed=read_confirmed,
+                )
+            except ValidationError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unable to log the toolbox talk signature: {exc}")
+            else:
+                st.session_state["toolbox_talk_kiosk_complete_message"] = (
+                    f"Toolbox Talk signed. Thank you, {logged_completion.toolbox_talk_completion.individual_name}."
+                )
+                st.session_state["toolbox_talk_kiosk_complete_at"] = time.time()
+                st.session_state["toolbox_talk_reset_pending"] = True
+                st.session_state["toolbox_talk_canvas_revision"] = canvas_revision + 1
+                st.rerun()
+
+
+def _render_site_induction_capture_form(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+    *,
+    induction_company_options: List[str],
+    is_kiosk: bool,
+    st_canvas: Any,
+) -> None:
+    """Render the UHSF16.01 induction capture form."""
+
+    reset_caption = (
+        "Reset clears the current induction form, signature canvas, and any staged competency uploads."
+    )
+    top_action_columns = st.columns([0.34, 0.66], gap="medium")
+    with top_action_columns[0]:
+        if st.button(
+            "↺ Reset Induction Form",
+            key="top_reset_site_induction_form",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["site_induction_reset_pending"] = True
+            st.session_state["site_induction_canvas_revision"] = (
+                int(st.session_state.get("site_induction_canvas_revision", 0)) + 1
+            )
+            st.session_state.pop("site_induction_kiosk_complete_name", None)
+            st.session_state.pop("site_induction_kiosk_complete_at", None)
+            st.session_state["site_induction_flash"] = "Induction form reset."
+            st.rerun()
+    with top_action_columns[1]:
+        st.caption(reset_caption)
+    st.markdown("")
+
+    if (
+        "site_induction_company_selection" not in st.session_state
+        or st.session_state["site_induction_company_selection"]
+        not in induction_company_options
     ):
-        deleted_count = 0
-        for document_type in (RAMSDocument.document_type, COSHHDocument.document_type):
-            for document in repository.list_documents(document_type=document_type):
-                repository.delete_document(document.doc_id)
-                deleted_count += 1
-        st.session_state["file3_safety_wipe_count"] = deleted_count
-        st.rerun()
+        st.session_state["site_induction_company_selection"] = (
+            "-- Select Company --"
+        )
+    selected_company_option = st.selectbox(
+        "Company / Contractor Name",
+        induction_company_options,
+        key="site_induction_company_selection",
+    )
+
+    personnel_columns = st.columns(2, gap="large")
+    with personnel_columns[0]:
+        full_name = st.text_input("Full Name", key="site_induction_full_name")
+        home_address = st.text_input("Home Address", key="site_induction_home_address")
+        contact_number = st.text_input(
+            "Contact Number",
+            key="site_induction_contact_number",
+        )
+        if selected_company_option == "🏢 New Company (Type Below)":
+            company = st.text_input(
+                "Enter New Company Name",
+                key="site_induction_new_company_name",
+            )
+        else:
+            company = selected_company_option
+        occupation = st.text_input("Occupation", key="site_induction_occupation")
+    with personnel_columns[1]:
+        emergency_contact = st.text_input(
+            "Emergency Contact",
+            key="site_induction_emergency_contact",
+        )
+        emergency_tel = st.text_input(
+            "Emergency Tel",
+            key="site_induction_emergency_tel",
+        )
+        medical = st.text_input("Medical", key="site_induction_medical")
+        cscs_number = st.text_input("CSCS No.", key="site_induction_cscs_number")
+        cscs_expiry = st.date_input(
+            "CSCS Expiry Date",
+            value=None,
+            format="DD/MM/YYYY",
+            key="site_induction_cscs_expiry",
+        )
+        cscs_card_upload = st.file_uploader(
+            "📸 Upload CSCS Card",
+            type=["png", "jpg", "jpeg", "pdf"],
+            accept_multiple_files=False,
+            key="site_induction_cscs_card_upload",
+        )
+        asbestos_cert = _render_site_induction_yes_no_field(
+            "Asbestos Awareness Certificate",
+            key="site_induction_asbestos_cert",
+        )
+        asbestos_card_upload = None
+        if asbestos_cert:
+            asbestos_card_upload = st.file_uploader(
+                "📄 Upload Asbestos Certificate",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_asbestos_card_upload",
+            )
+
+    if is_kiosk:
+        scaffold_section = st.container()
+        plant_section = st.container()
+    else:
+        competence_columns = st.columns(2, gap="large")
+        scaffold_section, plant_section = competence_columns
+
+    with scaffold_section:
+        erect_scaffold = _render_site_induction_yes_no_field(
+            "Are you erecting scaffold?",
+            key="site_induction_erect_scaffold",
+        )
+        cisrs_no = ""
+        cisrs_expiry = None
+        cisrs_card_upload = None
+        if erect_scaffold:
+            cisrs_no = st.text_input(
+                "CISRS No.",
+                key="site_induction_cisrs_no",
+            )
+            cisrs_expiry = st.date_input(
+                "CISRS Expiry",
+                value=None,
+                format="DD/MM/YYYY",
+                key="site_induction_cisrs_expiry",
+            )
+            cisrs_card_upload = st.file_uploader(
+                "📸 Upload CISRS Card",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_cisrs_card_upload",
+            )
+        st.markdown("**Role Certificates**")
+        first_aider = _render_site_induction_yes_no_field(
+            "First Aider",
+            key="site_induction_first_aider",
+        )
+        first_aider_upload = None
+        if first_aider:
+            first_aider_upload = st.file_uploader(
+                "📄 Upload First Aid Certificate",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_first_aider_upload",
+            )
+        fire_warden = _render_site_induction_yes_no_field(
+            "Fire Warden",
+            key="site_induction_fire_warden",
+        )
+        fire_warden_upload = None
+        if fire_warden:
+            fire_warden_upload = st.file_uploader(
+                "📄 Upload Fire Warden Certificate",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_fire_warden_upload",
+            )
+        supervisor = _render_site_induction_yes_no_field(
+            "Supervisor",
+            key="site_induction_supervisor",
+        )
+        supervisor_upload = None
+        if supervisor:
+            supervisor_upload = st.file_uploader(
+                "📄 Upload Supervisor Certificate",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_supervisor_upload",
+            )
+        smsts = _render_site_induction_yes_no_field(
+            "SMSTS",
+            key="site_induction_smsts",
+        )
+        smsts_upload = None
+        if smsts:
+            smsts_upload = st.file_uploader(
+                "📄 Upload SMSTS Certificate",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_smsts_upload",
+            )
+    with plant_section:
+        operate_plant = _render_site_induction_yes_no_field(
+            "Are you operating plant?",
+            key="site_induction_operate_plant",
+        )
+        cpcs_no = ""
+        cpcs_expiry = None
+        cpcs_card_upload = None
+        if operate_plant:
+            cpcs_no = st.text_input(
+                "CPCS No.",
+                key="site_induction_cpcs_no",
+            )
+            cpcs_expiry = st.date_input(
+                "CPCS Expiry",
+                value=None,
+                format="DD/MM/YYYY",
+                key="site_induction_cpcs_expiry",
+            )
+            cpcs_card_upload = st.file_uploader(
+                "📸 Upload CPCS Card",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=False,
+                key="site_induction_cpcs_card_upload",
+            )
+        client_training_desc = st.text_area(
+            "Client Specific Training",
+            key="site_induction_client_training_desc",
+            height=110,
+            placeholder="Describe any client-specific training completed",
+        )
+        training_date_columns = st.columns(2)
+        with training_date_columns[0]:
+            client_training_date = st.date_input(
+                "Training Date",
+                value=None,
+                format="DD/MM/YYYY",
+                key="site_induction_client_training_date",
+            )
+        with training_date_columns[1]:
+            client_training_expiry = st.date_input(
+                "Training Expiry",
+                value=None,
+                format="DD/MM/YYYY",
+                key="site_induction_client_training_expiry",
+            )
+        client_training_upload = st.file_uploader(
+            "📄 Upload Client Training Evidence",
+            type=["png", "jpg", "jpeg", "pdf"],
+            accept_multiple_files=False,
+            key="site_induction_client_training_upload",
+        )
+
+    st.caption(
+        "On mobile, tap each upload field to take a live photo of the relevant card or certificate."
+    )
+    competency_expiry_date = st.date_input(
+        "📅 Primary Competency Card Expiry Date",
+        format="DD/MM/YYYY",
+        key="site_induction_competency_expiry_date",
+    )
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Operative Signature</div>",
+        unsafe_allow_html=True,
+    )
+    canvas_revision = int(st.session_state.get("site_induction_canvas_revision", 0))
+    canvas_result = st_canvas(
+        update_streamlit=True,
+        key=f"site_induction_canvas_{canvas_revision}",
+        height=200,
+        width=420,
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#ffffff",
+        drawing_mode="freedraw",
+        display_toolbar=False,
+    )
+
+    action_columns = (
+        st.columns([0.28, 0.32, 0.40], gap="medium")
+        if is_kiosk
+        else st.columns([0.24, 0.24, 0.52], gap="large")
+    )
+    with action_columns[0]:
+        if st.button(
+            "🧽 Clear Signature",
+            key="clear_site_induction_signature",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["site_induction_canvas_revision"] = canvas_revision + 1
+            st.rerun()
+    with action_columns[1]:
+        if st.button(
+            "↺ Clear Induction Form",
+            key="clear_site_induction_form",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["site_induction_reset_pending"] = True
+            st.session_state["site_induction_canvas_revision"] = canvas_revision + 1
+            st.session_state.pop("site_induction_kiosk_complete_name", None)
+            st.session_state.pop("site_induction_kiosk_complete_at", None)
+            st.rerun()
+    with action_columns[2]:
+        if st.button("✅ Submit Induction", width="stretch"):
+            try:
+                if selected_company_option == "-- Select Company --":
+                    raise ValidationError(
+                        "Please select or enter your company name."
+                    )
+                resolved_company_name = (
+                    company.strip()
+                    if selected_company_option == "🏢 New Company (Type Below)"
+                    else selected_company_option.strip()
+                )
+                if not resolved_company_name:
+                    raise ValidationError(
+                        "Please select or enter your company name."
+                    )
+                generated_document = create_site_induction_document(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    full_name=full_name,
+                    home_address=home_address,
+                    contact_number=contact_number,
+                    company=resolved_company_name,
+                    occupation=occupation,
+                    emergency_contact=emergency_contact,
+                    emergency_tel=emergency_tel,
+                    medical=medical,
+                    cscs_number=cscs_number,
+                    cscs_expiry=cscs_expiry,
+                    asbestos_cert=asbestos_cert,
+                    erect_scaffold=erect_scaffold,
+                    cisrs_no=cisrs_no,
+                    cisrs_expiry=cisrs_expiry,
+                    operate_plant=operate_plant,
+                    cpcs_no=cpcs_no,
+                    cpcs_expiry=cpcs_expiry,
+                    client_training_desc=client_training_desc,
+                    client_training_date=client_training_date,
+                    client_training_expiry=client_training_expiry,
+                    first_aider=first_aider,
+                    fire_warden=fire_warden,
+                    supervisor=supervisor,
+                    smsts=smsts,
+                    competency_expiry_date=competency_expiry_date,
+                    competency_files=_build_site_induction_competency_file_payloads(
+                        [
+                            ("CSCS Card", cscs_card_upload),
+                            ("Asbestos Certificate", asbestos_card_upload if asbestos_cert else None),
+                            ("CISRS Card", cisrs_card_upload if erect_scaffold else None),
+                            ("First Aid Certificate", first_aider_upload if first_aider else None),
+                            ("Fire Warden Certificate", fire_warden_upload if fire_warden else None),
+                            ("Supervisor Certificate", supervisor_upload if supervisor else None),
+                            ("SMSTS Certificate", smsts_upload if smsts else None),
+                            ("CPCS Card", cpcs_card_upload if operate_plant else None),
+                            ("Client Training Evidence", client_training_upload),
+                        ]
+                    ),
+                    signature_image_data=canvas_result.image_data,
+                )
+            except ValidationError as exc:
+                st.error(str(exc))
+            except TemplateValidationError as exc:
+                st.error(f"Official induction template failed validation: {exc}")
+            except FileNotFoundError as exc:
+                st.error(f"Induction template not found: {exc}")
+            except Exception as exc:
+                st.error(f"Unable to complete induction: {exc}")
+            else:
+                st.session_state["site_induction_reset_pending"] = True
+                st.session_state["site_induction_canvas_revision"] = canvas_revision + 1
+                if is_kiosk:
+                    _route_kiosk_to_induction_station(kiosk_view="induction")
+                    st.session_state["site_induction_kiosk_complete_name"] = (
+                        generated_document.induction_document.individual_name
+                    )
+                    st.session_state["site_induction_kiosk_complete_at"] = time.time()
+                else:
+                    st.session_state["site_induction_flash"] = (
+                        "Induction Complete. Welcome to site, "
+                        f"{generated_document.induction_document.individual_name}!"
+                    )
+                st.rerun()
+    if not is_kiosk:
+        with action_columns[2]:
+            st.caption(f"Site: {project_setup.current_site_name}")
+            st.caption("Template: templates/UHSF16.01_Template.docx")
+            st.caption(f"Signatures: {FILE_3_SIGNATURES_DIR.name}")
+            st.caption(f"Completed docs: {FILE_3_COMPLETED_INDUCTIONS_DIR.name}")
+
+
+def _render_manager_attendance_register_tab(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+    *,
+    induction_picker_records: List[InductionDocument],
+    active_attendance_entries: List[DailyAttendanceEntryDocument],
+    todays_attendance_entries: List[DailyAttendanceEntryDocument],
+) -> None:
+    """Render the live attendance register manager workspace."""
+
+    attendance_flash_message = st.session_state.pop(
+        "site_attendance_delete_flash",
+        None,
+    )
+    if attendance_flash_message:
+        st.success(attendance_flash_message)
+
+    st.caption(
+        "Run the live sign-in console, monitor who is on site, and keep an eye on competency risk from one operational view."
+    )
+    _render_competency_compliance_radar(repository, active_attendance_entries)
+    _render_live_fire_roll_panel(active_attendance_entries)
+    _render_todays_attendance_activity_panel(todays_attendance_entries)
+
+    site_attendance_history = [
+        document
+        for document in repository.list_documents(
+            document_type=DailyAttendanceEntryDocument.document_type,
+            site_name=project_setup.current_site_name,
+        )
+        if isinstance(document, DailyAttendanceEntryDocument)
+    ]
+    pending_clear_today = bool(
+        st.session_state.get("site_attendance_clear_today_pending")
+    )
+    pending_clear_all = bool(
+        st.session_state.get("site_attendance_clear_all_pending")
+    )
+
+    with st.expander("Reset Attendance Data", expanded=False):
+        st.caption(
+            "Use these controls when you need to wipe test sign-ins or start the attendance station from a clean slate."
+        )
+        reset_metrics = st.columns(3, gap="large")
+        with reset_metrics[0]:
+            _render_inline_metric(
+                "Today Entries",
+                str(len(todays_attendance_entries)),
+                icon="📅",
+            )
+        with reset_metrics[1]:
+            _render_inline_metric(
+                "On Site Now",
+                str(len(active_attendance_entries)),
+                icon="🔥",
+            )
+        with reset_metrics[2]:
+            _render_inline_metric(
+                "Site History",
+                str(len(site_attendance_history)),
+                icon="🗃️",
+            )
+
+        reset_action_columns = st.columns(2, gap="medium")
+        with reset_action_columns[0]:
+            if st.button(
+                "🗑️ Clear Today's Attendance",
+                key="clear-todays-attendance",
+                width="stretch",
+                type="secondary",
+                disabled=not todays_attendance_entries,
+            ):
+                st.session_state["site_attendance_clear_today_pending"] = True
+                st.session_state.pop("site_attendance_clear_all_pending", None)
+                st.rerun()
+        with reset_action_columns[1]:
+            if st.button(
+                "🧨 Clear All Site Attendance History",
+                key="clear-all-site-attendance",
+                width="stretch",
+                type="secondary",
+                disabled=not site_attendance_history,
+            ):
+                st.session_state["site_attendance_clear_all_pending"] = True
+                st.session_state.pop("site_attendance_clear_today_pending", None)
+                st.rerun()
+
+        if pending_clear_today:
+            st.warning(
+                "Clear today's attendance activity for this site? This will remove the "
+                "saved sign-in/sign-out records and attempt to delete the linked "
+                "attendance signature files."
+            )
+            clear_today_columns = st.columns([1.2, 1.0, 4.0], gap="small")
+            if clear_today_columns[0].button(
+                "Confirm Clear Today",
+                key="confirm-clear-todays-attendance",
+                width="stretch",
+            ):
+                deleted_paths = repository.delete_documents_and_files(
+                    entry.doc_id for entry in todays_attendance_entries
+                )
+                st.session_state.pop("site_attendance_clear_today_pending", None)
+                _reset_site_attendance_form_state()
+                st.session_state["site_attendance_delete_flash"] = (
+                    f"Cleared {len(todays_attendance_entries)} attendance record(s) for today."
+                    + (
+                        f" Removed {len(deleted_paths)} linked file(s)."
+                        if deleted_paths
+                        else " No linked files were present on disk."
+                    )
+                )
+                st.rerun()
+            if clear_today_columns[1].button(
+                "Cancel",
+                key="cancel-clear-todays-attendance",
+                width="stretch",
+            ):
+                st.session_state.pop("site_attendance_clear_today_pending", None)
+                st.rerun()
+
+        if pending_clear_all:
+            st.warning(
+                "Clear all saved attendance history for this site? This wipes the site's "
+                "full UHSF16.09 attendance history and linked signature files."
+            )
+            clear_all_columns = st.columns([1.2, 1.0, 4.0], gap="small")
+            if clear_all_columns[0].button(
+                "Confirm Clear All",
+                key="confirm-clear-all-site-attendance",
+                width="stretch",
+            ):
+                deleted_paths = repository.delete_documents_and_files(
+                    entry.doc_id for entry in site_attendance_history
+                )
+                st.session_state.pop("site_attendance_clear_all_pending", None)
+                _reset_site_attendance_form_state()
+                st.session_state["site_attendance_delete_flash"] = (
+                    f"Cleared {len(site_attendance_history)} attendance record(s) for "
+                    f"{project_setup.current_site_name}."
+                    + (
+                        f" Removed {len(deleted_paths)} linked file(s)."
+                        if deleted_paths
+                        else " No linked files were present on disk."
+                    )
+                )
+                st.rerun()
+            if clear_all_columns[1].button(
+                "Cancel",
+                key="cancel-clear-all-site-attendance",
+                width="stretch",
+            ):
+                st.session_state.pop("site_attendance_clear_all_pending", None)
+                st.rerun()
+
+    st.divider()
+    st.markdown(
+        "<div class='file-2-section-heading'>Daily Attendance Console</div>",
+        unsafe_allow_html=True,
+    )
+    _render_site_attendance_console(
+        repository,
+        project_setup=project_setup,
+        site_name=project_setup.current_site_name,
+        public_url=project_setup.public_tunnel_url,
+        induction_picker_records=induction_picker_records,
+        active_attendance_entries=active_attendance_entries,
+        is_kiosk=False,
+    )
+
+
+def _render_manager_attendance_export_tab(
+    repository: DocumentRepository,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render poster generation and attendance print controls."""
+
+    st.caption(
+        "Generate the live kiosk poster and print any saved UHSF16.09 attendance day into the official File 2 register."
+    )
+    poster_action_columns = st.columns([1.1, 2.4], gap="large")
+    with poster_action_columns[0]:
+        if st.button(
+            "🪧 Generate Site Poster",
+            key="generate_site_induction_poster",
+            width="stretch",
+        ):
+            try:
+                poster = generate_site_induction_poster(
+                    site_name=project_setup.current_site_name,
+                    logo_path=UPLANDS_LOGO if UPLANDS_LOGO.exists() else None,
+                    public_url=project_setup.public_tunnel_url,
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unable to generate the site poster: {exc}")
+            else:
+                st.session_state["site_induction_poster_png"] = poster.poster_png
+                st.session_state["site_induction_qr_png"] = poster.qr_code_png
+                st.session_state["site_induction_qr_url"] = poster.induction_url
+    with poster_action_columns[1]:
+        st.caption(ATTENDANCE_FORM_METADATA)
+
+    poster_png = st.session_state.get("site_induction_poster_png")
+    qr_png = st.session_state.get("site_induction_qr_png")
+    qr_url = st.session_state.get("site_induction_qr_url")
+    if poster_png and qr_png and qr_url:
+        poster_columns = st.columns([0.52, 0.48], gap="large")
+        with poster_columns[0]:
+            st.markdown(
+                (
+                    "<div class='panel-card'>"
+                    "<div class='panel-heading'>Poster Preview</div>"
+                    "<div class='panel-title'>SCAN TO SIGN IN</div>"
+                    "<div class='panel-caption'>"
+                    "Daily attendance QR for operatives arriving on site."
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            if UPLANDS_LOGO.exists():
+                st.image(str(UPLANDS_LOGO), width=260)
+            st.image(qr_png, width=360)
+            st.caption(qr_url)
+            st.download_button(
+                "Download Poster",
+                data=poster_png,
+                file_name=(
+                    "Site_Induction_Poster_"
+                    f"{re.sub(r'[^A-Za-z0-9]+', '_', project_setup.current_site_name).strip('_') or 'Site'}"
+                    ".png"
+                ),
+                mime="image/png",
+                width="stretch",
+                key="download_site_induction_poster",
+            )
+        with poster_columns[1]:
+            st.image(
+                poster_png,
+                caption="Printable site sign-in poster",
+                width="stretch",
+            )
+
+    if "attendance_register_print_date" not in st.session_state:
+        st.session_state["attendance_register_print_date"] = date.today()
+
+    shortcut_columns = st.columns(4, gap="small")
+    with shortcut_columns[0]:
+        if st.button(
+            "Today",
+            key="attendance_register_date_today",
+            width="stretch",
+        ):
+            st.session_state["attendance_register_print_date"] = date.today()
+            st.rerun()
+    with shortcut_columns[1]:
+        if st.button(
+            "Yesterday",
+            key="attendance_register_date_yesterday",
+            width="stretch",
+        ):
+            st.session_state["attendance_register_print_date"] = (
+                date.today() - timedelta(days=1)
+            )
+            st.rerun()
+    with shortcut_columns[2]:
+        if st.button(
+            "This Monday",
+            key="attendance_register_date_monday",
+            width="stretch",
+        ):
+            st.session_state["attendance_register_print_date"] = (
+                date.today() - timedelta(days=date.today().weekday())
+            )
+            st.rerun()
+    with shortcut_columns[3]:
+        if st.button(
+            "Last Friday",
+            key="attendance_register_date_last_friday",
+            width="stretch",
+        ):
+            days_since_friday = (date.today().weekday() - 4) % 7
+            if days_since_friday == 0:
+                days_since_friday = 7
+            st.session_state["attendance_register_print_date"] = (
+                date.today() - timedelta(days=days_since_friday)
+            )
+            st.rerun()
+
+    selected_register_date = st.date_input(
+        "Register Date",
+        max_value=date.today(),
+        key="attendance_register_print_date",
+    )
+    selected_register_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=selected_register_date,
+        active_only=False,
+    )
+
+    print_columns = st.columns([0.9, 0.75, 1.45], gap="large")
+    with print_columns[0]:
+        if st.button(
+            "🖨️ Print Attendance Register",
+            key="print_daily_attendance_register",
+            width="stretch",
+        ):
+            try:
+                generated_register = generate_attendance_register_document(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    on_date=selected_register_date,
+                )
+            except TemplateValidationError as exc:
+                st.error(
+                    f"Official attendance register template failed validation: {exc}"
+                )
+            except Exception as exc:
+                st.error(f"Unable to generate attendance register: {exc}")
+            else:
+                _open_file_for_printing(generated_register.output_path)
+                st.success(
+                    f"Attendance register ready: {generated_register.output_path}"
+                )
+                st.caption(
+                    "Rows printed: "
+                    f"{generated_register.row_count} | Output folder: "
+                    f"{FILE_2_ATTENDANCE_OUTPUT_DIR.name}"
+                )
+    with print_columns[1]:
+        _render_inline_metric(
+            "Selected Day Rows",
+            str(len(selected_register_entries)),
+            icon="📋",
+        )
+    with print_columns[2]:
+        st.caption(
+            "Print any saved UHSF16.09 day into the official File 2 register, including the live sign-in and sign-out signatures."
+        )
+        st.caption(
+            f"Current print date: {selected_register_date.strftime('%d/%m/%Y')}"
+        )
 
 
 def _render_site_induction_station(
     repository: DocumentRepository,
     project_setup: ProjectSetup,
-) -> None:
-    """Render the mobile-responsive induction sign-in kiosk."""
+    *,
+    is_kiosk: bool = False,
+    ) -> None:
+    """Render the UHSF16.09 attendance station plus manager induction tools."""
 
+    if st.session_state.pop("site_attendance_reset_pending", False):
+        _reset_site_attendance_form_state()
     if st.session_state.pop("site_induction_reset_pending", False):
         _reset_site_induction_form_state()
+    if "site_induction_competency_expiry_date" not in st.session_state:
+        st.session_state["site_induction_competency_expiry_date"] = (
+            date.today() + timedelta(days=365)
+        )
 
-    flash_message = st.session_state.pop("site_induction_flash", None)
-    if flash_message is not None:
-        st.success(flash_message)
-    delete_flash_message = st.session_state.pop("site_induction_delete_flash", None)
-    if delete_flash_message is not None:
-        st.success(delete_flash_message)
+    kiosk_active_view = (
+        _get_kiosk_view_from_query_params()
+        or str(st.session_state.get("site_kiosk_active_view", "attendance")).strip().lower()
+    )
+    if kiosk_active_view not in {"attendance", "induction"}:
+        kiosk_active_view = "attendance"
+        st.session_state["site_kiosk_active_view"] = kiosk_active_view
+
+    if is_kiosk:
+        completed_message = str(
+            st.session_state.get("site_attendance_kiosk_complete_message", "")
+        )
+        completed_at = float(
+            st.session_state.get("site_attendance_kiosk_complete_at", 0.0)
+        )
+        if completed_message and completed_at and (time.time() - completed_at) >= 10:
+            st.session_state.pop("site_attendance_kiosk_complete_message", None)
+            st.session_state.pop("site_attendance_kiosk_complete_at", None)
+            _route_kiosk_to_induction_station(kiosk_view="attendance")
+            st.rerun()
+    else:
+        completed_message = ""
+        st.session_state.pop("site_kiosk_active_view", None)
+        st.session_state.pop("site_attendance_kiosk_complete_message", None)
+        st.session_state.pop("site_attendance_kiosk_complete_at", None)
+        st.session_state.pop("site_induction_kiosk_complete_name", None)
+        st.session_state.pop("site_induction_kiosk_complete_at", None)
+        attendance_flash_message = st.session_state.pop("site_attendance_flash", None)
+        if attendance_flash_message is not None:
+            st.success(attendance_flash_message)
+        induction_flash_message = st.session_state.pop("site_induction_flash", None)
+        if induction_flash_message is not None:
+            st.success(induction_flash_message)
+        delete_flash_message = st.session_state.pop("site_induction_delete_flash", None)
+        if delete_flash_message is not None:
+            st.success(delete_flash_message)
 
     try:
         from streamlit_drawable_canvas import st_canvas
@@ -2891,192 +8946,258 @@ def _render_site_induction_station(
         key=lambda document: (document.created_at, document.individual_name.casefold()),
         reverse=True,
     )
+    induction_picker_records = _build_induction_picker_records(inductions)
+    induction_company_options = _build_induction_company_options(
+        repository,
+        site_name=project_setup.current_site_name,
+        induction_documents=inductions,
+    )
+    todays_attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=date.today(),
+        active_only=False,
+    )
+    active_attendance_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=date.today(),
+        active_only=True,
+    )
 
-    summary_columns = st.columns([1.2, 0.8], gap="large")
-    with summary_columns[0]:
+    if UPLANDS_LOGO.exists():
+        logo_columns = st.columns([1, 1.2, 1])
+        with logo_columns[1]:
+            st.image(str(UPLANDS_LOGO), width="stretch")
+
+    if is_kiosk and kiosk_active_view == "attendance":
         st.markdown(
             (
                 "<div class='panel-card'>"
-                "<div class='panel-heading'>Induction Kiosk</div>"
-                "<div class='panel-title'>UHSF16.01 Mobile Sign-In</div>"
+                "<div class='panel-heading'>📅 SITE ATTENDANCE REGISTER (UHSF16.09)</div>"
+                "<div class='panel-title'>Daily Sign-In / Sign-Out</div>"
                 "<div class='panel-caption'>"
-                "Complete the operative induction, capture the signature, and generate the signed Word record in one flow."
+                "Select your inducted record, sign in or out, and sign on screen."
                 "</div>"
                 "</div>"
             ),
             unsafe_allow_html=True,
         )
-    with summary_columns[1]:
-        _render_metric_card(
-            title="Inductions Logged",
-            icon="📝",
-            value=str(len(inductions)),
-            caption="Completed induction records saved for the active project.",
-            body_html=(
-                "<div class='data-card-subtext'>"
-                f"Output: <strong>{html.escape(FILE_3_COMPLETED_INDUCTIONS_DIR.name)}</strong>"
+        if completed_message:
+            st.success(completed_message)
+            st.info("Please return the device or close the tab. This form will reset automatically.")
+            components.html(
+                """
+                <script>
+                setTimeout(function () {
+                    const url = new URL(window.parent.location.href);
+                    url.searchParams.set("station", "induction");
+                    url.searchParams.set("mode", "kiosk");
+                    url.searchParams.set("kiosk_view", "attendance");
+                    window.parent.location.href = url.toString();
+                }, 10000);
+                </script>
+                """,
+                height=0,
+            )
+            return
+        _render_kiosk_new_starter_call_to_action()
+        _render_site_attendance_console(
+            repository,
+            project_setup=project_setup,
+            site_name=project_setup.current_site_name,
+            public_url=project_setup.public_tunnel_url,
+            induction_picker_records=induction_picker_records,
+            active_attendance_entries=active_attendance_entries,
+            is_kiosk=True,
+        )
+        return
+    if is_kiosk and kiosk_active_view == "induction":
+        induction_complete_name = str(
+            st.session_state.get("site_induction_kiosk_complete_name", "")
+        ).strip()
+        induction_complete_at = float(
+            st.session_state.get("site_induction_kiosk_complete_at", 0.0)
+        )
+        if (
+            induction_complete_name
+            and induction_complete_at
+            and (time.time() - induction_complete_at) >= 8
+        ):
+            st.session_state.pop("site_induction_kiosk_complete_name", None)
+            st.session_state.pop("site_induction_kiosk_complete_at", None)
+            _route_kiosk_to_induction_station(kiosk_view="attendance")
+            st.session_state["site_attendance_action_mode"] = "sign_in"
+            st.session_state["site_attendance_worker_search"] = induction_complete_name
+            st.session_state["site_attendance_selected_induction_doc_id"] = ""
+            st.rerun()
+        st.markdown(
+            (
+                "<div class='panel-card'>"
+                "<div class='panel-heading'>📝 UHSF16.01 SITE INDUCTION</div>"
+                "<div class='panel-title'>First-Time Site Induction</div>"
+                "<div class='panel-caption'>"
+                "Complete your induction below. Once submitted, the kiosk will return you to Daily Attendance so you can sign in."
+                "</div>"
                 "</div>"
             ),
+            unsafe_allow_html=True,
         )
-
-    if st.button("Generate Site Poster", key="generate_site_induction_poster", use_container_width=False):
-        try:
-            poster = generate_site_induction_poster(
-                site_name=project_setup.current_site_name,
-                logo_path=UPLANDS_LOGO if UPLANDS_LOGO.exists() else None,
+        if st.button(
+            "← Back to Daily Attendance",
+            key="return_kiosk_to_attendance",
+            width="stretch",
+            type="secondary",
+        ):
+            _route_kiosk_to_induction_station(kiosk_view="attendance")
+            st.session_state["site_induction_reset_pending"] = True
+            st.session_state["site_induction_canvas_revision"] = (
+                int(st.session_state.get("site_induction_canvas_revision", 0)) + 1
             )
-        except RuntimeError as exc:
-            st.error(str(exc))
-        except Exception as exc:
-            st.error(f"Unable to generate the site poster: {exc}")
-        else:
-            st.session_state["site_induction_poster_png"] = poster.poster_png
-            st.session_state["site_induction_qr_png"] = poster.qr_code_png
-            st.session_state["site_induction_qr_url"] = poster.induction_url
+            components.html(
+                """
+                <script>
+                const url = new URL(window.parent.location.href);
+                url.searchParams.set("station", "induction");
+                url.searchParams.set("mode", "kiosk");
+                url.searchParams.set("kiosk_view", "attendance");
+                window.parent.location.href = url.toString();
+                </script>
+                """,
+                height=0,
+            )
+            st.stop()
+        if induction_complete_name and induction_complete_at:
+            st.success(
+                f"Induction Complete. Welcome to site, {induction_complete_name}!"
+            )
+            st.info(
+                "Returning you to Daily Attendance so you can sign in for the day."
+            )
+            components.html(
+                """
+                <script>
+                setTimeout(function () {
+                    const url = new URL(window.parent.location.href);
+                    url.searchParams.set("station", "induction");
+                    url.searchParams.set("mode", "kiosk");
+                    url.searchParams.set("kiosk_view", "attendance");
+                    window.parent.location.href = url.toString();
+                }, 8000);
+                </script>
+                """,
+                height=0,
+            )
+            return
 
-    poster_png = st.session_state.get("site_induction_poster_png")
-    qr_png = st.session_state.get("site_induction_qr_png")
-    qr_url = st.session_state.get("site_induction_qr_url")
-    if poster_png and qr_png and qr_url:
-        poster_columns = st.columns([0.52, 0.48], gap="large")
-        with poster_columns[0]:
+    if not is_kiosk:
+        _render_workspace_hero(
+            icon="🦺",
+            kicker="Live Operations",
+            title="Site Attendance & Induction",
+            caption="Run the live gate, manage first-time inductions, watch the fire roll, and print the official attendance record from one workspace.",
+        )
+        summary_columns = st.columns([1.2, 0.8], gap="large")
+        with summary_columns[0]:
             st.markdown(
                 (
                     "<div class='panel-card'>"
-                    "<div class='panel-heading'>Poster Preview</div>"
-                    "<div class='panel-title'>SCAN TO SIGN IN</div>"
+                    "<div class='panel-heading'>📅 SITE ATTENDANCE REGISTER (UHSF16.09)</div>"
+                    f"<div class='panel-title'>{html.escape(project_setup.current_site_name)} Daily Sign-In Engine</div>"
                     "<div class='panel-caption'>"
-                    "1. Scan QR Code  2. Complete Induction  3. Sign on Screen"
+                    "Live sign-in, sign-out, fire roll, and vehicle visibility powered by existing induction records."
                     "</div>"
                     "</div>"
                 ),
                 unsafe_allow_html=True,
             )
-            if UPLANDS_LOGO.exists():
-                st.image(str(UPLANDS_LOGO), width=220)
-            st.image(qr_png, width=320)
-            st.caption(qr_url)
-            st.download_button(
-                "Download Poster",
-                data=poster_png,
-                file_name=(
-                    "Site_Induction_Poster_"
-                    f"{re.sub(r'[^A-Za-z0-9]+', '_', project_setup.current_site_name).strip('_') or 'Site'}"
-                    ".png"
+        with summary_columns[1]:
+            _render_metric_card(
+                title="Inductions Available",
+                icon="📝",
+                value=str(len(induction_picker_records)),
+                caption="Inducted operatives available for fast daily sign-in.",
+                body_html=(
+                    "<div class='data-card-subtext'>"
+                    f"Signatures folder: <strong>{html.escape(FILE_2_ATTENDANCE_SIGNATURES_DIR.name)}</strong>"
+                    "</div>"
                 ),
-                mime="image/png",
-                use_container_width=True,
-                key="download_site_induction_poster",
             )
-        with poster_columns[1]:
-            st.image(poster_png, caption="Printable site sign-in poster", use_container_width=True)
 
-    detail_columns = st.columns(2, gap="large")
-    with detail_columns[0]:
-        full_name = st.text_input("Full Name", key="site_induction_full_name")
-        home_address = st.text_input("Home Address", key="site_induction_home_address")
-        contact_number = st.text_input(
-            "Contact Number",
-            key="site_induction_contact_number",
-        )
-        company = st.text_input("Company", key="site_induction_company")
-        occupation = st.text_input("Occupation", key="site_induction_occupation")
-    with detail_columns[1]:
-        emergency_contact = st.text_input(
-            "Emergency Contact",
-            key="site_induction_emergency_contact",
-        )
-        emergency_tel = st.text_input(
-            "Emergency Tel",
-            key="site_induction_emergency_tel",
-        )
-        medical = st.text_input("Medical", key="site_induction_medical")
-        cscs_number = st.text_input("CSCS No.", key="site_induction_cscs_number")
-        role_columns = st.columns(2)
-        with role_columns[0]:
-            first_aider = st.checkbox("First Aider", key="site_induction_first_aider")
-            fire_warden = st.checkbox("Fire Warden", key="site_induction_fire_warden")
-        with role_columns[1]:
-            supervisor = st.checkbox("Supervisor", key="site_induction_supervisor")
-            smsts = st.checkbox("SMSTS", key="site_induction_smsts")
+        with st.expander("Induction Admin", expanded=False):
+            _render_site_induction_bulk_reset_panel(repository, inductions)
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Operative Signature</div>",
-        unsafe_allow_html=True,
-    )
-    canvas_revision = int(st.session_state.get("site_induction_canvas_revision", 0))
-    canvas_result = st_canvas(
-        update_streamlit=True,
-        key=f"site_induction_canvas_{canvas_revision}",
-        height=200,
-        width=420,
-        stroke_width=3,
-        stroke_color="#000000",
-        background_color="#ffffff",
-        drawing_mode="freedraw",
-        display_toolbar=False,
-    )
-
-    submit_columns = st.columns([0.65, 0.35], gap="large")
-    with submit_columns[0]:
-        if st.button("Submit Induction", use_container_width=True):
-            try:
-                generated_document = create_site_induction_document(
-                    repository,
-                    site_name=project_setup.current_site_name,
-                    full_name=full_name,
-                    home_address=home_address,
-                    contact_number=contact_number,
-                    company=company,
-                    occupation=occupation,
-                    emergency_contact=emergency_contact,
-                    emergency_tel=emergency_tel,
-                    medical=medical,
-                    cscs_number=cscs_number,
-                    first_aider=first_aider,
-                    fire_warden=fire_warden,
-                    supervisor=supervisor,
-                    smsts=smsts,
-                    signature_image_data=canvas_result.image_data,
-                )
-            except ValidationError as exc:
-                st.error(str(exc))
-            except TemplateValidationError as exc:
-                st.error(f"Official induction template failed validation: {exc}")
-            except FileNotFoundError as exc:
-                st.error(f"Induction template not found: {exc}")
-            except Exception as exc:
-                st.error(f"Unable to complete induction: {exc}")
-            else:
+        manager_tabs = st.tabs(
+            ["Daily Register", "Print & Export", "Manual Induction", "Recent Inductions"]
+        )
+        with manager_tabs[0]:
+            _render_manager_attendance_register_tab(
+                repository,
+                project_setup,
+                induction_picker_records=induction_picker_records,
+                active_attendance_entries=active_attendance_entries,
+                todays_attendance_entries=todays_attendance_entries,
+            )
+        with manager_tabs[1]:
+            _render_manager_attendance_export_tab(repository, project_setup)
+        with manager_tabs[2]:
+            st.markdown(
+                "<div class='file-2-section-heading'>UHSF16.01 Induction Capture</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Use the induction builder below when a new operative needs their first site induction before appearing in the daily sign-in list."
+            )
+            if st.button(
+                "↺ Reset Manual Induction Form",
+                key="manager_reset_site_induction_form",
+                width="stretch",
+            ):
                 st.session_state["site_induction_reset_pending"] = True
-                st.session_state["site_induction_canvas_revision"] = canvas_revision + 1
+                st.session_state["site_induction_canvas_revision"] = (
+                    int(st.session_state.get("site_induction_canvas_revision", 0)) + 1
+                )
+                st.session_state.pop("site_induction_kiosk_complete_name", None)
+                st.session_state.pop("site_induction_kiosk_complete_at", None)
                 st.session_state["site_induction_flash"] = (
-                    "Induction Complete. Welcome to site, "
-                    f"{generated_document.induction_document.individual_name}!"
+                    "Manual induction form reset."
                 )
                 st.rerun()
-    with submit_columns[1]:
-        st.caption(f"Site: {project_setup.current_site_name}")
-        st.caption("Template: templates/UHSF16.01_Template.docx")
-        st.caption(f"Signatures: {FILE_3_SIGNATURES_DIR.name}")
-        st.caption(f"Completed docs: {FILE_3_COMPLETED_INDUCTIONS_DIR.name}")
+            st.caption(
+                "Reset clears the current manual induction form, signature canvas, and any staged competency uploads."
+            )
+            with st.expander("Open Manual Induction Builder", expanded=False):
+                _render_site_induction_capture_form(
+                    repository,
+                    project_setup,
+                    induction_company_options=induction_company_options,
+                    is_kiosk=False,
+                    st_canvas=st_canvas,
+                )
+        with manager_tabs[3]:
+            st.markdown(
+                (
+                    "<div class='panel-card'>"
+                    "<div class='panel-heading'>Recent Submissions</div>"
+                    "<div class='panel-title'>Completed Inductions</div>"
+                    "<div class='panel-caption'>"
+                    "Review, remove, or fully reset the saved induction records for the active site."
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            _render_site_induction_recent_submissions(repository, inductions)
+        return
 
-    if inductions:
-        st.markdown(
-            (
-                "<div class='panel-card'>"
-                "<div class='panel-heading'>Recent Submissions</div>"
-                "<div class='panel-title'>Completed Inductions</div>"
-                "<div class='panel-caption'>"
-                "Latest induction records saved to SQLite for the active site."
-                "</div>"
-                "</div>"
-            ),
-            unsafe_allow_html=True,
-        )
-        _render_site_induction_recent_submissions(repository, inductions)
-    else:
-        st.info("No inductions have been logged for this site yet.")
+    _render_site_induction_capture_form(
+        repository,
+        project_setup,
+        induction_company_options=induction_company_options,
+        is_kiosk=True,
+        st_canvas=st_canvas,
+    )
+    return
 
 
 def _render_file_4_station(
@@ -3085,6 +9206,12 @@ def _render_file_4_station(
 ) -> None:
     """Render File 4: Permits & Temp Works."""
 
+    _render_workspace_hero(
+        icon="⚡",
+        kicker="File 4",
+        title="Permits & Temp Works",
+        caption="Issue permits from live roster data, maintain the running permit history, and keep the physical register ready to print.",
+    )
     roster = build_site_worker_roster(site_name=project_setup.current_site_name)
     worker_options = _build_file_4_worker_options(
         repository,
@@ -3160,90 +9287,122 @@ def _render_file_4_station(
             ),
         )
 
-    columns = st.columns(2)
-    with columns[0]:
-        _render_file_list_panel(
-            heading="Permit Control",
-            title="UHSF21.09 Helper",
-            caption="Use the File 4 quick action in the sidebar to issue a ladder permit against the live contractor roster.",
-            items=[
-                "Worker is selected from the live JSON-driven contractor roster.",
-                "Company is auto-filled from the selected roster entry.",
-                "The official registered template is used as the only output source.",
-            ],
-            empty_message="No permit controls are configured.",
+    overview_tab, register_tab = st.tabs(["Permit Control", "Live Register"])
+    with overview_tab:
+        _render_workspace_zone_heading(
+            "Primary Action",
+            "Issue new ladder permits from the File 4 helper, then use the latest output panel here to check what has just been created.",
         )
-    with columns[1]:
-        _render_file_list_panel(
-            heading="Latest Permits",
-            title="Recent File 4 Output",
-            caption="Most recent ladder permits stored for printing and signature.",
-            items=[
-                (
-                    f"{permit.permit_number} | {permit.worker_name or '-'} | "
-                    f"{permit.location_of_work} | {permit.created_at.strftime('%Y-%m-%d %H:%M')}"
-                )
-                for permit in sorted(
-                    ladder_permits,
-                    key=lambda item: item.created_at,
-                    reverse=True,
-                )[:5]
-            ],
-            empty_message="No ladder permits have been generated yet.",
+        columns = st.columns(2)
+        with columns[0]:
+            _render_file_list_panel(
+                heading="Permit Control",
+                title="UHSF21.09 Helper",
+                caption="Use the File 4 quick action in the sidebar to issue a ladder permit against the live contractor roster.",
+                items=[
+                    "Worker is selected from the live JSON-driven contractor roster.",
+                    "Company is auto-filled from the selected roster entry.",
+                    "The official registered template is used as the only output source.",
+                ],
+                empty_message="No permit controls are configured.",
+            )
+        with columns[1]:
+            _render_file_list_panel(
+                heading="Latest Permits",
+                title="Recent File 4 Output",
+                caption="Most recent ladder permits stored for printing and signature.",
+                items=[
+                    (
+                        f"{permit.permit_number} | {permit.worker_name or '-'} | "
+                        f"{permit.location_of_work} | {permit.created_at.strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    for permit in sorted(
+                        ladder_permits,
+                        key=lambda item: item.created_at,
+                        reverse=True,
+                    )[:5]
+                ],
+                empty_message="No ladder permits have been generated yet.",
+            )
+        st.divider()
+        _render_workspace_zone_heading(
+            "Export / Print",
+            "The printable physical register lives on the Live Register tab so the running permit history stays separate from the control notes.",
+        )
+        st.info(
+            "Use the File 4 quick action in the sidebar to generate a permit. Use the Live Register tab when you need to print the full physical register."
+        )
+    with register_tab:
+        register_summary_columns = st.columns(3)
+        with register_summary_columns[0]:
+            _render_inline_metric("Active Permits", str(len(ladder_permits)), icon="📄")
+        with register_summary_columns[1]:
+            _render_inline_metric("Draft Permits", str(len(draft_permits)), icon="✍️")
+        with register_summary_columns[2]:
+            _render_inline_metric("Indexed Files", str(len(indexed_permits)), icon="📚")
+
+        st.divider()
+        _render_workspace_zone_heading(
+            "Live Register / History",
+            "This is the current File 4 permit history used for the physical UHSF21.00 register.",
+        )
+        st.markdown(
+            "<div class='file-2-section-heading'>Live Permit Register</div>",
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            pd.DataFrame(
+                permit_register_rows,
+                columns=[
+                    "Permit Number",
+                    "Date Issued",
+                    "Worker Name",
+                    "Company",
+                    "Job Number",
+                    "Location",
+                ],
+            ),
+            width="stretch",
+            hide_index=True,
         )
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Live Permit Register</div>",
-        unsafe_allow_html=True,
-    )
-    action_columns = st.columns([1.1, 2.4])
-    with action_columns[0]:
-        if st.button(
-            "🖨️ Print Physical Register",
-            key="print_physical_register",
-            use_container_width=True,
-        ):
-            try:
-                generated_register = generate_permit_register_document(
-                    repository,
-                    site_name=project_setup.current_site_name,
-                    job_number=project_setup.job_number,
-                )
-            except TemplateValidationError as exc:
-                st.error(f"Permit register template failed validation: {exc}")
-            except Exception as exc:
-                st.error(f"Unable to generate the physical permit register: {exc}")
-            else:
-                _open_file_for_printing(generated_register.output_path)
-                st.success(
-                    "Physical permit register generated: "
-                    f"{generated_register.output_path}"
-                )
-                st.toast(
-                    f"Permit register ready: {generated_register.output_path.name}",
-                    icon="🖨️",
-                )
-    with action_columns[1]:
-        st.caption(
-            "Live File 4 permit register for the active project. "
-            "This table drives the printable UHSF21.00 register."
+        st.divider()
+        _render_workspace_zone_heading(
+            "Export / Print",
+            "Generate the official physical permit register from the live File 4 history.",
         )
-
-    st.dataframe(
-        pd.DataFrame(
-            permit_register_rows,
-            columns=[
-                "Permit Number",
-                "Date Issued",
-                "Worker Name",
-                "Company",
-                "Job Number",
-                "Location",
-            ],
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
+        action_columns = st.columns([1.1, 2.4])
+        with action_columns[0]:
+            if st.button(
+                "🖨️ Print Physical Register",
+                key="print_physical_register",
+                width="stretch",
+            ):
+                try:
+                    generated_register = generate_permit_register_document(
+                        repository,
+                        site_name=project_setup.current_site_name,
+                        job_number=project_setup.job_number,
+                    )
+                except TemplateValidationError as exc:
+                    st.error(f"Permit register template failed validation: {exc}")
+                except Exception as exc:
+                    st.error(f"Unable to generate the physical permit register: {exc}")
+                else:
+                    _open_file_for_printing(generated_register.output_path)
+                    st.success(
+                        "Physical permit register generated: "
+                        f"{generated_register.output_path}"
+                    )
+                    st.toast(
+                        f"Permit register ready: {generated_register.output_path.name}",
+                        icon="🖨️",
+                    )
+        with action_columns[1]:
+            st.caption(
+                "Live File 4 permit register for the active project. "
+                "This table drives the printable UHSF21.00 register."
+            )
 
 
 def _render_metric_card(
@@ -3268,6 +9427,32 @@ def _render_metric_card(
         ),
         unsafe_allow_html=True,
     )
+
+
+def _render_inline_metric(
+    label: str,
+    value: str,
+    *,
+    icon: str,
+    border: bool = True,
+) -> None:
+    """Render a compact metric with a subtle icon in the label."""
+
+    st.metric(f"{icon} {label}", value, border=border)
+
+
+def _render_workspace_zone_heading(
+    title: str,
+    caption: str = "",
+) -> None:
+    """Render a consistent section heading inside a manager workspace."""
+
+    st.markdown(
+        f"<div class='file-2-section-heading'>{html.escape(title)}</div>",
+        unsafe_allow_html=True,
+    )
+    if caption:
+        st.caption(caption)
 
 
 def _render_file_list_panel(
@@ -3298,6 +9483,102 @@ def _render_file_list_panel(
         ),
         unsafe_allow_html=True,
     )
+
+
+def _list_workspace_files(directory: Path) -> List[Path]:
+    """Return files in one workspace directory sorted newest-first."""
+
+    if not directory.exists():
+        return []
+    return sorted(
+        [
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and not path.name.startswith(".")
+            and not path.name.startswith("._")
+        ],
+        key=lambda path: (path.stat().st_mtime, path.name.casefold()),
+        reverse=True,
+    )
+
+
+def _format_workspace_file_size(byte_count: int) -> str:
+    """Return one human-readable file size string."""
+
+    size = float(byte_count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{int(byte_count)} B"
+
+
+def _build_workspace_file_rows(files: List[Path]) -> List[Dict[str, str]]:
+    """Return UI rows for one workspace file list."""
+
+    rows: List[Dict[str, str]] = []
+    for file_path in files:
+        file_stat = file_path.stat()
+        rows.append(
+            {
+                "File": file_path.name,
+                "Type": file_path.suffix.lstrip(".").upper() or "-",
+                "Updated": datetime.fromtimestamp(file_stat.st_mtime).strftime("%d/%m/%Y %H:%M"),
+                "Size": _format_workspace_file_size(file_stat.st_size),
+            }
+        )
+    return rows
+
+
+def _render_file_3_vault_tab(
+    *,
+    heading: str,
+    caption: str,
+    directory: Path,
+    files: List[Path],
+    selection_key: str,
+    open_folder_label: str,
+    empty_message: str,
+) -> None:
+    """Render one document-vault tab inside File 3."""
+
+    _render_workspace_zone_heading(heading, caption)
+    st.caption(f"Folder: {directory}")
+    if files:
+        st.dataframe(
+            pd.DataFrame(_build_workspace_file_rows(files)),
+            hide_index=True,
+            width="stretch",
+        )
+        selected_path = st.selectbox(
+            "Select Filed Document",
+            options=files,
+            format_func=lambda path: path.name,
+            key=selection_key,
+        )
+        action_columns = st.columns(3)
+        with action_columns[0]:
+            if st.button(open_folder_label, key=f"{selection_key}-open-folder", width="stretch"):
+                _open_workspace_path(directory)
+        with action_columns[1]:
+            if st.button("📂 Open Selected File", key=f"{selection_key}-open-file", width="stretch"):
+                _open_workspace_path(selected_path)
+        with action_columns[2]:
+            st.download_button(
+                "📥 Download Selected File",
+                data=selected_path.read_bytes(),
+                file_name=selected_path.name,
+                mime=_guess_download_mime_type(selected_path),
+                key=f"{selection_key}-download-file",
+                width="stretch",
+            )
+    else:
+        st.info(empty_message)
+        if st.button(open_folder_label, key=f"{selection_key}-open-folder-empty", width="stretch"):
+            _open_workspace_path(directory)
 
 
 def _render_site_worker_roster_table(site_workers: List[SiteWorker]) -> None:
@@ -3374,7 +9655,7 @@ def _render_site_worker_roster_table(site_workers: List[SiteWorker]) -> None:
     ]
     st.dataframe(
         pd.DataFrame(dataframe_rows),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -3387,9 +9668,42 @@ def _render_file_2_site_checks_panel(
 ) -> None:
     """Render the File 2 weekly template grid and latest result."""
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Daily/Weekly Site Checks</div>",
-        unsafe_allow_html=True,
+    selected_week_commencing = _current_week_commencing(
+        st.session_state.get(
+            "weekly_site_check_week_commencing",
+            _current_week_commencing(),
+        )
+    )
+    weekly_site_check = _get_weekly_site_check_for_week(
+        repository,
+        site_name=site_name,
+        week_commencing=selected_week_commencing,
+    )
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric(
+            "Latest Status",
+            _weekly_site_check_dashboard_status(latest_site_check),
+            icon="✅",
+        )
+    with summary_columns[1]:
+        _render_inline_metric(
+            "Week Commencing",
+            selected_week_commencing.strftime("%d/%m/%Y"),
+            icon="🗓️",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Saved This Week",
+            "Yes" if weekly_site_check is not None else "No",
+            icon="💾",
+        )
+
+    _render_workspace_hero(
+        icon="✅",
+        kicker="Daily Checks",
+        title="Daily / Weekly Site Checks",
+        caption="Run the live UHSF19.1 check sheet, save the active day, and generate the printable record when the week is ready.",
     )
     flash_message = st.session_state.pop("site_check_flash", None)
     if flash_message is not None:
@@ -3412,27 +9726,31 @@ def _render_file_2_site_checks_panel(
         st.error(f"Unable to load the UHSF19.1 checklist template structure: {exc}")
         return
 
-    selected_week_commencing = _current_week_commencing(
-        st.session_state.get(
-            "weekly_site_check_week_commencing",
-            _current_week_commencing(),
-        )
-    )
-    weekly_site_check = _get_weekly_site_check_for_week(
-        repository,
-        site_name=site_name,
-        week_commencing=selected_week_commencing,
-    )
     namespace = _weekly_site_check_namespace(site_name, selected_week_commencing)
     _ensure_weekly_site_check_editor_state(
         namespace=namespace,
+        week_commencing=selected_week_commencing,
         weekly_site_check=weekly_site_check,
         row_definitions=row_definitions,
     )
     checked_by_key = _weekly_site_check_state_key(namespace, kind="checked-by")
     active_day_key_key = _weekly_site_check_state_key(namespace, kind="active-day")
+    checklist_mode_key = _weekly_site_check_state_key(namespace, kind="mode")
+    pending_active_day_key = _weekly_site_check_state_key(
+        namespace,
+        kind="pending-active-day",
+    )
+    st.session_state.setdefault(checklist_mode_key, "daily")
+    queued_active_day_key = st.session_state.pop(pending_active_day_key, None)
+    if queued_active_day_key in SITE_CHECK_WEEKDAY_KEYS:
+        st.session_state[active_day_key_key] = queued_active_day_key
 
     st.caption(f"Template output folder: {FILE_2_CHECKLIST_OUTPUT_DIR}")
+    st.divider()
+    _render_workspace_zone_heading(
+        "Primary Action",
+        "Set the live week details, complete the active day checks, then save the result before printing.",
+    )
 
     metadata_columns = st.columns(3)
     with metadata_columns[0]:
@@ -3448,88 +9766,161 @@ def _render_file_2_site_checks_panel(
             key="weekly_site_check_week_commencing",
         )
     with metadata_columns[2]:
-        active_day_key = st.selectbox(
-            "Active Day",
-            options=list(SITE_CHECK_WEEKDAY_KEYS),
-            key=active_day_key_key,
-            format_func=lambda day_key: SITE_CHECK_WEEKDAY_LABELS[day_key],
+        checklist_mode = st.radio(
+            "Checklist Scope",
+            options=list(WEEKLY_SITE_CHECK_MODE_LABELS),
+            key=checklist_mode_key,
+            horizontal=True,
+            format_func=lambda mode_key: WEEKLY_SITE_CHECK_MODE_LABELS[mode_key],
+        )
+
+    active_day_key = str(
+        st.session_state.get(active_day_key_key, _current_active_day_key())
+    ).strip().lower()
+    if checklist_mode == "daily":
+        active_day_columns = st.columns([1.6, 1.3, 1.5, 4.0])
+        with active_day_columns[0]:
+            active_day_key = st.selectbox(
+                "Active Day",
+                options=list(SITE_CHECK_WEEKDAY_KEYS),
+                key=active_day_key_key,
+                format_func=lambda day_key: SITE_CHECK_WEEKDAY_LABELS[day_key],
+            )
+        with active_day_columns[1]:
+            st.markdown(
+                "<div class='inline-field-label'>Smart Jump</div>",
+                unsafe_allow_html=True,
+            )
+        with active_day_columns[2]:
+            st.markdown(
+                "<div class='inline-field-label'>Visible Questions</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption("Daily + shared items")
+        with active_day_columns[3]:
+            st.caption(
+                "Daily scope shows questions that must be completed for the selected day, plus shared items that also appear in the weekly review."
+            )
+        prefill_marker_key = _weekly_site_check_state_key(
+            namespace,
+            kind="prefilled-day",
+        )
+    else:
+        st.caption(
+            "Weekly scope shows only end-of-week questions and the shared items that also need a weekly confirmation."
         )
 
     active_day_label = SITE_CHECK_WEEKDAY_LABELS[active_day_key]
-    st.caption(
-        "Bulk update: stamp the whole active day or weekly column before fine-tuning individual rows."
+    editable_day_key = _weekly_site_check_active_column_key(
+        checklist_mode=checklist_mode,
+        active_day_key=active_day_key,
     )
-    bulk_columns = st.columns(6)
+    editable_day_label = (
+        "Weekly"
+        if editable_day_key == "weekly"
+        else SITE_CHECK_WEEKDAY_LABELS[editable_day_key]
+    )
+    visible_row_definitions = _weekly_site_check_visible_row_definitions(
+        row_definitions,
+        checklist_mode=checklist_mode,
+    )
+    if checklist_mode == "daily" and st.session_state.get(prefill_marker_key) != active_day_key:
+        _prefill_weekly_site_check_day_from_previous_day(
+            namespace=namespace,
+            row_definitions=row_definitions,
+            target_day_key=active_day_key,
+            valid_template_tags=valid_template_tags,
+        )
+        st.session_state[prefill_marker_key] = active_day_key
+    recommended_day_key = _recommended_weekly_site_check_day_key(
+        week_commencing=selected_week_commencing,
+        weekly_site_check=weekly_site_check,
+        daily_initials_map=(
+            st.session_state.get(
+                _weekly_site_check_signoff_cache_key(namespace, field_name="initials"),
+                {},
+            )
+            if checklist_mode == "daily"
+            else None
+        ),
+        daily_time_markers_map=(
+            st.session_state.get(
+                _weekly_site_check_signoff_cache_key(namespace, field_name="time"),
+                {},
+            )
+            if checklist_mode == "daily"
+            else None
+        ),
+    )
+
+    if checklist_mode == "daily":
+        day_hint = (
+            "Today"
+            if selected_week_commencing == _current_week_commencing()
+            else "Recommended"
+        )
+        st.caption(
+            f"{day_hint} day: {SITE_CHECK_WEEKDAY_LABELS[recommended_day_key]}. "
+            f"Active editor day: {SITE_CHECK_WEEKDAY_LABELS[active_day_key]}."
+        )
+        with active_day_columns[1]:
+            jump_disabled = active_day_key == recommended_day_key
+            if st.button(
+                "↪ Jump",
+                key=f"weekly-site-check-jump-{namespace}",
+                width="stretch",
+                disabled=jump_disabled,
+            ):
+                st.session_state[pending_active_day_key] = recommended_day_key
+                st.rerun()
+
+    st.caption(
+        f"Bulk update: stamp the whole {editable_day_label} column before fine-tuning individual checklist rows."
+    )
+    bulk_columns = st.columns(3)
     bulk_actions = [
         (
             bulk_columns[0],
-            f"{active_day_label} all ✔",
-            active_day_key,
+            f"{editable_day_label} all ✔",
             True,
-            f"weekly-site-check-bulk-{namespace}-{active_day_key}-tick",
+            f"weekly-site-check-bulk-{namespace}-{editable_day_key}-tick",
         ),
         (
             bulk_columns[1],
-            f"{active_day_label} all ✘",
-            active_day_key,
+            f"{editable_day_label} all ✘",
             False,
-            f"weekly-site-check-bulk-{namespace}-{active_day_key}-cross",
+            f"weekly-site-check-bulk-{namespace}-{editable_day_key}-cross",
         ),
         (
             bulk_columns[2],
-            f"Clear {active_day_label}",
-            active_day_key,
+            f"Clear {editable_day_label}",
             None,
-            f"weekly-site-check-bulk-{namespace}-{active_day_key}-clear",
-        ),
-        (
-            bulk_columns[3],
-            "Weekly all ✔",
-            "weekly",
-            True,
-            f"weekly-site-check-bulk-{namespace}-weekly-tick",
-        ),
-        (
-            bulk_columns[4],
-            "Weekly all ✘",
-            "weekly",
-            False,
-            f"weekly-site-check-bulk-{namespace}-weekly-cross",
-        ),
-        (
-            bulk_columns[5],
-            "Clear Weekly",
-            "weekly",
-            None,
-            f"weekly-site-check-bulk-{namespace}-weekly-clear",
+            f"weekly-site-check-bulk-{namespace}-{editable_day_key}-clear",
         ),
     ]
-    for column, label, day_key, value, key in bulk_actions:
+    for column, label, value, key in bulk_actions:
         with column:
-            if st.button(label, key=key, use_container_width=True):
+            if st.button(label, key=key, width="stretch"):
                 _set_weekly_site_check_column_value(
                     namespace=namespace,
-                    row_definitions=row_definitions,
-                    day_key=day_key,
+                    row_definitions=visible_row_definitions,
+                    day_key=editable_day_key,
                     value=value,
                     valid_template_tags=valid_template_tags,
                 )
                 st.rerun()
 
-    header_columns = st.columns([2.2, 5.8] + [0.9] * 8)
+    st.caption(
+        f"Showing {len(visible_row_definitions)} of {len(row_definitions)} UHSF19.1 questions for {WEEKLY_SITE_CHECK_MODE_LABELS[checklist_mode]}."
+    )
+    header_columns = st.columns([2.0, 6.1, 1.5, 1.1])
     header_columns[0].markdown("**Section**")
     header_columns[1].markdown("**Checklist Item**")
-    for column, day_key in zip(
-        header_columns[2:],
-        list(SITE_CHECK_WEEKDAY_KEYS) + ["weekly"],
-    ):
-        column.markdown(
-            f"**{SITE_CHECK_WEEKDAY_LABELS.get(day_key, day_key.title())}**"
-        )
+    header_columns[2].markdown("**Scope**")
+    header_columns[3].markdown(f"**{editable_day_label}**")
 
-    edited_values: Dict[int, Dict[str, Optional[bool]]] = {}
-    for row_definition in row_definitions:
-        row_columns = st.columns([2.2, 5.8] + [0.9] * 8)
+    for row_definition in visible_row_definitions:
+        row_columns = st.columns([2.0, 6.1, 1.5, 1.1])
         row_columns[0].markdown(
             f"<div class='weekly-grid-section'>{row_definition.section}</div>",
             unsafe_allow_html=True,
@@ -3538,122 +9929,268 @@ def _render_file_2_site_checks_panel(
             f"<div class='weekly-grid-prompt'>{row_definition.prompt}</div>",
             unsafe_allow_html=True,
         )
-        edited_values[row_definition.row_number] = {}
-        for column_offset, day_key in enumerate(
-            list(SITE_CHECK_WEEKDAY_KEYS) + ["weekly"],
-            start=2,
-        ):
-            template_tag = _weekly_site_check_template_tag(
-                day_key,
-                row_definition.row_number,
+        row_columns[2].markdown(
+            (
+                "<div class='weekly-grid-cell' "
+                "style='font-weight: 700; color: var(--text-muted);'>"
+                f"{html.escape(row_definition.frequency.label)}"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        template_tag = _weekly_site_check_template_tag(
+            editable_day_key,
+            row_definition.row_number,
+        )
+        cell_state_key = _weekly_site_check_state_key(
+            namespace,
+            kind="cell",
+            row_number=row_definition.row_number,
+            day_key=editable_day_key,
+        )
+        current_value = st.session_state.get(cell_state_key)
+        if template_tag not in valid_template_tags:
+            row_columns[3].markdown(
+                (
+                    "<div class='weekly-grid-cell' "
+                    "style='background: #e2e8f0; border: none;'>&nbsp;</div>"
+                ),
+                unsafe_allow_html=True,
             )
-            cell_state_key = _weekly_site_check_state_key(
-                namespace,
-                kind="cell",
-                row_number=row_definition.row_number,
-                day_key=day_key,
+            continue
+
+        clicked = row_columns[3].button(
+            _weekly_site_check_status_label(current_value) or "·",
+            key=(
+                "weekly-site-check-button-"
+                f"{namespace}-{row_definition.row_number}-{editable_day_key}"
+            ),
+            width="stretch",
+            help="Click to cycle blank, tick, and cross.",
+        )
+        if clicked:
+            st.session_state[cell_state_key] = _cycle_weekly_site_check_value(
+                current_value
             )
-            current_value = st.session_state.get(cell_state_key)
-            if template_tag not in valid_template_tags:
-                edited_values[row_definition.row_number][day_key] = None
-                row_columns[column_offset].markdown(
-                    (
-                        "<div class='weekly-grid-cell' "
-                        "style='background: #e2e8f0; border: none;'>&nbsp;</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
-            elif day_key in {active_day_key, "weekly"}:
-                edited_values[row_definition.row_number][day_key] = current_value
-                button_label = _weekly_site_check_status_label(current_value) or "·"
-                clicked = row_columns[column_offset].button(
-                    button_label,
-                    key=f"weekly-site-check-button-{namespace}-{row_definition.row_number}-{day_key}",
-                    use_container_width=True,
-                    help="Click to cycle blank, tick, and cross.",
-                )
-                if clicked:
-                    st.session_state[cell_state_key] = _cycle_weekly_site_check_value(
-                        current_value
-                    )
-                    st.rerun()
-            else:
-                edited_values[row_definition.row_number][day_key] = current_value
-                row_columns[column_offset].markdown(
-                    (
-                        "<div class='weekly-grid-cell'>"
-                        f"{_weekly_site_check_status_label(current_value) or '&nbsp;'}"
-                        "</div>"
-                    ),
-                    unsafe_allow_html=True,
-                )
+            st.rerun()
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Daily Sign-Off</div>",
-        unsafe_allow_html=True,
-    )
-    initials_key = _weekly_site_check_state_key(
-        namespace,
-        kind="initials",
-        day_key=active_day_key,
-    )
-    time_key = _weekly_site_check_state_key(
-        namespace,
-        kind="time",
-        day_key=active_day_key,
-    )
-    signoff_columns = st.columns(2)
-    with signoff_columns[0]:
-        initials_value = st.text_input(
-            f"Initials ({SITE_CHECK_WEEKDAY_LABELS[active_day_key]})",
-            key=initials_key,
+    if checklist_mode == "daily":
+        st.markdown(
+            "<div class='file-2-section-heading'>Daily Sign-Off</div>",
+            unsafe_allow_html=True,
         )
-    with signoff_columns[1]:
-        time_marker_value = st.selectbox(
-            f"AM/PM ({SITE_CHECK_WEEKDAY_LABELS[active_day_key]})",
-            options=["", "AM", "PM"],
-            key=time_key,
+        initials_cache_key = _weekly_site_check_signoff_cache_key(
+            namespace,
+            field_name="initials",
+        )
+        time_cache_key = _weekly_site_check_signoff_cache_key(
+            namespace,
+            field_name="time",
+        )
+        initials_widget_key = _weekly_site_check_signoff_widget_key(
+            namespace,
+            field_name="initials",
+        )
+        time_widget_key = _weekly_site_check_signoff_widget_key(
+            namespace,
+            field_name="time",
+        )
+        active_signoff_day_key = _weekly_site_check_state_key(
+            namespace,
+            kind="active-signoff-day",
+        )
+        daily_initials_cache = {
+            day_key: str(value).strip().upper()
+            for day_key, value in dict(
+                st.session_state.get(
+                    initials_cache_key,
+                    (
+                        dict(weekly_site_check.daily_initials)
+                        if weekly_site_check is not None
+                        else {}
+                    ),
+                )
+            ).items()
+        }
+        daily_time_markers_cache = {
+            day_key: str(value).strip()
+            for day_key, value in dict(
+                st.session_state.get(
+                    time_cache_key,
+                    (
+                        dict(weekly_site_check.daily_time_markers)
+                        if weekly_site_check is not None
+                        else {}
+                    ),
+                )
+            ).items()
+        }
+        for day_key in SITE_CHECK_WEEKDAY_KEYS:
+            daily_initials_cache.setdefault(day_key, "")
+            daily_time_markers_cache.setdefault(day_key, "")
+
+        if st.session_state.get(active_signoff_day_key) != active_day_key:
+            st.session_state[active_signoff_day_key] = active_day_key
+            st.session_state[initials_widget_key] = daily_initials_cache.get(
+                active_day_key,
+                "",
+            )
+            st.session_state[time_widget_key] = daily_time_markers_cache.get(
+                active_day_key,
+                "",
+            )
+
+        current_initials_value = str(
+            st.session_state.get(initials_widget_key, daily_initials_cache.get(active_day_key, ""))
+        ).strip().upper()
+        st.session_state[initials_widget_key] = current_initials_value
+        suggested_initials = _initials_from_name(checked_by)
+        initials_options = [""]
+        for candidate in (suggested_initials, current_initials_value):
+            cleaned_candidate = str(candidate).strip()
+            if cleaned_candidate and cleaned_candidate not in initials_options:
+                initials_options.append(cleaned_candidate)
+        signoff_columns = st.columns(2)
+        with signoff_columns[0]:
+            st.selectbox(
+                f"Initials ({SITE_CHECK_WEEKDAY_LABELS[active_day_key]})",
+                options=initials_options,
+                key=initials_widget_key,
+            )
+        with signoff_columns[1]:
+            st.selectbox(
+                f"AM/PM ({SITE_CHECK_WEEKDAY_LABELS[active_day_key]})",
+                options=["", "AM", "PM"],
+                key=time_widget_key,
+            )
+        daily_initials_cache[active_day_key] = str(
+            st.session_state.get(initials_widget_key, "")
+        ).strip().upper()
+        daily_time_markers_cache[active_day_key] = str(
+            st.session_state.get(time_widget_key, "")
+        ).strip()
+        st.session_state[initials_cache_key] = daily_initials_cache
+        st.session_state[time_cache_key] = daily_time_markers_cache
+        st.caption(
+            "Signed days stay on the sheet for the whole week. Use this summary to check what is already stored before moving to the next day."
+        )
+        st.dataframe(
+            _weekly_site_check_signoff_snapshot(
+                daily_initials_map=daily_initials_cache,
+                daily_time_markers_map=daily_time_markers_cache,
+                active_day_key=active_day_key,
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info(
+            "Weekly scope does not require the daily initials/time sign-off fields."
         )
 
-    action_columns = st.columns(2)
-    with action_columns[0]:
-        save_submitted = st.button(
-            "Submit Check",
-            key=f"weekly-site-check-save-{namespace}",
-            use_container_width=True,
-        )
-    with action_columns[1]:
-        generate_submitted = st.button(
-            "Generate Printable Checklist",
-            key=f"weekly-site-check-generate-{namespace}",
-            use_container_width=True,
-        )
+    save_submitted = st.button(
+        "✅ Submit Check",
+        key=f"weekly-site-check-save-{namespace}",
+        width="stretch",
+    )
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Live Register / History",
+        "This shows the most recent saved File 2 checklist record for the active site.",
+    )
+    _render_file_list_panel(
+        heading="Morning Station",
+        title="Latest Site Check Sheet",
+        caption="The most recent tick sheet saved to SQLite for File 2.",
+        items=_weekly_site_check_items(latest_site_check),
+        empty_message="No daily/weekly site checks have been submitted yet.",
+    )
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Export / Print",
+        "Generate the official printable checklist once the live week has been saved.",
+    )
+    generate_submitted = st.button(
+        "🖨️ Generate Printable Checklist",
+        key=f"weekly-site-check-generate-{namespace}",
+        width="stretch",
+    )
 
     if save_submitted or generate_submitted:
-        daily_initials_map = {
-            day_key: str(
+        row_lookup = {
+            row_state.row_number: row_state
+            for row_state in (weekly_site_check.row_states if weekly_site_check else [])
+        }
+        signoff_initials_cache = {
+            day_key: str(value).strip().upper()
+            for day_key, value in dict(
                 st.session_state.get(
-                    _weekly_site_check_state_key(
+                    _weekly_site_check_signoff_cache_key(
                         namespace,
-                        kind="initials",
-                        day_key=day_key,
+                        field_name="initials",
                     ),
-                    "",
+                    {},
                 )
-            ).strip()
+            ).items()
+        }
+        signoff_time_cache = {
+            day_key: str(value).strip()
+            for day_key, value in dict(
+                st.session_state.get(
+                    _weekly_site_check_signoff_cache_key(
+                        namespace,
+                        field_name="time",
+                    ),
+                    {},
+                )
+            ).items()
+        }
+        grid_values = {
+            row_definition.row_number: {
+                day_key: (
+                    st.session_state.get(
+                        _weekly_site_check_state_key(
+                            namespace,
+                            kind="cell",
+                            row_number=row_definition.row_number,
+                            day_key=day_key,
+                        )
+                    )
+                    if day_key == editable_day_key
+                    else (
+                        row_lookup[row_definition.row_number].get_value(day_key)
+                        if row_definition.row_number in row_lookup
+                        else None
+                    )
+                )
+                for day_key in list(SITE_CHECK_WEEKDAY_KEYS) + ["weekly"]
+            }
+            for row_definition in row_definitions
+        }
+        existing_initials_map = (
+            dict(weekly_site_check.daily_initials) if weekly_site_check is not None else {}
+        )
+        existing_time_markers_map = (
+            dict(weekly_site_check.daily_time_markers)
+            if weekly_site_check is not None
+            else {}
+        )
+        daily_initials_map = {
+            day_key: (
+                str(signoff_initials_cache.get(day_key, "")).strip().upper()
+                if checklist_mode == "daily"
+                else str(existing_initials_map.get(day_key, "")).strip().upper()
+            )
             for day_key in SITE_CHECK_WEEKDAY_KEYS
         }
         daily_time_markers_map = {
-            day_key: str(
-                st.session_state.get(
-                    _weekly_site_check_state_key(
-                        namespace,
-                        kind="time",
-                        day_key=day_key,
-                    ),
-                    "",
-                )
-            ).strip()
+            day_key: (
+                str(signoff_time_cache.get(day_key, "")).strip()
+                if checklist_mode == "daily"
+                else str(existing_time_markers_map.get(day_key, "")).strip()
+            )
             for day_key in SITE_CHECK_WEEKDAY_KEYS
         }
         saved_check = _save_weekly_site_check(
@@ -3662,7 +10199,8 @@ def _render_file_2_site_checks_panel(
             week_commencing=week_commencing,
             checked_by=checked_by,
             active_day_key=active_day_key,
-            grid_values=edited_values,
+            checklist_mode=checklist_mode,
+            grid_values=grid_values,
             valid_template_tags=valid_template_tags,
             daily_initials_map=daily_initials_map,
             daily_time_markers_map=daily_time_markers_map,
@@ -3705,20 +10243,23 @@ def _render_file_2_site_checks_panel(
         st.session_state["site_check_flash"] = {
             "level": "success" if saved_check.overall_safe_to_start else "warning",
             "message": (
-                "Weekly site check saved."
+                f"{WEEKLY_SITE_CHECK_MODE_LABELS[checklist_mode]} saved."
                 if saved_check.overall_safe_to_start
-                else "Weekly site check saved, but one or more checklist items are marked ✘ or left blank."
+                else (
+                    f"{WEEKLY_SITE_CHECK_MODE_LABELS[checklist_mode]} saved, "
+                    "but one or more checklist items are marked ✘ or left blank."
+                )
             ),
         }
+        if checklist_mode == "daily":
+            next_day_key = _recommended_weekly_site_check_day_key(
+                week_commencing=saved_check.week_commencing,
+                weekly_site_check=saved_check,
+                daily_initials_map=daily_initials_map,
+                daily_time_markers_map=daily_time_markers_map,
+            )
+            st.session_state[pending_active_day_key] = next_day_key
         st.rerun()
-
-    _render_file_list_panel(
-        heading="Morning Station",
-        title="Latest Site Check Sheet",
-        caption="The most recent tick sheet saved to SQLite for File 2.",
-        items=_weekly_site_check_items(latest_site_check),
-        empty_message="No daily/weekly site checks have been submitted yet.",
-    )
 
 
 def _get_file_2_plant_assets(
@@ -3771,9 +10312,11 @@ def _render_file_2_plant_register_panel(
 ) -> None:
     """Render the live File 2 plant register panel and print action."""
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Site Plant Register</div>",
-        unsafe_allow_html=True,
+    _render_workspace_hero(
+        icon="🏗️",
+        kicker="Plant Register",
+        title="Site Plant Register",
+        caption="Keep live hire assets current, update pending serials and inspection records, and print the File 2 plant register when needed.",
     )
     flash_message = st.session_state.pop("plant_register_flash", None)
     if flash_message is not None:
@@ -3787,57 +10330,94 @@ def _render_file_2_plant_register_panel(
         site_name=project_setup.current_site_name,
     )
     pending_assets = sum(1 for asset in plant_assets if asset.is_pending)
+    inspection_attention_count = sum(
+        1 for asset in plant_assets if asset.inspection_requires_attention()
+    )
 
-    action_columns = st.columns(3)
-    with action_columns[0]:
-        if st.button(
-            "🖨️ Print Plant Register",
-            key="file_2_print_plant_register",
-            use_container_width=True,
-        ):
-            try:
-                generated_document = generate_plant_register_document(
-                    repository,
-                    site_name=project_setup.current_site_name,
-                )
-            except TemplateValidationError as exc:
-                st.session_state["plant_register_flash"] = {
-                    "level": "error",
-                    "message": f"Official plant register template failed validation: {exc}",
-                }
-                st.rerun()
-            except Exception as exc:
-                st.session_state["plant_register_flash"] = {
-                    "level": "error",
-                    "message": f"Unable to generate the plant register: {exc}",
-                }
-                st.rerun()
-
-            _open_file_for_printing(generated_document.output_path)
-            st.session_state["plant_register_flash"] = {
-                "level": "success",
-                "message": (
-                    f"Plant register saved to {generated_document.output_path.name} "
-                    f"with {generated_document.asset_count} live asset row"
-                    f"{'' if generated_document.asset_count == 1 else 's'}."
-                ),
-            }
-            st.rerun()
-    with action_columns[1]:
-        if st.button(
-            "Open Plant Folder",
-            key="file_2_open_plant_folder",
-            use_container_width=True,
-        ):
-            PLANT_HIRE_REGISTER_DIR.mkdir(parents=True, exist_ok=True)
-            _open_workspace_path(PLANT_HIRE_REGISTER_DIR)
-            st.toast("Opened Plant_Hire_Register", icon="📂")
-    with action_columns[2]:
-        st.metric("Pending Assets", str(pending_assets))
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric("Assets On Register", str(len(plant_assets)), icon="🏗️")
+    with summary_columns[1]:
+        _render_inline_metric("Pending Assets", str(pending_assets), icon="⏳")
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Inspection Attention",
+            str(inspection_attention_count),
+            icon="⚠️",
+        )
 
     if not plant_assets:
         st.info("SYNC WORKSPACE to file HSS/MEP plant hire paperwork into File 2.")
         return
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Primary Action",
+        "Update serial numbers and inspection details here so pending hire records become fully usable site assets.",
+    )
+    with st.expander("Update Plant Asset", expanded=False):
+        asset_options = {
+            f"{asset.hire_num} | {asset.description}": asset for asset in plant_assets
+        }
+        selected_asset_label = st.selectbox(
+            "Plant Asset",
+            options=list(asset_options),
+            key="file_2_selected_plant_asset",
+        )
+        selected_asset = asset_options[selected_asset_label]
+        with st.form("file_2_plant_asset_update_form", clear_on_submit=False):
+            serial_value = st.text_input(
+                "Serial Number",
+                value=selected_asset.serial,
+            )
+            inspection_value = st.text_input(
+                "LOLER / Inspection",
+                value=selected_asset.inspection,
+            )
+            status_value = st.selectbox(
+                "Record Status",
+                options=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE],
+                index=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE].index(
+                    selected_asset.status
+                    if selected_asset.status in {DocumentStatus.DRAFT, DocumentStatus.ACTIVE}
+                    else DocumentStatus.DRAFT
+                ),
+                format_func=lambda item: item.label,
+            )
+            submitted = st.form_submit_button(
+                "💾 Save Plant Asset",
+                width="stretch",
+            )
+
+        if submitted:
+            resolved_status = (
+                DocumentStatus.ACTIVE
+                if serial_value.strip() and status_value == DocumentStatus.DRAFT
+                else status_value
+            )
+            repository.save(
+                PlantAssetDocument(
+                    doc_id=selected_asset.doc_id,
+                    site_name=selected_asset.site_name,
+                    created_at=selected_asset.created_at,
+                    status=resolved_status,
+                    hire_num=selected_asset.hire_num,
+                    description=selected_asset.description,
+                    company=selected_asset.company,
+                    phone=selected_asset.phone,
+                    on_hire=selected_asset.on_hire,
+                    hired_by=selected_asset.hired_by,
+                    serial=serial_value,
+                    inspection=inspection_value,
+                    source_reference=selected_asset.source_reference,
+                    purchase_order=selected_asset.purchase_order,
+                )
+            )
+            st.session_state["plant_register_flash"] = {
+                "level": "success",
+                "message": f"Updated {selected_asset.hire_num}.",
+            }
+            st.rerun()
 
     register_rows = []
     for plant_asset in plant_assets:
@@ -3871,71 +10451,62 @@ def _render_file_2_plant_register_panel(
         dataframe.style.apply(_plant_register_row_styles, axis=1)
         .hide(axis="index")
     )
-    st.dataframe(styled_dataframe, use_container_width=True, hide_index=True)
+    st.divider()
+    _render_workspace_zone_heading(
+        "Live Register / History",
+        "This is the live plant register for the active site. Inspection cells highlight when attention is needed.",
+    )
+    st.dataframe(styled_dataframe, width="stretch", hide_index=True)
 
-    with st.expander("Update Plant Asset", expanded=False):
-        asset_options = {
-            f"{asset.hire_num} | {asset.description}": asset for asset in plant_assets
-        }
-        selected_asset_label = st.selectbox(
-            "Plant Asset",
-            options=list(asset_options),
-            key="file_2_selected_plant_asset",
-        )
-        selected_asset = asset_options[selected_asset_label]
-        with st.form("file_2_plant_asset_update_form", clear_on_submit=False):
-            serial_value = st.text_input(
-                "Serial Number",
-                value=selected_asset.serial,
-            )
-            inspection_value = st.text_input(
-                "LOLER / Inspection",
-                value=selected_asset.inspection,
-            )
-            status_value = st.selectbox(
-                "Record Status",
-                options=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE],
-                index=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE].index(
-                    selected_asset.status
-                    if selected_asset.status in {DocumentStatus.DRAFT, DocumentStatus.ACTIVE}
-                    else DocumentStatus.DRAFT
-                ),
-                format_func=lambda item: item.label,
-            )
-            submitted = st.form_submit_button(
-                "Save Plant Asset",
-                use_container_width=True,
-            )
-
-        if submitted:
-            resolved_status = (
-                DocumentStatus.ACTIVE
-                if serial_value.strip() and status_value == DocumentStatus.DRAFT
-                else status_value
-            )
-            repository.save(
-                PlantAssetDocument(
-                    doc_id=selected_asset.doc_id,
-                    site_name=selected_asset.site_name,
-                    created_at=selected_asset.created_at,
-                    status=resolved_status,
-                    hire_num=selected_asset.hire_num,
-                    description=selected_asset.description,
-                    company=selected_asset.company,
-                    phone=selected_asset.phone,
-                    on_hire=selected_asset.on_hire,
-                    hired_by=selected_asset.hired_by,
-                    serial=serial_value,
-                    inspection=inspection_value,
-                    source_reference=selected_asset.source_reference,
-                    purchase_order=selected_asset.purchase_order,
+    st.divider()
+    _render_workspace_zone_heading(
+        "Export / Print",
+        "Generate the official plant register or open the File 2 plant folder for direct access.",
+    )
+    action_columns = st.columns(2)
+    with action_columns[0]:
+        if st.button(
+            "🖨️ Print Plant Register",
+            key="file_2_print_plant_register",
+            width="stretch",
+        ):
+            try:
+                generated_document = generate_plant_register_document(
+                    repository,
+                    site_name=project_setup.current_site_name,
                 )
-            )
+            except TemplateValidationError as exc:
+                st.session_state["plant_register_flash"] = {
+                    "level": "error",
+                    "message": f"Official plant register template failed validation: {exc}",
+                }
+                st.rerun()
+            except Exception as exc:
+                st.session_state["plant_register_flash"] = {
+                    "level": "error",
+                    "message": f"Unable to generate the plant register: {exc}",
+                }
+                st.rerun()
+
+            _open_file_for_printing(generated_document.output_path)
             st.session_state["plant_register_flash"] = {
                 "level": "success",
-                "message": f"Updated {selected_asset.hire_num}.",
+                "message": (
+                    f"Plant register saved to {generated_document.output_path.name} "
+                    f"with {generated_document.asset_count} live asset row"
+                    f"{'' if generated_document.asset_count == 1 else 's'}."
+                ),
             }
             st.rerun()
+    with action_columns[1]:
+        if st.button(
+            "📂 Open Plant Folder",
+            key="file_2_open_plant_folder",
+            width="stretch",
+        ):
+            PLANT_HIRE_REGISTER_DIR.mkdir(parents=True, exist_ok=True)
+            _open_workspace_path(PLANT_HIRE_REGISTER_DIR)
+            st.toast("Opened Plant_Hire_Register", icon="📂")
 
 
 def _render_file_2_register_link(
@@ -3950,7 +10521,7 @@ def _render_file_2_register_link(
     with st.expander(title, expanded=True):
         st.caption(caption)
         destination.mkdir(parents=True, exist_ok=True)
-        if st.button(button_label, key=f"open-{destination.name}", use_container_width=True):
+        if st.button(button_label, key=f"open-{destination.name}", width="stretch"):
             _open_workspace_path(destination)
             st.toast(f"Opened {destination.name}", icon="📂")
         st.caption(destination.name)
@@ -4119,6 +10690,7 @@ def _save_weekly_site_check(
     week_commencing: date,
     checked_by: str,
     active_day_key: str,
+    checklist_mode: str,
     grid_values: Dict[int, Dict[str, Optional[bool]]],
     valid_template_tags: set[str],
     daily_initials_map: Dict[str, str],
@@ -4167,28 +10739,35 @@ def _save_weekly_site_check(
         for day_key, value in daily_time_markers_map.items()
     }
 
-    for row_definition in get_weekly_site_check_row_definitions():
+    row_definitions = get_weekly_site_check_row_definitions()
+    for row_definition in row_definitions:
         row_state = saved_check.get_row_state(row_definition.row_number)
         for day_key in list(SITE_CHECK_WEEKDAY_KEYS) + ["weekly"]:
             if (
                 _weekly_site_check_template_tag(day_key, row_definition.row_number)
                 not in valid_template_tags
+                or not row_definition.supports_day_key(day_key)
             ):
                 row_state.set_value(day_key, None)
                 continue
             row_state.set_value(
                 day_key,
-                grid_values[row_definition.row_number][day_key],
+                grid_values.get(row_definition.row_number, {}).get(day_key),
             )
 
-    active_day_values = [
-        saved_check.get_row_state(row_definition.row_number).get_value(active_day_key)
-        for row_definition in get_weekly_site_check_row_definitions()
-        if _weekly_site_check_template_tag(active_day_key, row_definition.row_number)
+    relevant_day_key = _weekly_site_check_active_column_key(
+        checklist_mode=checklist_mode,
+        active_day_key=active_day_key,
+    )
+    relevant_values = [
+        saved_check.get_row_state(row_definition.row_number).get_value(relevant_day_key)
+        for row_definition in row_definitions
+        if row_definition.supports_day_key(relevant_day_key)
+        and _weekly_site_check_template_tag(relevant_day_key, row_definition.row_number)
         in valid_template_tags
     ]
-    saved_check.overall_safe_to_start = bool(active_day_values) and all(
-        value is True for value in active_day_values
+    saved_check.overall_safe_to_start = bool(relevant_values) and all(
+        value is True for value in relevant_values
     )
     repository.save(saved_check)
     return saved_check
@@ -4261,20 +10840,31 @@ def _weekly_site_check_dashboard_status(
     if weekly_site_check is None:
         return "PENDING"
     valid_template_tags = set(get_valid_template_tags())
+    row_definitions = get_weekly_site_check_row_definitions()
     active_day_values = [
-        row_state.get_value(weekly_site_check.active_day_key)
-        for row_state in weekly_site_check.row_states
-        if _weekly_site_check_template_tag(
+        weekly_site_check.get_row_state(row_definition.row_number).get_value(
+            weekly_site_check.active_day_key
+        )
+        for row_definition in row_definitions
+        if row_definition.supports_day_key(weekly_site_check.active_day_key)
+        and _weekly_site_check_template_tag(
             weekly_site_check.active_day_key,
-            row_state.row_number,
+            row_definition.row_number,
         )
         in valid_template_tags
     ]
-    if not any(value is not None for value in active_day_values):
+    weekly_values = [
+        weekly_site_check.get_row_state(row_definition.row_number).get_value("weekly")
+        for row_definition in row_definitions
+        if row_definition.supports_day_key("weekly")
+        and _weekly_site_check_template_tag("weekly", row_definition.row_number)
+        in valid_template_tags
+    ]
+    if not any(
+        value is not None for value in list(active_day_values) + list(weekly_values)
+    ):
         return "PENDING"
-    if all(value is True for value in active_day_values):
-        return "OK"
-    return "REVIEW"
+    return "OK" if weekly_site_check.overall_safe_to_start else "REVIEW"
 
 
 def _get_file_station(station_label: str) -> FileStation:
@@ -4361,6 +10951,293 @@ def _build_contractor_folder_rows(
         ),
         reverse=True,
     )
+
+
+def _normalize_file_3_review_value(value: str) -> str:
+    """Return a punctuation-light comparison string for File 3 review heuristics."""
+
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _trim_file_3_reference_text(reference: str) -> str:
+    """Remove leading code tokens from one reference for comparison."""
+
+    cleaned_reference = _normalize_file_3_review_value(reference)
+    return re.sub(r"^(?:[a-z]{1,4}\d+[a-z0-9./ -]*|ms\d+[a-z0-9./ -]*)\s+", "", cleaned_reference).strip()
+
+
+def _looks_like_file_3_generic_company(company: str, *, title: str, reference: str) -> bool:
+    """Return True when one File 3 company value reads like parser noise."""
+
+    normalized_company = _normalize_file_3_review_value(company)
+    normalized_title = _normalize_file_3_review_value(title)
+    trimmed_reference = _trim_file_3_reference_text(reference)
+    if not normalized_company:
+        return True
+    if company[:1] and not company[:1].isalnum():
+        return True
+    if any(token in company for token in ("@", "http://", "https://", ":")):
+        return True
+    if any(character.isdigit() for character in company) and not any(
+        marker in normalized_company for marker in ("ltd", "limited", "uk")
+    ):
+        return True
+    if len(normalized_company) <= 3 and normalized_company not in {"tde", "msk", "msuk"}:
+        return True
+    if normalized_company == normalized_title or (
+        trimmed_reference and normalized_company == trimmed_reference
+    ):
+        return True
+    if normalized_company and trimmed_reference and normalized_company in trimmed_reference:
+        return True
+    if normalized_company in {
+        "site contractor",
+        "limits",
+        "review",
+        "air",
+        "manual handling",
+        "electrical work",
+        "installation and use of temporary electrical supplies",
+        "disposal of waste materials",
+        "work in confined spaces",
+        "use of mobile scaffold towers",
+        "installing or replacing luminaires",
+        "electrical testing and commissioning",
+    }:
+        return True
+    if company[:1].islower():
+        return True
+    return False
+
+
+def _looks_like_file_3_generic_title(title: str, *, company: str = "", reference: str = "") -> bool:
+    """Return True when one File 3 title/substance value looks like OCR junk."""
+
+    normalized_title = _normalize_file_3_review_value(title)
+    normalized_company = _normalize_file_3_review_value(company)
+    trimmed_reference = _trim_file_3_reference_text(reference)
+    if not normalized_title:
+        return True
+    if title[:1] and not title[:1].isalnum():
+        return True
+    if normalized_title in {
+        "rams document",
+        "mixture identification",
+        "qualified electrician",
+        "severity s",
+        "title signature date date",
+        "confined space training",
+        "risks",
+        "s",
+    }:
+        return True
+    if normalized_company and normalized_title == normalized_company:
+        return True
+    if trimmed_reference and normalized_title == trimmed_reference:
+        return True
+    if len(normalized_title) <= 2:
+        return True
+    return False
+
+
+def _looks_like_file_3_generic_reference(reference: str) -> bool:
+    """Return True when one File 3 reference value does not look trustworthy."""
+
+    normalized_reference = _normalize_file_3_review_value(reference)
+    if not normalized_reference:
+        return True
+    if normalized_reference in {"to", "copy", "documents", "documents copied", "copy."}:
+        return True
+    return False
+
+
+def _looks_like_file_3_generic_version(version: str) -> bool:
+    """Return True when one File 3 version value does not look trustworthy."""
+
+    return re.fullmatch(r"\d+(?:\.\d+)*[a-zA-Z]?", version.strip()) is None
+
+
+def _build_file_3_source_lookup(
+    repository: DocumentRepository,
+    documents: Iterable[RAMSDocument | COSHHDocument],
+) -> Dict[str, Path]:
+    """Return the latest indexed source path for each File 3 live document."""
+
+    source_lookup: Dict[str, Path] = {}
+    for document in documents:
+        indexed_files = [
+            indexed_file
+            for indexed_file in repository.list_indexed_files(related_doc_id=document.doc_id)
+            if indexed_file.file_path.exists()
+        ]
+        if indexed_files:
+            source_lookup[document.doc_id] = indexed_files[0].file_path
+    return source_lookup
+
+
+def _build_file_3_review_candidates(
+    repository: DocumentRepository,
+    *,
+    rams_documents: List[RAMSDocument],
+    coshh_documents: List[COSHHDocument],
+    include_clean: bool = False,
+) -> List[File3ReviewCandidate]:
+    """Return File 3 live documents that probably need a manual review."""
+
+    source_lookup = _build_file_3_source_lookup(
+        repository,
+        [*rams_documents, *coshh_documents],
+    )
+    candidates: List[File3ReviewCandidate] = []
+
+    for document in rams_documents:
+        findings: List[str] = []
+        if _looks_like_file_3_generic_company(
+            document.contractor_name,
+            title=document.activity_description,
+            reference=document.reference,
+        ):
+            findings.append("Company")
+        if _looks_like_file_3_generic_title(
+            document.activity_description,
+            company=document.contractor_name,
+            reference=document.reference,
+        ):
+            findings.append("Activity")
+        if _looks_like_file_3_generic_reference(document.reference):
+            findings.append("Reference")
+        if _looks_like_file_3_generic_version(document.version):
+            findings.append("Version")
+        if findings or include_clean:
+            candidates.append(
+                File3ReviewCandidate(
+                    document_type="RAMS",
+                    doc_id=document.doc_id,
+                    company=document.contractor_name,
+                    title=document.activity_description,
+                    reference=document.reference,
+                    version=document.version,
+                    findings=tuple(findings),
+                    source_path=source_lookup.get(document.doc_id),
+                )
+            )
+
+    for document in coshh_documents:
+        findings = []
+        if _looks_like_file_3_generic_company(
+            document.contractor_name,
+            title=document.substance_name,
+            reference=document.reference,
+        ):
+            findings.append("Company")
+        if _looks_like_file_3_generic_title(
+            document.substance_name,
+            company=document.contractor_name,
+            reference=document.reference,
+        ):
+            findings.append("Substance")
+        if _looks_like_file_3_generic_title(
+            document.manufacturer,
+            company=document.contractor_name,
+            reference=document.reference,
+        ):
+            findings.append("Supplier")
+        if _looks_like_file_3_generic_reference(document.reference):
+            findings.append("Reference")
+        if _looks_like_file_3_generic_version(document.version):
+            findings.append("Version")
+        if findings or include_clean:
+            candidates.append(
+                File3ReviewCandidate(
+                    document_type="COSHH",
+                    doc_id=document.doc_id,
+                    company=document.contractor_name,
+                    title=document.substance_name,
+                    reference=document.reference,
+                    version=document.version,
+                    findings=tuple(findings),
+                    source_path=source_lookup.get(document.doc_id),
+                )
+            )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.document_type,
+            len(candidate.findings),
+            candidate.company.casefold(),
+            candidate.title.casefold(),
+        ),
+        reverse=True,
+    )
+
+
+def _filter_file_3_review_candidates(
+    candidates: List[File3ReviewCandidate],
+    *,
+    document_type_filter: str = "All",
+    finding_filter: str = "Any finding",
+    search_query: str = "",
+) -> List[File3ReviewCandidate]:
+    """Return the File 3 review queue after applying UI filters."""
+
+    filtered_candidates = candidates
+    if document_type_filter in {"RAMS", "COSHH"}:
+        filtered_candidates = [
+            candidate
+            for candidate in filtered_candidates
+            if candidate.document_type == document_type_filter
+        ]
+
+    finding_aliases = {
+        "Title / Substance": {"Activity", "Substance"},
+    }
+    if finding_filter != "Any finding":
+        accepted_findings = finding_aliases.get(finding_filter, {finding_filter})
+        filtered_candidates = [
+            candidate
+            for candidate in filtered_candidates
+            if any(finding in accepted_findings for finding in candidate.findings)
+        ]
+
+    normalized_query = " ".join(search_query.casefold().split())
+    if normalized_query:
+        query_parts = normalized_query.split()
+        filtered_candidates = [
+            candidate
+            for candidate in filtered_candidates
+            if all(
+                part in " ".join(
+                    [
+                        candidate.document_type,
+                        candidate.company,
+                        candidate.title,
+                        candidate.reference,
+                        candidate.version,
+                        " ".join(candidate.findings),
+                        candidate.source_path.name if candidate.source_path is not None else "",
+                    ]
+                ).casefold()
+                for part in query_parts
+            )
+        ]
+
+    return filtered_candidates
+
+
+def _get_file_3_review_adjacent_doc_ids(
+    candidates: List[File3ReviewCandidate],
+    current_doc_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the previous and next doc ids for the current File 3 review row."""
+
+    doc_ids = [candidate.doc_id for candidate in candidates]
+    if current_doc_id not in doc_ids:
+        return None, None
+    current_index = doc_ids.index(current_doc_id)
+    previous_doc_id = doc_ids[current_index - 1] if current_index > 0 else None
+    next_doc_id = doc_ids[current_index + 1] if current_index < len(doc_ids) - 1 else None
+    return previous_doc_id, next_doc_id
 
 
 def _build_file_3_rams_rows(rams_assets: List[SafetyAsset]) -> List[Dict[str, str]]:
@@ -4505,6 +11382,47 @@ def _get_latest_attendance_records_by_worker(
     return latest_records
 
 
+def _get_latest_daily_attendance_entry_for_induction(
+    repository: DocumentRepository,
+    induction_document: InductionDocument,
+    *,
+    site_name: Optional[str] = None,
+) -> Optional[DailyAttendanceEntryDocument]:
+    """Return the latest daily attendance entry for one inducted operative."""
+
+    attendance_entries = [
+        document
+        for document in repository.list_documents(
+            document_type=DailyAttendanceEntryDocument.document_type,
+            site_name=site_name,
+        )
+        if isinstance(document, DailyAttendanceEntryDocument)
+    ]
+    matching_entries = [
+        attendance_entry
+        for attendance_entry in attendance_entries
+        if (
+            induction_document.doc_id
+            and attendance_entry.linked_induction_doc_id == induction_document.doc_id
+        )
+        or (
+            attendance_entry.individual_name.casefold()
+            == induction_document.individual_name.casefold()
+            and attendance_entry.contractor_name.casefold()
+            == induction_document.contractor_name.casefold()
+        )
+    ]
+    if not matching_entries:
+        return None
+    return max(
+        matching_entries,
+        key=lambda attendance_entry: (
+            attendance_entry.time_in,
+            attendance_entry.created_at,
+        ),
+    )
+
+
 def _build_file_4_worker_options(
     repository: DocumentRepository,
     *,
@@ -4593,10 +11511,16 @@ def _render_site_induction_recent_submissions(
     """Render recent induction submissions with delete actions and confirmation."""
 
     pending_delete_doc_id = st.session_state.get("site_induction_delete_pending_doc_id")
-    header_columns = st.columns([1.4, 1.35, 1.0, 1.05, 1.4, 0.55], gap="small")
+    selected_view_doc_id = st.session_state.get("site_induction_view_doc_id")
+
+    if not inductions:
+        st.info("No inductions have been logged for this site yet.")
+        return
+
+    header_columns = st.columns([1.25, 1.2, 1.0, 1.0, 1.2, 0.72, 0.55], gap="small")
     for column, label in zip(
         header_columns,
-        ("Date", "Full Name", "Company", "Occupation", "Roles", "Delete"),
+        ("Date", "Full Name", "Company", "Occupation", "Roles", "View", "Delete"),
     ):
         column.markdown(f"**{label}**")
 
@@ -4612,20 +11536,136 @@ def _render_site_induction_recent_submissions(
             if enabled
         ) or "-"
 
-        row_columns = st.columns([1.4, 1.35, 1.0, 1.05, 1.4, 0.55], gap="small")
+        row_columns = st.columns([1.25, 1.2, 1.0, 1.0, 1.2, 0.72, 0.55], gap="small")
         row_columns[0].caption(induction.created_at.strftime("%d/%m/%Y %H:%M"))
         row_columns[1].write(induction.individual_name)
         row_columns[2].write(induction.contractor_name)
         row_columns[3].write(induction.occupation or "-")
         row_columns[4].caption(role_summary)
         if row_columns[5].button(
+            "View",
+            key=f"view-induction-{induction.doc_id}",
+            width="stretch",
+        ):
+            if selected_view_doc_id == induction.doc_id:
+                st.session_state.pop("site_induction_view_doc_id", None)
+            else:
+                st.session_state["site_induction_view_doc_id"] = induction.doc_id
+            st.rerun()
+        if row_columns[6].button(
             "🗑️",
             key=f"delete-induction-{induction.doc_id}",
             help="Delete this induction record",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state["site_induction_delete_pending_doc_id"] = induction.doc_id
             st.rerun()
+
+        if selected_view_doc_id == induction.doc_id:
+            detail_columns = st.columns([1.05, 1.1, 1.15], gap="large")
+            with detail_columns[0]:
+                st.markdown("**Operative Details**")
+                st.caption(f"Home Address: {induction.home_address or '-'}")
+                st.caption(f"Contact: {induction.contact_number or '-'}")
+                st.caption(f"Emergency Contact: {induction.emergency_contact or '-'}")
+                st.caption(f"Emergency Tel: {induction.emergency_tel or '-'}")
+                st.caption(f"Medical: {induction.medical or '-'}")
+            with detail_columns[1]:
+                st.markdown("**Competency & Roles**")
+                st.caption(f"CSCS No: {induction.cscs_number or '-'}")
+                st.caption(
+                    "Primary Competency Expiry: "
+                    + (
+                        induction.competency_expiry_date.strftime("%d/%m/%Y")
+                        if induction.competency_expiry_date is not None
+                        else "-"
+                    )
+                )
+                st.caption(
+                    "Client Training Expiry: "
+                    + (
+                        induction.client_training_expiry.strftime("%d/%m/%Y")
+                        if induction.client_training_expiry is not None
+                        else "-"
+                    )
+                )
+                st.caption(
+                    "Saved as: "
+                    + (
+                        Path(induction.completed_document_path).name
+                        if induction.completed_document_path
+                        else "-"
+                    )
+                )
+            with detail_columns[2]:
+                st.markdown("**Files**")
+                completed_document_path = Path(induction.completed_document_path)
+                print_pack_paths = _build_induction_print_pack_paths(induction)
+                print_pack_count = (
+                    len(print_pack_paths["default"]) + len(print_pack_paths["preview"])
+                )
+                if st.button(
+                    "🖨️ Print Induction Pack",
+                    key=f"print-induction-pack-{induction.doc_id}",
+                    width="stretch",
+                    disabled=print_pack_count == 0,
+                ):
+                    opened_count = _open_induction_print_pack(induction)
+                    if opened_count:
+                        st.success(
+                            f"Opened {opened_count} induction pack file(s) for printing."
+                        )
+                    else:
+                        st.warning(
+                            "No induction form or competency certificates were available to print."
+                        )
+                st.caption(
+                    f"Pack contents: {print_pack_count} file(s) including the induction form and uploaded competency certificates."
+                )
+                if induction.completed_document_path and completed_document_path.exists():
+                    st.download_button(
+                        "Download Induction DOCX",
+                        data=completed_document_path.read_bytes(),
+                        file_name=completed_document_path.name,
+                        mime=_guess_download_mime_type(completed_document_path),
+                        key=f"download-induction-docx-{induction.doc_id}",
+                        width="stretch",
+                    )
+                signature_path = Path(induction.signature_image_path)
+                if induction.signature_image_path and signature_path.exists():
+                    st.download_button(
+                        "Download Signature",
+                        data=signature_path.read_bytes(),
+                        file_name=signature_path.name,
+                        mime=_guess_download_mime_type(signature_path),
+                        key=f"download-induction-signature-{induction.doc_id}",
+                        width="stretch",
+                    )
+                    st.image(str(signature_path), caption="Captured signature", width="stretch")
+
+                competency_paths = _split_induction_competency_paths(induction)
+                if competency_paths:
+                    st.caption("Competency Cards")
+                    for competency_path in competency_paths:
+                        if not competency_path.exists():
+                            continue
+                        st.download_button(
+                            f"Download {competency_path.name}",
+                            data=competency_path.read_bytes(),
+                            file_name=competency_path.name,
+                            mime=_guess_download_mime_type(competency_path),
+                            key=f"download-competency-{induction.doc_id}-{competency_path.name}",
+                            width="stretch",
+                        )
+                        if competency_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+                            st.image(
+                                str(competency_path),
+                                caption=competency_path.name,
+                                width="stretch",
+                            )
+                else:
+                    st.caption("No competency cards uploaded.")
+            st.divider()
 
         if pending_delete_doc_id != induction.doc_id:
             continue
@@ -4638,7 +11678,7 @@ def _render_site_induction_recent_submissions(
         if confirm_columns[0].button(
             "Confirm Delete",
             key=f"confirm-delete-induction-{induction.doc_id}",
-            use_container_width=True,
+            width="stretch",
         ):
             deleted_paths = repository.delete_document_and_files(induction.doc_id)
             st.session_state.pop("site_induction_delete_pending_doc_id", None)
@@ -4654,10 +11694,78 @@ def _render_site_induction_recent_submissions(
         if confirm_columns[1].button(
             "Cancel",
             key=f"cancel-delete-induction-{induction.doc_id}",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state.pop("site_induction_delete_pending_doc_id", None)
             st.rerun()
+
+
+def _render_site_induction_bulk_reset_panel(
+    repository: DocumentRepository,
+    inductions: List[InductionDocument],
+) -> None:
+    """Render a dedicated top-level reset panel for saved induction records."""
+
+    pending_bulk_delete = bool(st.session_state.get("site_induction_delete_all_pending"))
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Reset Saved Inductions</div>",
+        unsafe_allow_html=True,
+    )
+    st.warning(
+        "This removes the saved induction records for the active site from the app and "
+        "deletes linked DOCX, signature, and competency-card files."
+    )
+    if st.button(
+        "🗑️ Reset Saved Inductions",
+        key="reset-all-saved-inductions",
+        width="stretch",
+        type="secondary",
+        disabled=not inductions,
+    ):
+        st.session_state["site_induction_delete_all_pending"] = True
+        st.session_state.pop("site_induction_delete_pending_doc_id", None)
+        st.rerun()
+
+    if not inductions:
+        st.caption("No saved inductions are currently stored for this site.")
+    else:
+        st.caption(f"{len(inductions)} saved induction(s) currently stored for this site.")
+
+    if pending_bulk_delete:
+        st.error(
+            "Confirm reset: this will remove every saved induction record for this site."
+        )
+        bulk_confirm_columns = st.columns([1.2, 1.0, 3.8], gap="small")
+        if bulk_confirm_columns[0].button(
+            "Confirm Reset",
+            key="confirm-clear-all-saved-inductions",
+            width="stretch",
+        ):
+            deleted_paths = repository.delete_documents_and_files(
+                induction.doc_id for induction in inductions
+            )
+            st.session_state.pop("site_induction_delete_all_pending", None)
+            st.session_state.pop("site_induction_delete_pending_doc_id", None)
+            st.session_state.pop("site_induction_view_doc_id", None)
+            st.session_state["site_induction_delete_flash"] = (
+                f"Cleared {len(inductions)} saved induction(s)."
+                + (
+                    f" Removed {len(deleted_paths)} linked file(s)."
+                    if deleted_paths
+                    else " No linked files were present on disk."
+                )
+            )
+            st.rerun()
+        if bulk_confirm_columns[1].button(
+            "Cancel",
+            key="cancel-clear-all-saved-inductions",
+            width="stretch",
+        ):
+            st.session_state.pop("site_induction_delete_all_pending", None)
+            st.rerun()
+
+    st.divider()
 
 
 def _build_live_waste_register_rows(
@@ -4695,6 +11803,89 @@ def _format_waste_register_reference_for_ui(
         if part and part.strip()
     ]
     return " / ".join(parts)
+
+
+def _guess_download_mime_type(file_path: Path) -> str:
+    """Return a sensible download MIME type for one induction attachment."""
+
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix == ".png":
+        return "image/png"
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".docx":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return "application/octet-stream"
+
+
+def _split_induction_competency_paths(induction: InductionDocument) -> List[Path]:
+    """Return saved competency-card paths for one induction record."""
+
+    return [
+        Path(path_text)
+        for path_text in induction.competency_card_paths.split(",")
+        if path_text.strip()
+    ]
+
+
+def _build_induction_print_pack_paths(
+    induction: InductionDocument,
+) -> Dict[str, List[Path]]:
+    """Return the grouped file paths that make up one induction print pack."""
+
+    default_paths: List[Path] = []
+    preview_paths: List[Path] = []
+
+    completed_document_path = Path(induction.completed_document_path)
+    if induction.completed_document_path and completed_document_path.exists():
+        default_paths.append(completed_document_path)
+
+    for competency_path in _split_induction_competency_paths(induction):
+        if not competency_path.exists():
+            continue
+        if competency_path.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg"}:
+            preview_paths.append(competency_path)
+        else:
+            default_paths.append(competency_path)
+
+    return {"default": default_paths, "preview": preview_paths}
+
+
+def _open_induction_print_pack(induction: InductionDocument) -> int:
+    """Open the induction form and cert pack in print-friendly apps on macOS."""
+
+    pack_paths = _build_induction_print_pack_paths(induction)
+    opened_count = 0
+
+    if pack_paths["default"]:
+        try:
+            subprocess.run(
+                ["open", *[str(path) for path in pack_paths["default"]]],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            opened_count += len(pack_paths["default"])
+        except OSError:
+            pass
+
+    if pack_paths["preview"]:
+        try:
+            subprocess.run(
+                ["open", "-a", "Preview", *[str(path) for path in pack_paths["preview"]]],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            opened_count += len(pack_paths["preview"])
+        except OSError:
+            for preview_path in pack_paths["preview"]:
+                _open_workspace_path(preview_path)
+                opened_count += 1
+
+    return opened_count
 
 
 def _get_file_1_waste_note_source_path(

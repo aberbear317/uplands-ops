@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Uplands GPS Check</title>
+  <style>
+    :root {
+      --ink: #121826;
+      --muted: #667085;
+      --accent: #d1228e;
+      --border: #e5e7eb;
+      --bg: #f8fafc;
+      --card: rgba(255, 255, 255, 0.88);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(209,34,142,0.12), transparent 34%),
+        radial-gradient(circle at top right, rgba(91,141,239,0.10), transparent 30%),
+        var(--bg);
+      color: var(--ink);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: min(100%, 560px);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 28px 24px;
+      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.10);
+      text-align: center;
+      backdrop-filter: blur(18px);
+    }
+    img {
+      max-width: 220px;
+      width: 58%;
+      height: auto;
+      margin: 0 auto 18px;
+      display: block;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(1.8rem, 5vw, 2.5rem);
+      line-height: 1.05;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+    .status {
+      margin-top: 22px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .status.error {
+      color: #b42318;
+      background: rgba(254, 242, 242, 0.92);
+      border-color: rgba(254, 205, 211, 0.95);
+    }
+    .actions {
+      margin-top: 22px;
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 18px;
+      font-size: 0.98rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 180px;
+    }
+    .button.primary {
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 10px 24px rgba(209, 34, 142, 0.26);
+    }
+    .button.secondary {
+      background: white;
+      color: var(--ink);
+      border: 1px solid var(--border);
+    }
+    .small {
+      margin-top: 18px;
+      font-size: 0.92rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img src="/app/static/uplands-logo.png" alt="Uplands">
+    <h1>Checking Site GPS</h1>
+    <p>We need your location once to unlock the attendance register. If your browser asks, tap <strong>Allow</strong>.</p>
+    <div id="status" class="status">Tap the button below to request your current location.</div>
+    <div class="actions">
+      <button id="request" class="button primary" type="button">Use Current Location</button>
+      <button id="retry" class="button secondary" type="button">Retry GPS Access</button>
+      <a id="back" class="button secondary" href="/">Back to Register</a>
+    </div>
+    <p class="small">iPhone tip: Safari > aA > Website Settings > Location > Allow.</p>
+  </main>
+  <script>
+    (function () {
+      const query = new URLSearchParams(window.location.search);
+      const rawReturn = query.get("return") || "/?station=induction&mode=kiosk&kiosk_view=attendance";
+      const logoBack = document.getElementById("back");
+      const requestButton = document.getElementById("request");
+      const status = document.getElementById("status");
+      const retry = document.getElementById("retry");
+
+      function buildReturnUrl() {
+        return new URL(rawReturn, window.location.origin);
+      }
+
+      function redirectWithError(message) {
+        const url = buildReturnUrl();
+        url.searchParams.delete("geo_lat");
+        url.searchParams.delete("geo_lng");
+        url.searchParams.delete("geo_acc");
+        url.searchParams.set("geo_error", message || "Location access was not granted.");
+        window.location.replace(url.toString());
+      }
+
+      function redirectWithPosition(position) {
+        const url = buildReturnUrl();
+        url.searchParams.delete("geo_error");
+        url.searchParams.set("geo_lat", String(position.coords.latitude));
+        url.searchParams.set("geo_lng", String(position.coords.longitude));
+        if (position.coords.accuracy !== undefined && position.coords.accuracy !== null) {
+          url.searchParams.set("geo_acc", String(position.coords.accuracy));
+        } else {
+          url.searchParams.delete("geo_acc");
+        }
+        window.location.replace(url.toString());
+      }
+
+      function requestLocation() {
+        status.className = "status";
+        status.textContent = "Requesting location access...";
+        if (!navigator.geolocation) {
+          status.className = "status error";
+          status.textContent = "This browser does not support location services.";
+          redirectWithError("This browser does not support location services.");
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+          function (position) {
+            status.textContent = "GPS captured. Returning to the register...";
+            redirectWithPosition(position);
+          },
+          function (error) {
+            const message = error && error.message ? error.message : "Location access was not granted.";
+            status.className = "status error";
+            status.textContent = message;
+          },
+          { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+        );
+      }
+
+      logoBack.href = buildReturnUrl().toString();
+      requestButton.addEventListener("click", requestLocation);
+      retry.addEventListener("click", requestLocation);
+    })();
+  </script>
+</body>
+</html>

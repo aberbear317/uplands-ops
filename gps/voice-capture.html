@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Uplands Diary Dictation</title>
+  <style>
+    :root {
+      --ink: #121826;
+      --muted: #667085;
+      --accent: #d1228e;
+      --accent-2: #5b8def;
+      --surface: rgba(255, 255, 255, 0.94);
+      --border: rgba(226, 232, 240, 0.95);
+      --danger: #b42318;
+      --success: #027a48;
+      --bg: #f8fafc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(209, 34, 142, 0.12), transparent 34%),
+        radial-gradient(circle at top right, rgba(91, 141, 239, 0.10), transparent 30%),
+        var(--bg);
+      color: var(--ink);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: min(100%, 680px);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 30px 28px;
+      box-shadow: 0 28px 60px rgba(15, 23, 42, 0.14);
+      backdrop-filter: blur(18px);
+    }
+    img {
+      max-width: 220px;
+      width: 56%;
+      height: auto;
+      display: block;
+      margin: 0 auto 22px;
+    }
+    .eyebrow {
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      text-align: center;
+      margin-bottom: 0.55rem;
+    }
+    h1 {
+      margin: 0 0 0.55rem;
+      text-align: center;
+      font-size: clamp(1.7rem, 4vw, 2.5rem);
+      line-height: 1.03;
+      letter-spacing: -0.03em;
+    }
+    p.lead {
+      margin: 0 auto 1.4rem;
+      max-width: 44rem;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.55;
+      font-size: 1rem;
+    }
+    .field-chip {
+      margin: 0 auto 1.25rem;
+      width: fit-content;
+      border-radius: 999px;
+      padding: 0.5rem 0.85rem;
+      background: rgba(91, 141, 239, 0.10);
+      color: var(--ink);
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+    .status {
+      margin-bottom: 1rem;
+      border-radius: 18px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--muted);
+      font-weight: 600;
+      text-align: center;
+    }
+    .status.error {
+      border-color: rgba(254, 205, 211, 0.95);
+      background: rgba(254, 242, 242, 0.92);
+      color: var(--danger);
+    }
+    .status.success {
+      border-color: rgba(167, 243, 208, 0.95);
+      background: rgba(236, 253, 245, 0.95);
+      color: var(--success);
+    }
+    textarea {
+      width: 100%;
+      min-height: 180px;
+      resize: vertical;
+      border-radius: 22px;
+      border: 1px solid var(--border);
+      padding: 16px 18px;
+      font: 500 1rem/1.55 "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    textarea:focus {
+      outline: none;
+      border-color: rgba(209, 34, 142, 0.40);
+      box-shadow: 0 0 0 4px rgba(209, 34, 142, 0.10);
+    }
+    .actions {
+      margin-top: 1rem;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 18px;
+      font: 800 0.96rem/1 "Avenir Next", "Segoe UI", sans-serif;
+      cursor: pointer;
+      transition: transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+      transform: none;
+      box-shadow: none;
+    }
+    .primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+      box-shadow: 0 14px 30px rgba(91, 141, 239, 0.24);
+    }
+    .secondary {
+      background: #fff;
+      color: var(--ink);
+      border: 1px solid var(--border);
+    }
+    .hint {
+      margin-top: 1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      line-height: 1.45;
+    }
+    @media (max-width: 640px) {
+      .actions {
+        grid-template-columns: 1fr;
+      }
+      .card {
+        padding: 24px 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img src="/gps/uplands-logo.png" alt="Uplands">
+    <div class="eyebrow">Daily Site Diary</div>
+    <h1>Voice Dictation</h1>
+    <p class="lead">Speak your update, review the transcript, then send it straight back into the Site Diary without losing your place.</p>
+    <div id="field-chip" class="field-chip">Diary Field</div>
+    <div id="status" class="status">Preparing dictation…</div>
+    <textarea id="transcript" placeholder="Your spoken dictation will appear here. You can adjust the wording before sending it back to the diary."></textarea>
+    <div class="actions">
+      <button id="start" class="primary" type="button">🎙️ Start Dictation</button>
+      <button id="send" class="secondary" type="button" disabled>Use Transcript</button>
+      <button id="cancel" class="secondary" type="button">Cancel</button>
+    </div>
+    <p class="hint">Best results come from Chrome, Edge, or a modern Safari build with microphone access allowed for this site.</p>
+  </main>
+  <script>
+    (function () {
+      const query = new URLSearchParams(window.location.search);
+      const target = (query.get("target") || "").trim();
+      const fieldLabel = (query.get("label") || "Diary Field").trim();
+      const rawReturn = (query.get("return") || "/").trim();
+      const fieldChip = document.getElementById("field-chip");
+      const status = document.getElementById("status");
+      const transcriptBox = document.getElementById("transcript");
+      const startButton = document.getElementById("start");
+      const sendButton = document.getElementById("send");
+      const cancelButton = document.getElementById("cancel");
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      let recognition = null;
+
+      fieldChip.textContent = fieldLabel;
+
+      function buildReturnUrl() {
+        return new URL(rawReturn || "/", window.location.origin);
+      }
+
+      function resolveDiaryWindow() {
+        if (!window.opener || window.opener.closed) {
+          return null;
+        }
+        const candidates = [];
+        try {
+          if (window.opener.top) {
+            candidates.push(window.opener.top);
+          }
+        } catch (error) {
+          console.error(error);
+        }
+        try {
+          if (window.opener.parent) {
+            candidates.push(window.opener.parent);
+          }
+        } catch (error) {
+          console.error(error);
+        }
+        candidates.push(window.opener);
+        for (const candidate of candidates) {
+          if (!candidate) {
+            continue;
+          }
+          try {
+            if (!candidate.closed && candidate.location) {
+              return candidate;
+            }
+          } catch (error) {
+            console.error(error);
+          }
+        }
+        return null;
+      }
+
+      function applyResultToDiary(payload) {
+        const targetWindow = resolveDiaryWindow();
+        if (!targetWindow) {
+          status.className = "status error";
+          status.textContent = "The diary page is no longer available. Close this window and try again.";
+          return;
+        }
+
+        const returnUrl = buildReturnUrl();
+        returnUrl.searchParams.set("dictation_target", target);
+        returnUrl.searchParams.set("dictation_nonce", String(Date.now()));
+        returnUrl.searchParams.delete("dictation_error");
+        returnUrl.searchParams.delete("dictation_text");
+        if (payload && payload.error) {
+          returnUrl.searchParams.set("dictation_error", String(payload.error));
+        }
+        if (payload && payload.transcript) {
+          returnUrl.searchParams.set("dictation_text", String(payload.transcript));
+        }
+        returnUrl.hash = "site-diary-editor";
+
+        try {
+          targetWindow.location.replace(returnUrl.toString());
+          try {
+            targetWindow.focus();
+          } catch (error) {
+            console.error(error);
+          }
+        } catch (error) {
+          console.error(error);
+          status.className = "status error";
+          status.textContent = "The diary page could not be updated automatically.";
+          return;
+        }
+      }
+
+      function setIdle(message) {
+        status.className = "status";
+        status.textContent = message;
+      }
+
+      function setError(message) {
+        status.className = "status error";
+        status.textContent = message;
+      }
+
+      function setSuccess(message) {
+        status.className = "status success";
+        status.textContent = message;
+      }
+
+      function beginRecognition() {
+        if (!SpeechRecognition) {
+          const message = "This browser does not support native speech dictation.";
+          setError(message);
+          return;
+        }
+
+        if (recognition) {
+          try {
+            recognition.stop();
+          } catch (error) {
+            console.error(error);
+          }
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.lang = "en-GB";
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.maxAlternatives = 1;
+
+        startButton.disabled = true;
+        sendButton.disabled = true;
+        setIdle("Listening… speak naturally and pause when you are done.");
+
+        recognition.onresult = function (event) {
+          const transcript = Array.from(event.results || [])
+            .map((result) => result[0] ? result[0].transcript : "")
+            .join(" ")
+            .trim();
+          transcriptBox.value = transcript;
+        };
+
+        recognition.onerror = function (event) {
+          startButton.disabled = false;
+          const errorCode = event && event.error ? String(event.error) : "unknown";
+          let message = "Dictation could not start.";
+          if (errorCode === "not-allowed" || errorCode === "service-not-allowed") {
+            message = "Microphone permission was blocked by the browser.";
+          } else if (errorCode === "no-speech") {
+            message = "No speech was detected. Try again.";
+          } else if (errorCode === "audio-capture") {
+            message = "No microphone was available on this device.";
+          } else if (errorCode === "aborted") {
+            message = "Dictation was cancelled before any transcript was captured.";
+          }
+          setError(message);
+          applyResultToDiary({ error: message });
+          recognition = null;
+        };
+
+        recognition.onend = function () {
+          startButton.disabled = false;
+          recognition = null;
+          const transcript = transcriptBox.value.trim();
+          if (transcript) {
+            sendButton.disabled = false;
+            setSuccess("Transcript ready. Review it if needed, then send it back to the diary.");
+          } else {
+            setError("No speech was captured. Try again.");
+          }
+        };
+
+        try {
+          recognition.start();
+        } catch (error) {
+          console.error(error);
+          startButton.disabled = false;
+          setError("The browser could not start dictation. Try again.");
+          recognition = null;
+        }
+      }
+
+      startButton.addEventListener("click", beginRecognition);
+      sendButton.addEventListener("click", function () {
+        const transcript = transcriptBox.value.trim();
+        if (!transcript) {
+          setError("There is no transcript to send back yet.");
+          return;
+        }
+        setSuccess("Sending transcript back to the Site Diary…");
+        applyResultToDiary({ transcript: transcript });
+        window.setTimeout(function () {
+          window.close();
+        }, 650);
+      });
+      cancelButton.addEventListener("click", function () {
+        window.close();
+      });
+
+      setIdle("Click Start Dictation, speak your update, then send the transcript back into the diary.");
+    })();
+  </script>
+</body>
+</html>

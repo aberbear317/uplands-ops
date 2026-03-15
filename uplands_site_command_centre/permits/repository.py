@@ -201,11 +201,22 @@ class DocumentRepository:
                 for row in indexed_file_rows
                 if row["file_path"]
             }
-            for payload_key in ("signature_image_path", "completed_document_path"):
+            for payload_key in (
+                "signature_image_path",
+                "completed_document_path",
+                "sign_in_signature_path",
+                "sign_out_signature_path",
+                "generated_document_path",
+            ):
                 payload_value = payload.get(payload_key)
                 if not payload_value:
                     continue
                 candidate_paths.add(Path(str(payload_value)).resolve())
+            competency_card_paths = str(payload.get("competency_card_paths", "") or "")
+            for path_text in competency_card_paths.split(","):
+                if not path_text.strip():
+                    continue
+                candidate_paths.add(Path(path_text.strip()).resolve())
 
             connection.execute(
                 "DELETE FROM indexed_files WHERE related_doc_id = ?",
@@ -224,6 +235,19 @@ class DocumentRepository:
                     deleted_paths.append(candidate_path)
             except OSError:
                 continue
+        return deleted_paths
+
+    def delete_documents_and_files(self, doc_ids: Iterable[str]) -> List[Path]:
+        """Delete multiple documents and collect every linked physical file removed."""
+
+        deleted_paths: List[Path] = []
+        seen_doc_ids = set()
+        for doc_id in doc_ids:
+            resolved_doc_id = str(doc_id).strip()
+            if not resolved_doc_id or resolved_doc_id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(resolved_doc_id)
+            deleted_paths.extend(self.delete_document_and_files(resolved_doc_id))
         return deleted_paths
 
     def delete_indexed_file(self, file_path: Union[str, Path]) -> None:
