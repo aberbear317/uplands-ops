@@ -61,6 +61,7 @@ from uplands_site_command_centre.workspace import (
     build_live_site_broadcast_contacts,
     build_site_alert_sms_link,
     build_site_alert_sms_links,
+    build_site_gate_access_code,
     build_pending_toolbox_talk_contacts,
     build_toolbox_talk_sms_message,
     build_toolbox_talk_url,
@@ -105,6 +106,7 @@ from uplands_site_command_centre.workspace import (
     sync_file_4_permit_records,
     launch_messages_sms_broadcast,
     log_broadcast_dispatch,
+    validate_site_gate_access_code,
 )
 
 
@@ -1638,6 +1640,84 @@ class IngestionEngineTests(unittest.TestCase):
             self.assertAlmostEqual(s_carter.totalHours, 8.5)
             self.assertEqual(register.site_name, "Uplands - Cardiff")
 
+    def test_ingestion_engine_recovers_short_kpi_dates_from_row_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+            engine = IngestionEngine(repository)
+            json_path = Path(temp_dir) / "attendance_export.json"
+
+            with json_path.open("w", encoding="utf-8") as file_handle:
+                json.dump(
+                    {
+                        "version": 1,
+                        "settings": {"siteName": "Uplands - Cardiff"},
+                        "extractedRows": {
+                            "weekly": [
+                                {
+                                    "id": "extracted:weekly:2026-03-12|url|c edwards|10:40|12:00",
+                                    "date": "12/03",
+                                    "company": "URL",
+                                    "workerName": "C Edwards",
+                                    "timeIn": "10:40",
+                                    "timeOut": "12:00",
+                                    "totalHours": 1.33,
+                                    "isSeniorManager": False,
+                                }
+                            ],
+                            "eom": [],
+                        },
+                    },
+                    file_handle,
+                )
+
+            register = engine.ingest_site_attendance_json(
+                json_path,
+                site_name="Uplands - Cardiff",
+            )
+
+            self.assertEqual(len(register.attendance_records), 1)
+            self.assertEqual(register.attendance_records[0].date, date(2026, 3, 12))
+
+    def test_ingestion_engine_accepts_year_month_day_slash_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+            engine = IngestionEngine(repository)
+            json_path = Path(temp_dir) / "attendance_export.json"
+
+            with json_path.open("w", encoding="utf-8") as file_handle:
+                json.dump(
+                    {
+                        "version": 1,
+                        "settings": {"siteName": "Uplands - Cardiff"},
+                        "extractedRows": {
+                            "weekly": [
+                                {
+                                    "id": "extracted:weekly:2026/03/13|150|r minard|07:30|13:00",
+                                    "date": "2026/03/13",
+                                    "company": "150",
+                                    "workerName": "R Minard",
+                                    "timeIn": "07:30",
+                                    "timeOut": "13:00",
+                                    "totalHours": 5.5,
+                                    "isSeniorManager": False,
+                                }
+                            ],
+                            "eom": [],
+                        },
+                    },
+                    file_handle,
+                )
+
+            register = engine.ingest_site_attendance_json(
+                json_path,
+                site_name="Uplands - Cardiff",
+            )
+
+            self.assertEqual(len(register.attendance_records), 1)
+            self.assertEqual(register.attendance_records[0].date, date(2026, 3, 13))
+
 
 class SiteWorkerRosterTests(unittest.TestCase):
     def test_build_site_worker_roster_reads_all_active_kpi_arrays(self) -> None:
@@ -1728,6 +1808,36 @@ class SiteWorkerRosterTests(unittest.TestCase):
 
             self.assertEqual(len(roster), 1)
             self.assertEqual(roster[0].worker_name, "S. Carter")
+
+    def test_build_site_worker_roster_recovers_short_kpi_dates_from_row_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_path = Path(temp_dir) / "site-kpi-backup-short-date.json"
+            with json_path.open("w", encoding="utf-8") as file_handle:
+                json.dump(
+                    {
+                        "settings": {"siteName": "NG Lovedean Substation"},
+                        "extractedRows": {
+                            "weekly": [
+                                {
+                                    "id": "extracted:weekly:2026-03-12|url|c edwards|10:40|12:00",
+                                    "date": "12/03",
+                                    "company": "URL",
+                                    "workerName": "C Edwards",
+                                }
+                            ]
+                        },
+                    },
+                    file_handle,
+                )
+
+            roster = build_site_worker_roster(
+                site_name="NG Lovedean Substation",
+                source_paths=[json_path],
+            )
+
+            self.assertEqual(len(roster), 1)
+            self.assertEqual(roster[0].worker_name, "C Edwards")
+            self.assertEqual(roster[0].last_on_site_date, date(2026, 3, 12))
 
 
 class WorkspaceFileIndexingTests(unittest.TestCase):
@@ -3905,6 +4015,65 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             )
             self.assertTrue(attendance_entry.is_uplands_employee)
 
+    def test_file_4_company_options_include_roster_and_trusted_company_values(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            repository.save(
+                InductionDocument(
+                    doc_id="IND-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 13, 7, 0),
+                    status=DocumentStatus.ACTIVE,
+                    contractor_name="A. Archer Electrical",
+                    individual_name="A Hustler",
+                )
+            )
+            repository.save(
+                SiteAttendanceRegister(
+                    doc_id="SAR-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 13, 17, 0),
+                    status=DocumentStatus.ACTIVE,
+                    attendance_records=[
+                        SiteAttendanceRecord(
+                            date=date(2026, 3, 13),
+                            company="150",
+                            workerName="A Hustler",
+                            timeIn=time(7, 30),
+                            timeOut=time(16, 0),
+                            totalHours=8.5,
+                        )
+                    ],
+                )
+            )
+
+            with patch.object(
+                app_module,
+                "build_site_worker_roster",
+                return_value=[
+                    SiteWorker(
+                        company="150",
+                        worker_name="A Hustler",
+                        last_on_site_date=date(2026, 3, 13),
+                    )
+                ],
+            ):
+                company_options = app_module._build_file_4_company_options(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    worker_name="A Hustler",
+                    default_company="150",
+                )
+
+            self.assertIn("150", company_options)
+            self.assertIn("A. Archer Electrical", company_options)
+            self.assertEqual(company_options[-1], "🏢 Other Company (Type Below)")
+
     def test_daily_attendance_sign_in_and_sign_out_round_trip(self) -> None:
         class SignInDateTime(datetime):
             @classmethod
@@ -4062,6 +4231,107 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             self.assertIsNotNone(resolved_entry)
             self.assertEqual(resolved_entry.doc_id, latest_entry.doc_id)
             self.assertEqual(resolved_entry.vehicle_registration, "XY34 ZZZ")
+            self.assertEqual(resolved_entry.distance_travelled, "14 miles")
+
+    def test_resolve_attendance_sign_in_selection_prefers_pending_doc_id(self) -> None:
+        records = [
+            InductionDocument(
+                doc_id="IND-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="A. Archer Electrical",
+                individual_name="Sean Carter",
+            ),
+            InductionDocument(
+                doc_id="IND-002",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 5),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="Uplands Construction Group",
+                individual_name="Luke Green",
+            ),
+        ]
+
+        resolved_doc_id = app_module._resolve_attendance_sign_in_selection(
+            filtered_records=records,
+            current_doc_id="",
+            pending_doc_id="IND-002",
+        )
+
+        self.assertEqual(resolved_doc_id, "IND-002")
+
+    def test_resolve_attendance_sign_in_selection_auto_selects_single_match(self) -> None:
+        records = [
+            InductionDocument(
+                doc_id="IND-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="A. Archer Electrical",
+                individual_name="Sean Carter",
+            )
+        ]
+
+        resolved_doc_id = app_module._resolve_attendance_sign_in_selection(
+            filtered_records=records,
+            current_doc_id="",
+            pending_doc_id="",
+        )
+
+        self.assertEqual(resolved_doc_id, "IND-001")
+
+    def test_resolve_attendance_sign_out_selection_preserves_current_match(self) -> None:
+        entries = [
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 20),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                time_in=datetime(2026, 3, 15, 7, 20),
+            ),
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-002",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 25),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-002",
+                individual_name="Luke Green",
+                contractor_name="Uplands Construction Group",
+                time_in=datetime(2026, 3, 15, 7, 25),
+            ),
+        ]
+
+        resolved_doc_id = app_module._resolve_attendance_sign_out_selection(
+            filtered_entries=entries,
+            current_doc_id="ATT-002",
+        )
+
+        self.assertEqual(resolved_doc_id, "ATT-002")
+
+    def test_resolve_attendance_sign_out_selection_auto_selects_single_match(self) -> None:
+        entries = [
+            DailyAttendanceEntryDocument(
+                doc_id="ATT-001",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 15, 7, 20),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                time_in=datetime(2026, 3, 15, 7, 20),
+            )
+        ]
+
+        resolved_doc_id = app_module._resolve_attendance_sign_out_selection(
+            filtered_entries=entries,
+            current_doc_id="",
+        )
+
+        self.assertEqual(resolved_doc_id, "ATT-001")
 
     def test_generate_attendance_register_document_writes_today_sheet_to_file_2(
         self,
@@ -4566,6 +4836,50 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             calculate_haversine_distance_meters(50.917, -1.036, 50.918, -1.036),
             120.0,
         )
+
+    def test_site_gate_access_code_validates_current_and_previous_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "settings.json"
+            with patch.object(app_config, "SETTINGS_PATH", settings_path):
+                generated_code, minutes_remaining = build_site_gate_access_code(
+                    "NG Lovedean Substation",
+                    at_time=datetime(2026, 3, 15, 10, 10),
+                    slot_minutes=30,
+                )
+                self.assertEqual(len(generated_code), 6)
+                self.assertGreaterEqual(minutes_remaining, 1)
+                self.assertTrue(
+                    validate_site_gate_access_code(
+                        "NG Lovedean Substation",
+                        generated_code,
+                        at_time=datetime(2026, 3, 15, 10, 10),
+                        slot_minutes=30,
+                    )
+                )
+                self.assertTrue(
+                    validate_site_gate_access_code(
+                        "NG Lovedean Substation",
+                        generated_code,
+                        at_time=datetime(2026, 3, 15, 10, 35),
+                        slot_minutes=30,
+                    )
+                )
+                self.assertFalse(
+                    validate_site_gate_access_code(
+                        "NG Lovedean Substation",
+                        generated_code,
+                        at_time=datetime(2026, 3, 15, 11, 15),
+                        slot_minutes=30,
+                    )
+                )
+                self.assertFalse(
+                    validate_site_gate_access_code(
+                        "11 station close",
+                        generated_code,
+                        at_time=datetime(2026, 3, 15, 10, 10),
+                        slot_minutes=30,
+                    )
+                )
 
     def test_build_pending_toolbox_talk_contacts_returns_only_unsigned_live_people(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

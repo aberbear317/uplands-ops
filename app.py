@@ -12,7 +12,7 @@ import re
 import subprocess
 import time
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 
 import pandas as pd
 import streamlit as st
@@ -73,6 +73,7 @@ from uplands_site_command_centre import (
     build_site_alert_sms_links,
     build_pending_toolbox_talk_contacts,
     build_site_worker_roster,
+    build_site_gate_access_code,
     build_toolbox_talk_sms_message,
     calculate_haversine_distance_meters,
     check_carrier_compliance,
@@ -85,6 +86,7 @@ from uplands_site_command_centre import (
     generate_toolbox_talk_register_document,
     generate_site_diary_document,
     detect_public_tunnel_url_from_log,
+    ensure_gate_access_secret,
     generate_attendance_register_document,
     generate_site_induction_poster,
     generate_coshh_register_document,
@@ -114,6 +116,7 @@ from uplands_site_command_centre import (
     smart_scan_waste_transfer_note,
     sync_file_4_permit_records,
     update_logged_waste_transfer_note,
+    validate_site_gate_access_code,
     build_toolbox_talk_url,
     launch_messages_sms_broadcast,
     log_broadcast_dispatch,
@@ -149,6 +152,7 @@ ATTENDANCE_FORM_METADATA = (
     "Date Issued: 12-AUG-2013 | Document Type: FORM | Created by: HSEQ Dept."
 )
 GEOFENCE_RADIUS_METERS = 500
+SITE_GATE_CODE_SLOT_MINUTES = 30
 LADDER_CHECKLIST_QUESTIONS: Dict[int, str] = {
     1: "Safer alternative eliminated",
     2: "Task-specific RAMS prepared and approved",
@@ -1281,6 +1285,9 @@ def _synchronise_public_tunnel_settings(project_setup: ProjectSetup) -> ProjectS
 def _reset_ladder_permit_form_state() -> None:
     """Reset the File 4 permit helper fields back to their default values."""
 
+    st.session_state["ladder_permit_company_context_worker"] = ""
+    st.session_state["ladder_permit_company_selection"] = ""
+    st.session_state["ladder_permit_worker_company_override"] = ""
     st.session_state["ladder_permit_description_of_work"] = ""
     st.session_state["ladder_permit_location_of_work"] = ""
     st.session_state["ladder_permit_supervisor_name"] = SITE_MANAGER_NAME
@@ -1292,6 +1299,12 @@ def _reset_ladder_permit_form_state() -> None:
     st.session_state["ladder_permit_inspection_comments"] = "No defects found"
     for question_number in LADDER_CHECKLIST_QUESTIONS:
         st.session_state[f"ladder_permit_q{question_number}"] = True
+
+
+def _queue_ladder_permit_form_reset() -> None:
+    """Queue a safe File 4 permit reset for the next rerun before widgets render."""
+
+    st.session_state["ladder_permit_reset_pending"] = True
 
 
 def _reset_site_induction_form_state() -> None:
@@ -1345,6 +1358,7 @@ def _reset_site_induction_form_state() -> None:
         "site_induction_fire_warden_upload",
         "site_induction_supervisor_upload",
         "site_induction_smsts_upload",
+        "site_induction_kiosk_complete_doc_id",
         "site_induction_view_doc_id",
     ):
         st.session_state.pop(transient_key, None)
@@ -1412,8 +1426,11 @@ def _reset_site_attendance_form_state() -> None:
     state_defaults = {
         "site_attendance_action_mode": "sign_in",
         "site_attendance_worker_search": "",
+        "site_attendance_sign_out_search": "",
+        "site_attendance_prefill_induction_doc_id": "",
         "site_attendance_selected_induction_doc_id": "",
         "site_attendance_vehicle_registration_context_doc_id": "",
+        "site_attendance_distance_travelled_context_doc_id": "",
         "site_attendance_vehicle_registration": "",
         "site_attendance_distance_travelled": "",
         "site_attendance_selected_sign_out_doc_id": "",
@@ -1485,7 +1502,7 @@ def _get_kiosk_view_from_query_params() -> str:
 def _clear_kiosk_geolocation_query_params() -> None:
     """Remove any previously captured kiosk geolocation query params."""
 
-    for key in ("geo_lat", "geo_lng", "geo_acc", "geo_error", "geo_nonce"):
+    for key in ("geo_lat", "geo_lng", "geo_acc", "geo_error", "geo_nonce", "geo_source"):
         if key in st.query_params:
             del st.query_params[key]
 
@@ -1645,22 +1662,155 @@ def _apply_site_diary_dictation_query_payload(site_name: str) -> None:
         _clear_site_diary_dictation_query_params()
 
 
-def _build_kiosk_geolocation_capture_path(*, kiosk_view: str) -> str:
+def _get_site_gate_secret() -> str:
+    """Return the persistent secret used to build short-lived site gate codes."""
+
+    return ensure_gate_access_secret()
+
+
+def _get_site_gate_code(site_name: str) -> tuple[str, int]:
+    """Return the current six-digit site gate code and minutes until refresh."""
+
+    _get_site_gate_secret()
+    return build_site_gate_access_code(
+        site_name,
+        slot_minutes=SITE_GATE_CODE_SLOT_MINUTES,
+    )
+
+
+def _validate_site_gate_code(site_name: str, submitted_code: str) -> bool:
+    """Return True when the submitted fallback gate code is currently valid."""
+
+    _get_site_gate_secret()
+    return validate_site_gate_access_code(
+        site_name,
+        submitted_code,
+        slot_minutes=SITE_GATE_CODE_SLOT_MINUTES,
+        accepted_previous_slots=1,
+    )
+
+
+def _clear_kiosk_geofence_session_verification() -> None:
+    """Drop any session-level kiosk verification state for the current browser session."""
+
+    for key in (
+        "site_attendance_geofence_verified_site",
+        "site_attendance_geofence_verified_method",
+        "site_attendance_geofence_verified_note",
+        "site_attendance_geofence_verified_distance_meters",
+        "site_attendance_geofence_verified_accuracy_meters",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _get_kiosk_geofence_session_verification(
+    project_setup: ProjectSetup,
+) -> Optional[Dict[str, Any]]:
+    """Return the active kiosk verification state for this site, if one exists."""
+
+    verified_site_name = str(
+        st.session_state.get("site_attendance_geofence_verified_site", "") or ""
+    ).strip()
+    if not verified_site_name:
+        return None
+    if verified_site_name.casefold() != project_setup.current_site_name.casefold():
+        _clear_kiosk_geofence_session_verification()
+        return None
+    return {
+        "method": str(
+            st.session_state.get("site_attendance_geofence_verified_method", "") or ""
+        ).strip(),
+        "note": str(
+            st.session_state.get("site_attendance_geofence_verified_note", "") or ""
+        ).strip(),
+        "distance_meters": st.session_state.get(
+            "site_attendance_geofence_verified_distance_meters"
+        ),
+        "accuracy_meters": st.session_state.get(
+            "site_attendance_geofence_verified_accuracy_meters"
+        ),
+    }
+
+
+def _set_kiosk_geofence_session_verification(
+    project_setup: ProjectSetup,
+    *,
+    method: str,
+    note: str,
+    distance_meters: Optional[float],
+    accuracy_meters: Optional[float],
+) -> None:
+    """Persist one successful kiosk verification in Streamlit session state."""
+
+    st.session_state["site_attendance_geofence_verified_site"] = (
+        project_setup.current_site_name
+    )
+    st.session_state["site_attendance_geofence_verified_method"] = method.strip()
+    st.session_state["site_attendance_geofence_verified_note"] = note.strip()
+    st.session_state["site_attendance_geofence_verified_distance_meters"] = (
+        float(distance_meters) if distance_meters is not None else None
+    )
+    st.session_state["site_attendance_geofence_verified_accuracy_meters"] = (
+        float(accuracy_meters) if accuracy_meters is not None else None
+    )
+
+
+def _format_kiosk_verification_message(verification_state: Mapping[str, Any]) -> str:
+    """Return a human-readable success message for the current kiosk gate state."""
+
+    method = str(verification_state.get("method") or "").strip().casefold()
+    distance_meters = verification_state.get("distance_meters")
+    accuracy_meters = verification_state.get("accuracy_meters")
+    distance_suffix = (
+        f" Distance {float(distance_meters):.0f}m."
+        if isinstance(distance_meters, (int, float))
+        else ""
+    )
+    accuracy_suffix = (
+        f" GPS accuracy ±{float(accuracy_meters):.0f}m."
+        if isinstance(accuracy_meters, (int, float))
+        else ""
+    )
+    if method == "trusted_device":
+        return (
+            "✅ Gate already verified in this browser session. "
+            "Using the last on-site GPS check."
+            f"{distance_suffix}{accuracy_suffix}"
+        )
+    if method == "gate_code":
+        return (
+            "✅ Gate code accepted. The register is unlocked for this device session."
+        )
+    return f"✅ GPS Verified: You are on site.{distance_suffix}{accuracy_suffix}"
+
+
+def _build_kiosk_geolocation_capture_path(
+    *,
+    kiosk_view: str,
+    project_setup: ProjectSetup,
+) -> str:
     """Return the top-level GPS capture page URL for kiosk attendance."""
 
-    return_target = (
-        f"/?station=induction&mode=kiosk&kiosk_view={kiosk_view}"
+    return_target = f"/?station=induction&mode=kiosk&kiosk_view={kiosk_view}"
+    return_query = urlencode(
+        {
+            "v": "20260315c",
+            "prefix": "geo",
+            "return": return_target,
+            "site_name": project_setup.current_site_name,
+            "site_lat": f"{project_setup.site_latitude:.6f}",
+            "site_lng": f"{project_setup.site_longitude:.6f}",
+            "site_radius": str(int(project_setup.geofence_radius_meters)),
+        }
     )
-    return (
-        "/gps/geo-capture.html"
-        f"?v=20260314e&prefix=geo&return={quote(return_target, safe='')}"
-    )
+    return f"/gps/geo-capture.html?{return_query}"
 
 
 def _build_kiosk_geolocation_capture_url(
     *,
     public_url: str,
     kiosk_view: str,
+    project_setup: ProjectSetup,
 ) -> str:
     """Return an absolute GPS-capture URL for the current environment."""
 
@@ -1677,7 +1827,8 @@ def _build_kiosk_geolocation_capture_url(
         fragment="",
     )
     return urlunparse(normalized_base) + _build_kiosk_geolocation_capture_path(
-        kiosk_view=kiosk_view
+        kiosk_view=kiosk_view,
+        project_setup=project_setup,
     )
 
 
@@ -1698,7 +1849,7 @@ def _build_project_setup_geolocation_capture_url(*, public_url: str) -> str:
     )
     return (
         urlunparse(normalized_base)
-        + "/gps/geo-capture.html?v=20260314e&prefix=setup_geo&return=%2F"
+        + "/gps/geo-capture.html?v=20260315c&prefix=setup_geo&return=%2F"
     )
 
 
@@ -3920,6 +4071,9 @@ def _render_sidebar_tools(
     """Render document-generation tools for live site paperwork."""
 
     with st.expander("Tools", expanded=False):
+        if st.session_state.pop("ladder_permit_reset_pending", False):
+            _reset_ladder_permit_form_state()
+
         st.caption("Generate a draft ladder permit from the live contractor roster.")
         st.caption(f"Output folder: {PERMITS_DESTINATION.name}")
         st.caption(
@@ -3980,11 +4134,41 @@ def _render_sidebar_tools(
                 options=worker_labels,
             )
             selected_worker, _ = worker_options[selected_worker_label]
-            st.text_input(
-                "Company",
-                value=selected_worker.company,
-                disabled=True,
+            company_context_key = "ladder_permit_company_context_worker"
+            company_selection_key = "ladder_permit_company_selection"
+            company_override_key = "ladder_permit_worker_company_override"
+            company_options = _build_file_4_company_options(
+                repository,
+                site_name=project_setup.current_site_name,
+                worker_name=selected_worker.worker_name,
+                default_company=selected_worker.company,
             )
+            selected_worker_company = selected_worker.company.strip()
+            if st.session_state.get(company_context_key) != selected_worker_label:
+                st.session_state[company_selection_key] = (
+                    selected_worker_company
+                    if selected_worker_company in company_options
+                    else (
+                        company_options[0]
+                        if company_options
+                        else "🏢 Other Company (Type Below)"
+                    )
+                )
+                st.session_state[company_override_key] = ""
+                st.session_state[company_context_key] = selected_worker_label
+            selected_company_option = st.selectbox(
+                "Company",
+                options=company_options,
+                key=company_selection_key,
+            )
+            if selected_company_option == "🏢 Other Company (Type Below)":
+                resolved_worker_company = st.text_input(
+                    "Enter Company Name",
+                    key=company_override_key,
+                    placeholder="Enter contractor name",
+                )
+            else:
+                resolved_worker_company = selected_company_option
             description_of_work = st.text_input(
                 "Description of Work",
                 value=st.session_state.get(
@@ -4077,11 +4261,11 @@ def _render_sidebar_tools(
             )
 
         if st.button(
-            "↺ Clear Form",
+            "↺ Reset Permit",
             key="ladder_permit_clear_form",
             width="stretch",
         ):
-            _reset_ladder_permit_form_state()
+            _queue_ladder_permit_form_reset()
             st.session_state["ladder_permit_flash"] = {
                 "level": "success",
                 "message": "File 4 permit form reset.",
@@ -4093,10 +4277,15 @@ def _render_sidebar_tools(
 
         _, selected_record = worker_options[selected_worker_label]
         try:
+            if not str(resolved_worker_company or "").strip():
+                raise ValidationError(
+                    "Enter the correct contractor name before issuing the permit."
+                )
             generated_permit = create_ladder_permit_draft(
                 repository,
                 attendance_record=selected_record,
                 site_worker=selected_worker,
+                worker_company_override=resolved_worker_company,
                 description_of_work=description_of_work,
                 location_of_work=location_of_work,
                 supervisor_name=supervisor_name,
@@ -5363,6 +5552,39 @@ def _attendance_sign_out_label(attendance_entry: DailyAttendanceEntryDocument) -
     )
 
 
+def _resolve_attendance_sign_in_selection(
+    *,
+    filtered_records: List[InductionDocument],
+    current_doc_id: str,
+    pending_doc_id: str = "",
+) -> str:
+    """Return the best induction doc id to preselect in the live sign-in picker."""
+
+    available_doc_ids = {record.doc_id for record in filtered_records}
+    if pending_doc_id and pending_doc_id in available_doc_ids:
+        return pending_doc_id
+    if current_doc_id and current_doc_id in available_doc_ids:
+        return current_doc_id
+    if len(filtered_records) == 1:
+        return filtered_records[0].doc_id
+    return ""
+
+
+def _resolve_attendance_sign_out_selection(
+    *,
+    filtered_entries: List[DailyAttendanceEntryDocument],
+    current_doc_id: str,
+) -> str:
+    """Return the best live attendance doc id to preselect for sign-out."""
+
+    available_doc_ids = {entry.doc_id for entry in filtered_entries}
+    if current_doc_id and current_doc_id in available_doc_ids:
+        return current_doc_id
+    if len(filtered_entries) == 1:
+        return filtered_entries[0].doc_id
+    return ""
+
+
 def _is_uplands_company(company_name: str) -> bool:
     """Return True when the company should count as an Uplands employee."""
 
@@ -5385,6 +5607,7 @@ def _build_live_fire_roll_rows(
             "Time In": attendance_entry.time_in.strftime("%H:%M"),
             "Vehicle Reg": attendance_entry.vehicle_registration or "—",
             "Distance Travelled": attendance_entry.distance_travelled or "—",
+            "Gate Check": _format_gate_verification_display(attendance_entry),
             "Category": (
                 "Uplands Employee"
                 if attendance_entry.is_uplands_employee
@@ -5518,6 +5741,7 @@ def _build_todays_attendance_log_rows(
             ),
             "Status": "On Site" if attendance_entry.is_on_site else "Signed Out",
             "Vehicle Reg": attendance_entry.vehicle_registration or "—",
+            "Gate Check": _format_gate_verification_display(attendance_entry),
         }
         for attendance_entry in sorted(
             attendance_entries,
@@ -5525,6 +5749,28 @@ def _build_todays_attendance_log_rows(
             reverse=True,
         )
     ]
+
+
+def _format_gate_verification_display(
+    attendance_entry: DailyAttendanceEntryDocument,
+) -> str:
+    """Return a compact gate verification label for manager-facing tables."""
+
+    raw_method = str(attendance_entry.gate_verification_method or "").strip().casefold()
+    if raw_method == "trusted_device":
+        method_label = "Trusted Device"
+    elif raw_method == "gate_code":
+        method_label = "Gate Code"
+    elif raw_method == "gps":
+        method_label = "GPS"
+    elif raw_method:
+        method_label = raw_method.replace("_", " ").title()
+    else:
+        method_label = "—"
+
+    if attendance_entry.geofence_distance_meters is None or method_label == "—":
+        return method_label
+    return f"{method_label} • {attendance_entry.geofence_distance_meters:.0f}m"
 
 
 def _extract_browser_geolocation_coordinates(
@@ -5552,23 +5798,25 @@ def _extract_browser_geolocation_coordinates(
 
 
 def _get_kiosk_geolocation_query_payload(
-) -> tuple[Optional[tuple[float, float, Optional[float]]], str]:
+) -> tuple[Optional[tuple[float, float, Optional[float]]], str, str]:
     """Return GPS coordinates or error text captured in the kiosk URL."""
 
     raw_geo_error = st.query_params.get("geo_error")
     geo_error = str(raw_geo_error).strip() if raw_geo_error else ""
+    raw_geo_source = st.query_params.get("geo_source")
+    geo_source = str(raw_geo_source).strip().casefold() if raw_geo_source else ""
     raw_latitude = st.query_params.get("geo_lat")
     raw_longitude = st.query_params.get("geo_lng")
     raw_accuracy = st.query_params.get("geo_acc")
     if not raw_latitude or not raw_longitude:
-        return None, geo_error
+        return None, geo_error, geo_source
     try:
         resolved_latitude = float(raw_latitude)
         resolved_longitude = float(raw_longitude)
         resolved_accuracy = float(raw_accuracy) if raw_accuracy else None
     except (TypeError, ValueError):
-        return None, geo_error
-    return (resolved_latitude, resolved_longitude, resolved_accuracy), geo_error
+        return None, geo_error, geo_source
+    return (resolved_latitude, resolved_longitude, resolved_accuracy), geo_error, geo_source
 
 
 def _apply_project_setup_geolocation_query_payload(
@@ -5626,11 +5874,28 @@ def _render_kiosk_geofence_gate(
         "Before signing in or out, allow GPS access so the register can confirm you are at "
         f"{project_setup.current_site_name}."
     )
-    geolocation_payload, geo_error = _get_kiosk_geolocation_query_payload()
+    geolocation_payload, geo_error, geo_source = _get_kiosk_geolocation_query_payload()
     capture_url = _build_kiosk_geolocation_capture_url(
         public_url=public_url,
         kiosk_view="attendance",
+        project_setup=project_setup,
     )
+    existing_verification = _get_kiosk_geofence_session_verification(project_setup)
+    if existing_verification is not None:
+        st.success(_format_kiosk_verification_message(existing_verification))
+        refresh_columns = st.columns([0.62, 0.38], gap="medium")
+        with refresh_columns[0]:
+            st.caption(
+                "This session is already unlocked. Re-check GPS only if you need to refresh the location."
+            )
+        with refresh_columns[1]:
+            st.link_button(
+                "🔄 Recheck GPS",
+                capture_url,
+                type="secondary",
+                width="stretch",
+            )
+        return True, existing_verification.get("distance_meters")
     geofence_link_columns = st.columns(2, gap="medium")
     with geofence_link_columns[0]:
         st.link_button(
@@ -5647,34 +5912,51 @@ def _render_kiosk_geofence_gate(
             width="stretch",
         )
 
+    if geolocation_payload is not None:
+        latitude, longitude, accuracy = geolocation_payload
+        st.session_state["site_attendance_geofence_requested"] = True
+        distance_meters = calculate_haversine_distance_meters(
+            latitude,
+            longitude,
+            project_setup.site_latitude,
+            project_setup.site_longitude,
+        )
+        if distance_meters <= project_setup.geofence_radius_meters:
+            verification_method = "trusted_device" if geo_source == "trusted_device" else "gps"
+            verification_note = (
+                "Trusted browser session"
+                if verification_method == "trusted_device"
+                else "Direct GPS verification"
+            )
+            _set_kiosk_geofence_session_verification(
+                project_setup,
+                method=verification_method,
+                note=verification_note,
+                distance_meters=distance_meters,
+                accuracy_meters=accuracy,
+            )
+            _clear_kiosk_geolocation_query_params()
+            verification_state = _get_kiosk_geofence_session_verification(project_setup)
+            if verification_state is not None:
+                st.success(_format_kiosk_verification_message(verification_state))
+            return True, distance_meters
+
     if geolocation_payload is None and not geo_error:
         st.info(
-            "Tap “Allow GPS Access” to open the secure GPS check page. Once approved, you will return here automatically."
+            "Tap “Allow GPS Access” to open the secure GPS check page. If Safari or Chrome already has a recent on-site fix for this browser session, it should come straight back. Otherwise, tap “Use Current Location” once on the next page."
         )
         st.caption(
             "This uses a full-page browser location request for better support on iPhone, Android, tablets, and laptops."
         )
-        return False, None
-
-    if geolocation_payload is None:
+    elif geolocation_payload is None:
         st.warning(
             "⚠️ Geo-Fence Active: "
             + (geo_error or "Location access has not been granted yet.")
         )
         st.caption(
-            "iPhone tip: Safari > aA menu > Website Settings > Location should be set to Allow."
+            "If this phone still refuses location, use the short-lived site gate code from the manager dashboard below."
         )
-        return False, None
-
-    latitude, longitude, accuracy = geolocation_payload
-    st.session_state["site_attendance_geofence_requested"] = True
-    distance_meters = calculate_haversine_distance_meters(
-        latitude,
-        longitude,
-        project_setup.site_latitude,
-        project_setup.site_longitude,
-    )
-    if distance_meters > project_setup.geofence_radius_meters:
+    else:
         accuracy_suffix = (
             f" GPS accuracy ±{accuracy:.0f}m." if accuracy is not None else ""
         )
@@ -5687,11 +5969,44 @@ def _render_kiosk_geofence_gate(
             f"Current site fence: {project_setup.current_site_name} "
             f"({project_setup.geofence_radius_meters}m radius)."
         )
-        return False, distance_meters
 
-    accuracy_suffix = f" GPS accuracy ±{accuracy:.0f}m." if accuracy is not None else ""
-    st.success(f"✅ GPS Verified: You are on site.{accuracy_suffix}")
-    return True, distance_meters
+    with st.expander("🔐 Can't use location on this phone?", expanded=bool(geo_error)):
+        st.caption(
+            "Ask the site manager for the live six-digit gate code. It refreshes automatically and is only for operatives physically at the gate."
+        )
+        gate_code_columns = st.columns([0.65, 0.35], gap="medium")
+        with gate_code_columns[0]:
+            submitted_gate_code = st.text_input(
+                "Site Gate Code",
+                key="site_attendance_gate_code",
+                placeholder="Enter 6-digit code",
+                max_chars=6,
+            )
+        with gate_code_columns[1]:
+            st.caption("Short-lived code")
+            if st.button(
+                "🔓 Unlock with Gate Code",
+                key="site_attendance_unlock_gate_code",
+                width="stretch",
+                type="primary",
+            ):
+                if _validate_site_gate_code(
+                    project_setup.current_site_name,
+                    submitted_gate_code,
+                ):
+                    st.session_state["site_attendance_gate_code"] = ""
+                    _set_kiosk_geofence_session_verification(
+                        project_setup,
+                        method="gate_code",
+                        note="Manager-issued gate code",
+                        distance_meters=None,
+                        accuracy_meters=None,
+                    )
+                    _clear_kiosk_geolocation_query_params()
+                    st.rerun()
+                st.error("That gate code is not valid or has expired.")
+
+    return False, None
 
 
 def _render_kiosk_new_starter_call_to_action() -> None:
@@ -5806,12 +6121,26 @@ def _render_site_attendance_console(
                 in _attendance_picker_label(induction_document).casefold()
             ]
 
+        pending_prefill_doc_id = str(
+            st.session_state.get("site_attendance_prefill_induction_doc_id", "") or ""
+        ).strip()
         picker_options = [""] + [record.doc_id for record in filtered_records]
+        resolved_selected_induction_doc_id = _resolve_attendance_sign_in_selection(
+            filtered_records=filtered_records,
+            current_doc_id=str(
+                st.session_state.get("site_attendance_selected_induction_doc_id", "") or ""
+            ).strip(),
+            pending_doc_id=pending_prefill_doc_id,
+        )
         if (
             st.session_state.get("site_attendance_selected_induction_doc_id")
-            not in picker_options
+            != resolved_selected_induction_doc_id
         ):
-            st.session_state["site_attendance_selected_induction_doc_id"] = ""
+            st.session_state["site_attendance_selected_induction_doc_id"] = (
+                resolved_selected_induction_doc_id
+            )
+        if pending_prefill_doc_id and resolved_selected_induction_doc_id == pending_prefill_doc_id:
+            st.session_state["site_attendance_prefill_induction_doc_id"] = ""
         selected_induction_doc_id = st.selectbox(
             "Name & Company",
             options=picker_options,
@@ -5846,6 +6175,7 @@ def _render_site_attendance_console(
             st.info("No inducted operatives matched that search.")
 
         remembered_vehicle_registration = ""
+        remembered_distance_travelled = ""
         if selected_induction is not None:
             latest_attendance_entry = _get_latest_daily_attendance_entry_for_induction(
                 repository,
@@ -5854,8 +6184,12 @@ def _render_site_attendance_console(
             )
             if latest_attendance_entry is not None:
                 remembered_vehicle_registration = latest_attendance_entry.vehicle_registration
+                remembered_distance_travelled = latest_attendance_entry.distance_travelled
         vehicle_registration_context_key = (
             "site_attendance_vehicle_registration_context_doc_id"
+        )
+        distance_travelled_context_key = (
+            "site_attendance_distance_travelled_context_doc_id"
         )
         if (
             st.session_state.get(vehicle_registration_context_key, "")
@@ -5865,6 +6199,16 @@ def _render_site_attendance_console(
                 remembered_vehicle_registration
             )
             st.session_state[vehicle_registration_context_key] = (
+                selected_induction_doc_id
+            )
+        if (
+            st.session_state.get(distance_travelled_context_key, "")
+            != selected_induction_doc_id
+        ):
+            st.session_state["site_attendance_distance_travelled"] = (
+                remembered_distance_travelled
+            )
+            st.session_state[distance_travelled_context_key] = (
                 selected_induction_doc_id
             )
 
@@ -5887,17 +6231,59 @@ def _render_site_attendance_console(
                 placeholder="e.g. 14 miles",
                 disabled=is_kiosk and not kiosk_gps_verified,
             )
+            if remembered_distance_travelled:
+                st.caption(
+                    f"Last known travel: {remembered_distance_travelled}. Change it only if today's journey is different."
+                )
         st.caption(
             f"Time In will be stamped automatically at {datetime.now().strftime('%H:%M')}."
         )
     else:
         if active_attendance_entries:
-            sign_out_options = [""] + [entry.doc_id for entry in active_attendance_entries]
+            sorted_active_entries = sorted(
+                active_attendance_entries,
+                key=lambda entry: (
+                    entry.contractor_name.casefold(),
+                    entry.individual_name.casefold(),
+                    entry.time_in,
+                ),
+            )
+            sign_out_search = st.text_input(
+                "Search Currently On Site",
+                key="site_attendance_sign_out_search",
+                placeholder="Type a name, company, or vehicle",
+                disabled=is_kiosk and not kiosk_gps_verified,
+            )
+            filtered_active_entries = sorted_active_entries
+            if sign_out_search.strip():
+                lowered_sign_out_search = sign_out_search.strip().casefold()
+                filtered_active_entries = [
+                    entry
+                    for entry in sorted_active_entries
+                    if lowered_sign_out_search
+                    in " ".join(
+                        [
+                            entry.individual_name,
+                            entry.contractor_name,
+                            entry.vehicle_registration or "",
+                            entry.time_in.strftime("%H:%M"),
+                        ]
+                    ).casefold()
+                ]
+            sign_out_options = [""] + [entry.doc_id for entry in filtered_active_entries]
+            resolved_sign_out_doc_id = _resolve_attendance_sign_out_selection(
+                filtered_entries=filtered_active_entries,
+                current_doc_id=str(
+                    st.session_state.get("site_attendance_selected_sign_out_doc_id", "") or ""
+                ).strip(),
+            )
             if (
                 st.session_state.get("site_attendance_selected_sign_out_doc_id")
-                not in sign_out_options
+                != resolved_sign_out_doc_id
             ):
-                st.session_state["site_attendance_selected_sign_out_doc_id"] = ""
+                st.session_state["site_attendance_selected_sign_out_doc_id"] = (
+                    resolved_sign_out_doc_id
+                )
             selected_sign_out_doc_id = st.selectbox(
                 "Currently On Site",
                 options=sign_out_options,
@@ -5909,11 +6295,36 @@ def _render_site_attendance_console(
                     else _attendance_sign_out_label(
                         next(
                             entry
-                            for entry in active_attendance_entries
+                            for entry in filtered_active_entries
                             if entry.doc_id == doc_id
                         )
                     )
                 ),
+            )
+            selected_sign_out_entry = next(
+                (
+                    entry
+                    for entry in filtered_active_entries
+                    if entry.doc_id == selected_sign_out_doc_id
+                ),
+                None,
+            )
+            if selected_sign_out_entry is not None:
+                vehicle_suffix = (
+                    f" | Vehicle {selected_sign_out_entry.vehicle_registration}"
+                    if selected_sign_out_entry.vehicle_registration
+                    else ""
+                )
+                st.caption(
+                    f"Selected operative: {selected_sign_out_entry.individual_name} | "
+                    f"{selected_sign_out_entry.contractor_name} | "
+                    f"Signed in at {selected_sign_out_entry.time_in.strftime('%H:%M')}"
+                    f"{vehicle_suffix}"
+                )
+            elif sign_out_search.strip() and not filtered_active_entries:
+                st.info("No on-site operatives matched that search.")
+            st.caption(
+                f"Currently on site: {len(active_attendance_entries)} | Matches shown: {len(filtered_active_entries)}"
             )
         else:
             selected_sign_out_doc_id = ""
@@ -5982,6 +6393,9 @@ def _render_site_attendance_console(
                 if action_mode == "sign_in":
                     if selected_induction is None:
                         raise ValidationError("Select an inducted operative before signing in.")
+                    current_gate_verification = _get_kiosk_geofence_session_verification(
+                        project_setup
+                    )
                     logged_entry = create_daily_attendance_sign_in(
                         repository,
                         site_name=site_name,
@@ -5989,6 +6403,21 @@ def _render_site_attendance_console(
                         vehicle_registration=vehicle_registration,
                         distance_travelled=distance_travelled,
                         signature_image_data=canvas_result.image_data,
+                        gate_verification_method=(
+                            str(
+                                (current_gate_verification or {}).get("method", "")
+                                or ""
+                            ).strip()
+                        ),
+                        gate_verification_note=(
+                            str(
+                                (current_gate_verification or {}).get("note", "")
+                                or ""
+                            ).strip()
+                        ),
+                        geofence_distance_meters=(
+                            (current_gate_verification or {}).get("distance_meters")
+                        ),
                     )
                     flash_message = (
                         f"{logged_entry.attendance_entry.individual_name} signed in at "
@@ -6099,6 +6528,46 @@ def _render_live_fire_roll_panel(
             )
         else:
             st.info("No vehicle registrations are currently active on site.")
+
+
+def _render_site_gate_fallback_panel(project_setup: ProjectSetup) -> None:
+    """Render the manager-only fallback code for phones that refuse geolocation."""
+
+    current_gate_code, minutes_remaining = _get_site_gate_code(
+        project_setup.current_site_name
+    )
+    with st.expander("🔐 Site Gate Fallback Code", expanded=False):
+        st.caption(
+            "Use this only when an operative is physically at the gate and their phone browser refuses location access."
+        )
+        code_columns = st.columns([0.7, 0.3], gap="large")
+        with code_columns[0]:
+            _render_metric_card(
+                title="Current Gate Code",
+                icon="🔐",
+                value=current_gate_code,
+                caption="Short-lived fallback for location failures on phone browsers.",
+                body_html=(
+                    "<div class='data-card-subtext'>"
+                    f"Refreshes in <strong>{minutes_remaining} min</strong>"
+                    "</div>"
+                ),
+            )
+        with code_columns[1]:
+            st.markdown(
+                (
+                    "<div class='panel-card' style='height:100%; display:flex; "
+                    "flex-direction:column; justify-content:center;'>"
+                    "<div class='panel-heading'>Use</div>"
+                    "<div class='panel-title'>Tell the operative this code</div>"
+                    "<div class='panel-caption'>"
+                    "The kiosk fallback accepts the live code and the previous slot."
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            st.code(current_gate_code)
 
 
 def _render_todays_attendance_activity_panel(
@@ -8509,6 +8978,9 @@ def _render_site_induction_capture_form(
                     st.session_state["site_induction_kiosk_complete_name"] = (
                         generated_document.induction_document.individual_name
                     )
+                    st.session_state["site_induction_kiosk_complete_doc_id"] = (
+                        generated_document.induction_document.doc_id
+                    )
                     st.session_state["site_induction_kiosk_complete_at"] = time.time()
                 else:
                     st.session_state["site_induction_flash"] = (
@@ -8545,6 +9017,7 @@ def _render_manager_attendance_register_tab(
         "Run the live sign-in console, monitor who is on site, and keep an eye on competency risk from one operational view."
     )
     _render_competency_compliance_radar(repository, active_attendance_entries)
+    _render_site_gate_fallback_panel(project_setup)
     _render_live_fire_roll_panel(active_attendance_entries)
     _render_todays_attendance_activity_panel(todays_attendance_entries)
 
@@ -8915,6 +9388,7 @@ def _render_site_induction_station(
         st.session_state.pop("site_attendance_kiosk_complete_at", None)
         st.session_state.pop("site_induction_kiosk_complete_name", None)
         st.session_state.pop("site_induction_kiosk_complete_at", None)
+        st.session_state.pop("site_induction_kiosk_complete_doc_id", None)
         attendance_flash_message = st.session_state.pop("site_attendance_flash", None)
         if attendance_flash_message is not None:
             st.success(attendance_flash_message)
@@ -9024,12 +9498,21 @@ def _render_site_induction_station(
             and induction_complete_at
             and (time.time() - induction_complete_at) >= 8
         ):
+            induction_complete_doc_id = str(
+                st.session_state.get("site_induction_kiosk_complete_doc_id", "") or ""
+            ).strip()
             st.session_state.pop("site_induction_kiosk_complete_name", None)
             st.session_state.pop("site_induction_kiosk_complete_at", None)
             _route_kiosk_to_induction_station(kiosk_view="attendance")
             st.session_state["site_attendance_action_mode"] = "sign_in"
             st.session_state["site_attendance_worker_search"] = induction_complete_name
-            st.session_state["site_attendance_selected_induction_doc_id"] = ""
+            st.session_state["site_attendance_prefill_induction_doc_id"] = (
+                induction_complete_doc_id
+            )
+            st.session_state["site_attendance_selected_induction_doc_id"] = (
+                induction_complete_doc_id
+            )
+            st.session_state.pop("site_induction_kiosk_complete_doc_id", None)
             st.rerun()
         st.markdown(
             (
@@ -11435,11 +11918,29 @@ def _build_file_4_worker_options(
         repository,
         site_name=site_name,
     )
+    latest_attendance_records_by_worker_name: Dict[str, SiteAttendanceRecord] = {}
+    for attendance_record in latest_attendance_records.values():
+        worker_name_key = attendance_record.workerName.casefold()
+        existing_record = latest_attendance_records_by_worker_name.get(worker_name_key)
+        if existing_record is None or (
+            attendance_record.date,
+            attendance_record.timeOut,
+            attendance_record.timeIn,
+        ) > (
+            existing_record.date,
+            existing_record.timeOut,
+            existing_record.timeIn,
+        ):
+            latest_attendance_records_by_worker_name[worker_name_key] = attendance_record
     worker_options: Dict[str, tuple[SiteWorker, SiteAttendanceRecord]] = {}
     for worker in roster:
         attendance_record = latest_attendance_records.get(
             (worker.company.casefold(), worker.worker_name.casefold())
         )
+        if attendance_record is None:
+            attendance_record = latest_attendance_records_by_worker_name.get(
+                worker.worker_name.casefold()
+            )
         if attendance_record is None:
             continue
         option_label = f"{worker.worker_name} ({worker.company})"
@@ -11449,6 +11950,82 @@ def _build_file_4_worker_options(
             )
         worker_options[option_label] = (worker, attendance_record)
     return worker_options
+
+
+def _build_file_4_company_options(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    worker_name: str,
+    default_company: str,
+) -> List[str]:
+    """Return selectable company options for one permit operative."""
+
+    company_names_by_key: Dict[str, str] = {}
+
+    def _remember_company(raw_company_name: str) -> None:
+        cleaned_company_name = str(raw_company_name or "").strip()
+        if not cleaned_company_name:
+            return
+        company_names_by_key.setdefault(
+            cleaned_company_name.casefold(),
+            cleaned_company_name,
+        )
+
+    _remember_company(default_company)
+
+    for worker in build_site_worker_roster(site_name=site_name):
+        if worker.worker_name.casefold() == worker_name.casefold():
+            _remember_company(worker.company)
+
+    for attendance_register in repository.list_documents(
+        document_type=SiteAttendanceRegister.document_type,
+        site_name=site_name,
+    ):
+        if not isinstance(attendance_register, SiteAttendanceRegister):
+            continue
+        for attendance_record in attendance_register.attendance_records:
+            if attendance_record.workerName.casefold() == worker_name.casefold():
+                _remember_company(attendance_record.company)
+
+    for induction_document in repository.list_documents(
+        document_type=InductionDocument.document_type,
+        site_name=site_name,
+    ):
+        if (
+            isinstance(induction_document, InductionDocument)
+            and induction_document.individual_name.casefold() == worker_name.casefold()
+        ):
+            _remember_company(induction_document.contractor_name)
+
+    for attendance_entry in repository.list_documents(
+        document_type=DailyAttendanceEntryDocument.document_type,
+        site_name=site_name,
+    ):
+        if (
+            isinstance(attendance_entry, DailyAttendanceEntryDocument)
+            and attendance_entry.individual_name.casefold() == worker_name.casefold()
+        ):
+            _remember_company(attendance_entry.contractor_name)
+
+    for global_company_name in _build_induction_company_options(
+        repository,
+        site_name=site_name,
+        induction_documents=[
+            document
+            for document in repository.list_documents(
+                document_type=InductionDocument.document_type,
+                site_name=site_name,
+            )
+            if isinstance(document, InductionDocument)
+        ],
+    ):
+        if global_company_name in {"-- Select Company --", "🏢 New Company (Type Below)"}:
+            continue
+        _remember_company(global_company_name)
+
+    sorted_companies = sorted(company_names_by_key.values(), key=str.casefold)
+    return [*sorted_companies, "🏢 Other Company (Type Below)"]
 
 
 def _build_live_permit_register_rows(

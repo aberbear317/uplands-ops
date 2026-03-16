@@ -114,7 +114,8 @@
     <img src="./uplands-logo.png" alt="Uplands">
     <h1>Checking Site GPS</h1>
     <p>We need your location once to unlock the attendance register. If your browser asks, tap <strong>Allow</strong>.</p>
-    <div id="status" class="status">Tap the button below to request your current location.</div>
+    <div id="status" class="status">Checking whether this browser already has location access...</div>
+    <p id="diagnostic" class="small"></p>
     <div class="actions">
       <button id="request" class="button primary" type="button">Use Current Location</button>
       <button id="retry" class="button secondary" type="button">Retry GPS Access</button>
@@ -127,13 +128,142 @@
       const query = new URLSearchParams(window.location.search);
       const prefix = (query.get("prefix") || "geo").replace(/[^a-z0-9_]/gi, "") || "geo";
       const rawReturn = query.get("return") || "/?station=induction&mode=kiosk&kiosk_view=attendance";
+      const siteName = (query.get("site_name") || "").trim();
+      const siteLatitude = Number.parseFloat(query.get("site_lat") || "");
+      const siteLongitude = Number.parseFloat(query.get("site_lng") || "");
+      const siteRadiusMeters = Number.parseFloat(query.get("site_radius") || "");
+      const sessionVerificationKey = "uplands_site_gate_geofence_v1";
+      const sessionVerificationTtlMs = 8 * 60 * 60 * 1000;
       const logoBack = document.getElementById("back");
       const requestButton = document.getElementById("request");
       const status = document.getElementById("status");
       const retry = document.getElementById("retry");
+      const diagnostic = document.getElementById("diagnostic");
+      const userAgent = navigator.userAgent || "";
+      const isIOSDevice =
+        /iPhone|iPad|iPod/i.test(userAgent) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+      function setDiagnostic(message) {
+        diagnostic.textContent = message || "";
+      }
+
+      function isFiniteNumber(value) {
+        return Number.isFinite(value);
+      }
+
+      function buildDeniedMessage() {
+        if (!isIOSDevice) {
+          return "Location access was not granted.";
+        }
+        return [
+          "Safari is still blocking location for this site.",
+          "Check Safari > aA > Website Settings > Location > Allow.",
+          "If needed, also check iPhone Settings > Privacy & Security > Location Services > Safari Websites and make sure Precise Location is enabled.",
+        ].join(" ");
+      }
 
       function buildReturnUrl() {
         return new URL(rawReturn, window.location.origin);
+      }
+
+      function calculateDistanceMeters(latitudeA, longitudeA, latitudeB, longitudeB) {
+        const toRadians = (degrees) => (degrees * Math.PI) / 180;
+        const earthRadiusMeters = 6371000;
+        const deltaLatitude = toRadians(latitudeB - latitudeA);
+        const deltaLongitude = toRadians(longitudeB - longitudeA);
+        const startLatitude = toRadians(latitudeA);
+        const endLatitude = toRadians(latitudeB);
+        const haversine =
+          Math.sin(deltaLatitude / 2) * Math.sin(deltaLatitude / 2) +
+          Math.cos(startLatitude) *
+            Math.cos(endLatitude) *
+            Math.sin(deltaLongitude / 2) *
+            Math.sin(deltaLongitude / 2);
+        const centralAngle = 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+        return earthRadiusMeters * centralAngle;
+      }
+
+      function loadCachedVerification() {
+        if (!siteName || !isFiniteNumber(siteLatitude) || !isFiniteNumber(siteLongitude) || !isFiniteNumber(siteRadiusMeters)) {
+          return null;
+        }
+        try {
+          const rawPayload = window.sessionStorage.getItem(sessionVerificationKey);
+          if (!rawPayload) {
+            return null;
+          }
+          const payload = JSON.parse(rawPayload);
+          const verifiedAt = Number(payload.verifiedAt || 0);
+          if (!verifiedAt || (Date.now() - verifiedAt) > sessionVerificationTtlMs) {
+            window.sessionStorage.removeItem(sessionVerificationKey);
+            return null;
+          }
+          if (String(payload.siteName || "").trim().toLowerCase() !== siteName.toLowerCase()) {
+            return null;
+          }
+          const cachedLatitude = Number(payload.latitude);
+          const cachedLongitude = Number(payload.longitude);
+          const cachedAccuracy = isFiniteNumber(Number(payload.accuracy))
+            ? Number(payload.accuracy)
+            : null;
+          if (!isFiniteNumber(cachedLatitude) || !isFiniteNumber(cachedLongitude)) {
+            return null;
+          }
+          const cachedDistance = calculateDistanceMeters(
+            cachedLatitude,
+            cachedLongitude,
+            siteLatitude,
+            siteLongitude
+          );
+          if (cachedDistance > siteRadiusMeters) {
+            return null;
+          }
+          return {
+            coords: {
+              latitude: cachedLatitude,
+              longitude: cachedLongitude,
+              accuracy: cachedAccuracy,
+            },
+          };
+        } catch (error) {
+          return null;
+        }
+      }
+
+      function saveCachedVerification(position) {
+        if (!siteName || !isFiniteNumber(siteLatitude) || !isFiniteNumber(siteLongitude) || !isFiniteNumber(siteRadiusMeters)) {
+          return;
+        }
+        try {
+          window.sessionStorage.setItem(
+            sessionVerificationKey,
+            JSON.stringify({
+              siteName: siteName,
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+              accuracy:
+                position.coords.accuracy !== undefined && position.coords.accuracy !== null
+                  ? position.coords.accuracy
+                  : null,
+              verifiedAt: Date.now(),
+            })
+          );
+        } catch (error) {
+          // Best effort only. The gate still works without browser storage.
+        }
+      }
+
+      async function getPermissionState() {
+        if (!navigator.permissions || !navigator.permissions.query) {
+          return "unknown";
+        }
+        try {
+          const permissionStatus = await navigator.permissions.query({ name: "geolocation" });
+          return permissionStatus.state || "unknown";
+        } catch (error) {
+          return "unknown";
+        }
       }
 
       function redirectWithError(message) {
@@ -141,15 +271,17 @@
         url.searchParams.delete(prefix + "_lat");
         url.searchParams.delete(prefix + "_lng");
         url.searchParams.delete(prefix + "_acc");
+        url.searchParams.delete(prefix + "_source");
         url.searchParams.set(prefix + "_error", message || "Location access was not granted.");
         window.location.replace(url.toString());
       }
 
-      function redirectWithPosition(position) {
+      function redirectWithPosition(position, source) {
         const url = buildReturnUrl();
         url.searchParams.delete(prefix + "_error");
         url.searchParams.set(prefix + "_lat", String(position.coords.latitude));
         url.searchParams.set(prefix + "_lng", String(position.coords.longitude));
+        url.searchParams.set(prefix + "_source", source || "gps");
         if (position.coords.accuracy !== undefined && position.coords.accuracy !== null) {
           url.searchParams.set(prefix + "_acc", String(position.coords.accuracy));
         } else {
@@ -158,9 +290,35 @@
         window.location.replace(url.toString());
       }
 
-      function requestLocation() {
+      function tryWatchPositionFallback() {
+        if (!navigator.geolocation || !navigator.geolocation.watchPosition) {
+          return;
+        }
+        let watchId = null;
+        watchId = navigator.geolocation.watchPosition(
+          function (position) {
+            if (watchId !== null) {
+              navigator.geolocation.clearWatch(watchId);
+            }
+            status.textContent = "GPS captured. Returning to the register...";
+            saveCachedVerification(position);
+            redirectWithPosition(position, "gps");
+          },
+          function () {
+            if (watchId !== null) {
+              navigator.geolocation.clearWatch(watchId);
+            }
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      }
+
+      function requestLocation(manualRequest) {
         status.className = "status";
-        status.textContent = "Requesting location access...";
+        status.textContent = manualRequest
+          ? "Requesting location access..."
+          : "Checking whether location is already allowed...";
+        setDiagnostic(window.isSecureContext ? "Secure connection confirmed." : "This page is not running in a secure context.");
         if (!navigator.geolocation) {
           status.className = "status error";
           status.textContent = "This browser does not support location services.";
@@ -171,20 +329,72 @@
         navigator.geolocation.getCurrentPosition(
           function (position) {
             status.textContent = "GPS captured. Returning to the register...";
-            redirectWithPosition(position);
+            saveCachedVerification(position);
+            redirectWithPosition(position, "gps");
           },
           function (error) {
-            const message = error && error.message ? error.message : "Location access was not granted.";
-            status.className = "status error";
-            status.textContent = message;
+            if (error && error.code === 3 && manualRequest) {
+              status.textContent = "Trying a slower GPS fallback...";
+              tryWatchPositionFallback();
+              return;
+            }
+            const message =
+              error && error.code === 1
+                ? buildDeniedMessage()
+                : error && error.message
+                  ? error.message
+                  : "Location access was not granted.";
+            if (manualRequest) {
+              status.className = "status error";
+              status.textContent = message;
+              return;
+            }
+            status.className = "status";
+            status.textContent = "Tap Use Current Location to continue. If Safari asks, choose Allow.";
           },
-          { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+          {
+            enableHighAccuracy: !isIOSDevice,
+            timeout: isIOSDevice ? 12000 : 20000,
+            maximumAge: isIOSDevice ? 60000 : 0,
+          }
         );
       }
 
-      logoBack.href = buildReturnUrl().toString();
-      requestButton.addEventListener("click", requestLocation);
-      retry.addEventListener("click", requestLocation);
+      async function bootstrap() {
+        logoBack.href = buildReturnUrl().toString();
+        const cachedVerification = loadCachedVerification();
+        if (cachedVerification) {
+          status.textContent = "Using the last on-site check from this browser session...";
+          redirectWithPosition(cachedVerification, "trusted_device");
+          return;
+        }
+        setDiagnostic(window.isSecureContext ? "Secure connection confirmed." : "This page is not running in a secure context.");
+        const permissionState = await getPermissionState();
+        if (permissionState && permissionState !== "unknown") {
+          setDiagnostic(
+            (window.isSecureContext ? "Secure connection confirmed." : "This page is not running in a secure context.")
+            + " Location permission: " + permissionState + "."
+          );
+        }
+        if (permissionState === "granted") {
+          requestLocation(false);
+          return;
+        }
+        if (permissionState === "denied") {
+          status.className = "status error";
+          status.textContent = buildDeniedMessage();
+          return;
+        }
+        if (isIOSDevice) {
+          status.textContent = "Tap Use Current Location once. If Safari asks, choose Allow.";
+          return;
+        }
+        status.textContent = "Tap Use Current Location to continue.";
+      }
+
+      requestButton.addEventListener("click", function () { requestLocation(true); });
+      retry.addEventListener("click", function () { requestLocation(true); });
+      bootstrap();
     })();
   </script>
 </body>

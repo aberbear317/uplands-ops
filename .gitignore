@@ -4,6 +4,8 @@
 # Python
 __pycache__/
 *.py[cod]
+gps.log
+tunnel.log
 
 # Site Command Centre Data (STRICTLY IGNORE)
 Uplands_Workspace/

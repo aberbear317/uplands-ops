@@ -6,6 +6,8 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
+import hashlib
+import hmac
 from io import BytesIO
 import json
 import math
@@ -13,6 +15,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -906,12 +909,14 @@ def load_app_settings() -> Dict[str, Any]:
             "public_tunnel_url": "",
             "broadcast_message_history_by_site": {},
             "tbt_topic_history_by_site": {},
+            "gate_access_secret": "",
         }
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return {
             "public_tunnel_url": "",
             "broadcast_message_history_by_site": {},
             "tbt_topic_history_by_site": {},
+            "gate_access_secret": "",
         }
 
     return {
@@ -922,6 +927,7 @@ def load_app_settings() -> Dict[str, Any]:
         "tbt_topic_history_by_site": _normalise_site_history_payload(
             payload.get("tbt_topic_history_by_site")
         ),
+        "gate_access_secret": str(payload.get("gate_access_secret") or "").strip(),
     }
 
 
@@ -930,6 +936,7 @@ def save_app_settings(
     public_tunnel_url: Optional[str] = None,
     broadcast_message_history_by_site: Optional[Mapping[str, List[str]]] = None,
     tbt_topic_history_by_site: Optional[Mapping[str, List[str]]] = None,
+    gate_access_secret: Optional[str] = None,
 ) -> None:
     """Persist the root-level app settings used by the live manager workflows."""
 
@@ -953,18 +960,107 @@ def save_app_settings(
             existing_settings.get("tbt_topic_history_by_site")
         )
     )
+    resolved_gate_access_secret = (
+        str(gate_access_secret).strip()
+        if gate_access_secret is not None
+        else str(existing_settings.get("gate_access_secret") or "").strip()
+    )
     config.SETTINGS_PATH.write_text(
         json.dumps(
             {
                 "public_tunnel_url": resolved_public_tunnel_url,
                 "broadcast_message_history_by_site": resolved_broadcast_history,
                 "tbt_topic_history_by_site": resolved_tbt_history,
+                "gate_access_secret": resolved_gate_access_secret,
             },
             indent=2,
             sort_keys=True,
         ),
         encoding="utf-8",
     )
+
+
+def ensure_gate_access_secret() -> str:
+    """Return one persistent secret used to build short-lived gate access codes."""
+
+    existing_secret = str(load_app_settings().get("gate_access_secret") or "").strip()
+    if existing_secret:
+        return existing_secret
+
+    generated_secret = secrets.token_hex(24)
+    save_app_settings(gate_access_secret=generated_secret)
+    return generated_secret
+
+
+def _build_gate_access_payload(site_name: str, slot_index: int, slot_minutes: int) -> str:
+    """Return the HMAC payload for one site-specific gate code slot."""
+
+    normalized_site_name = re.sub(r"[^a-z0-9]+", "-", site_name.casefold()).strip("-")
+    return f"{normalized_site_name}|{slot_index}|{slot_minutes}"
+
+
+def build_site_gate_access_code(
+    site_name: str,
+    *,
+    at_time: Optional[datetime] = None,
+    slot_minutes: int = 30,
+) -> Tuple[str, int]:
+    """Return the active six-digit site gate code and minutes until it refreshes."""
+
+    resolved_time = at_time or datetime.now()
+    slot_seconds = max(1, int(slot_minutes)) * 60
+    slot_index = int(resolved_time.timestamp() // slot_seconds)
+    payload = _build_gate_access_payload(site_name, slot_index, max(1, int(slot_minutes)))
+    digest = hmac.new(
+        ensure_gate_access_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    gate_code = f"{int(digest[:12], 16) % 1_000_000:06d}"
+    slot_expires_at = datetime.fromtimestamp((slot_index + 1) * slot_seconds)
+    minutes_remaining = max(
+        1,
+        int(math.ceil((slot_expires_at - resolved_time).total_seconds() / 60.0)),
+    )
+    return gate_code, minutes_remaining
+
+
+def validate_site_gate_access_code(
+    site_name: str,
+    submitted_code: str,
+    *,
+    at_time: Optional[datetime] = None,
+    slot_minutes: int = 30,
+    accepted_previous_slots: int = 1,
+) -> bool:
+    """Return True when the submitted gate code matches the current live site code."""
+
+    cleaned_code = re.sub(r"\D", "", str(submitted_code or ""))
+    if len(cleaned_code) != 6:
+        return False
+
+    resolved_time = at_time or datetime.now()
+    slot_seconds = max(1, int(slot_minutes)) * 60
+    current_slot_index = int(resolved_time.timestamp() // slot_seconds)
+    max_previous_slots = max(0, int(accepted_previous_slots))
+
+    for slot_offset in range(0, max_previous_slots + 1):
+        candidate_slot_index = current_slot_index - slot_offset
+        payload = _build_gate_access_payload(
+            site_name,
+            candidate_slot_index,
+            max(1, int(slot_minutes)),
+        )
+        digest = hmac.new(
+            ensure_gate_access_secret().encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        expected_code = f"{int(digest[:12], 16) % 1_000_000:06d}"
+        if hmac.compare_digest(cleaned_code, expected_code):
+            return True
+
+    return False
 
 
 def detect_public_tunnel_url_from_log() -> str:
@@ -5535,6 +5631,9 @@ def create_daily_attendance_sign_in(
     vehicle_registration: str,
     distance_travelled: str,
     signature_image_data: Any,
+    gate_verification_method: str = "",
+    gate_verification_note: str = "",
+    geofence_distance_meters: Optional[float] = None,
 ) -> LoggedDailyAttendanceEntry:
     """Create one live daily sign-in record from an existing induction record."""
 
@@ -5586,6 +5685,9 @@ def create_daily_attendance_sign_in(
         contractor_name=induction_document.contractor_name,
         vehicle_registration=vehicle_registration.strip().upper(),
         distance_travelled=distance_travelled.strip(),
+        gate_verification_method=gate_verification_method.strip(),
+        gate_verification_note=gate_verification_note.strip(),
+        geofence_distance_meters=geofence_distance_meters,
         time_in=created_at,
         sign_in_signature_path=str(signature_path),
     )
@@ -6422,6 +6524,7 @@ def create_ladder_permit_draft(
     *,
     attendance_record: SiteAttendanceRecord,
     site_worker: Optional[SiteWorker] = None,
+    worker_company_override: str = "",
     description_of_work: str,
     location_of_work: str,
     supervisor_name: str,
@@ -6466,7 +6569,7 @@ def create_ladder_permit_draft(
         if site_worker is not None and site_worker.worker_name.strip()
         else attendance_record.workerName
     )
-    resolved_worker_company = (
+    resolved_worker_company = worker_company_override.strip() or (
         site_worker.company.strip()
         if site_worker is not None and site_worker.company.strip()
         else attendance_record.company

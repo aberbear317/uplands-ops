@@ -366,11 +366,54 @@ def _coerce_date(value: date, field_name: str) -> date:
         except ValueError:
             try:
                 return datetime.strptime(value, "%d/%m/%Y").date()
-            except ValueError as exc:
-                raise ValueError(
-                    f"{field_name} must be an ISO date string or use DD/MM/YYYY."
-                ) from exc
+            except ValueError:
+                try:
+                    return datetime.strptime(value, "%Y/%m/%d").date()
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{field_name} must be an ISO date string or use DD/MM/YYYY / YYYY/MM/DD."
+                    ) from exc
     raise TypeError(f"{field_name} must be a date, datetime, or ISO date string.")
+
+
+_KPI_SHORT_DATE_PATTERN = re.compile(r"^(?P<day>\d{2})/(?P<month>\d{2})$")
+_KPI_ROW_ID_ISO_DATE_PATTERN = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})")
+
+
+def _coerce_kpi_row_date(
+    value: Any,
+    row: Mapping[str, Any],
+    *,
+    field_name: str = "date",
+) -> Any:
+    """Recover KPI row dates like ``DD/MM`` from the full ISO date stored in the row id."""
+
+    if not isinstance(value, str):
+        return value
+
+    cleaned_value = value.strip()
+    short_date_match = _KPI_SHORT_DATE_PATTERN.fullmatch(cleaned_value)
+    if short_date_match is None:
+        return cleaned_value
+
+    row_id = row.get("id")
+    if not isinstance(row_id, str):
+        return cleaned_value
+
+    row_id_date_match = _KPI_ROW_ID_ISO_DATE_PATTERN.search(row_id)
+    if row_id_date_match is None:
+        return cleaned_value
+
+    resolved_date = date.fromisoformat(row_id_date_match.group("date"))
+    if (
+        resolved_date.day != int(short_date_match.group("day"))
+        or resolved_date.month != int(short_date_match.group("month"))
+    ):
+        raise ValueError(
+            f"{field_name} {cleaned_value!r} does not match KPI row id date "
+            f"{resolved_date.isoformat()}."
+        )
+    return resolved_date
 
 
 def _coerce_optional_date(value: Optional[date], field_name: str) -> Optional[date]:
@@ -1000,7 +1043,7 @@ class SiteAttendanceRecord:
         if not isinstance(row, Mapping):
             raise TypeError("Attendance row must be a mapping.")
         return cls(
-            date=row["date"],
+            date=_coerce_kpi_row_date(row["date"], row, field_name="date"),
             company=row["company"],
             workerName=row["workerName"],
             timeIn=row["timeIn"],
@@ -1056,7 +1099,11 @@ class SiteWorker:
         return cls(
             company=row["company"],
             worker_name=row["workerName"],
-            last_on_site_date=row["date"],
+            last_on_site_date=_coerce_kpi_row_date(
+                row["date"],
+                row,
+                field_name="last_on_site_date",
+            ),
         )
 
 
@@ -1175,6 +1222,9 @@ class DailyAttendanceEntryDocument(BaseDocument):
     contractor_name: str
     vehicle_registration: str = ""
     distance_travelled: str = ""
+    gate_verification_method: str = ""
+    gate_verification_note: str = ""
+    geofence_distance_meters: Optional[float] = None
     time_in: datetime = field(default_factory=datetime.now)
     time_out: Optional[datetime] = None
     hours_worked: Optional[float] = None
@@ -1213,6 +1263,18 @@ class DailyAttendanceEntryDocument(BaseDocument):
         self.distance_travelled = _normalise_optional_text(
             self.distance_travelled,
             "distance_travelled",
+        )
+        self.gate_verification_method = _normalise_optional_text(
+            self.gate_verification_method,
+            "gate_verification_method",
+        )
+        self.gate_verification_note = _normalise_optional_text(
+            self.gate_verification_note,
+            "gate_verification_note",
+        )
+        self.geofence_distance_meters = _coerce_optional_non_negative_float(
+            self.geofence_distance_meters,
+            "geofence_distance_meters",
         )
         self.time_in = _coerce_datetime(self.time_in, "time_in")
         self.time_out = _coerce_optional_datetime(self.time_out, "time_out")
@@ -1300,6 +1362,12 @@ class DailyAttendanceEntryDocument(BaseDocument):
         payload["hours_worked"] = _coerce_optional_non_negative_float(
             payload.get("hours_worked"),
             "hours_worked",
+        )
+        payload["gate_verification_method"] = payload.get("gate_verification_method", "")
+        payload["gate_verification_note"] = payload.get("gate_verification_note", "")
+        payload["geofence_distance_meters"] = _coerce_optional_non_negative_float(
+            payload.get("geofence_distance_meters"),
+            "geofence_distance_meters",
         )
         payload["sign_in_signature_path"] = payload.get("sign_in_signature_path", "")
         payload["sign_out_signature_path"] = payload.get("sign_out_signature_path", "")
