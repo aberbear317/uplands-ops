@@ -42,7 +42,9 @@ from uplands_site_command_centre import (
     LOVEDEAN_SITE_LATITUDE,
     LOVEDEAN_SITE_LONGITUDE,
     PlantAssetDocument,
+    PlantInspectionType,
     PERMITS_DESTINATION,
+    PLANT_PENDING_INSPECTION_TEXT,
     PLANT_HIRE_REGISTER_DIR,
     RAMSDocument,
     RAMS_DESTINATION,
@@ -106,6 +108,7 @@ from uplands_site_command_centre import (
     list_waste_transfer_note_source_conflicts,
     get_valid_template_tags,
     get_weekly_site_check_row_definitions,
+    format_plant_inspection_reference,
     list_daily_attendance_entries,
     list_toolbox_talk_documents,
     list_toolbox_talk_completions,
@@ -125,6 +128,7 @@ from uplands_site_command_centre import (
     sync_file_4_permit_records,
     update_logged_waste_transfer_note,
     validate_site_gate_access_code,
+    is_pending_plant_inspection_reference,
     build_toolbox_talk_url,
     launch_messages_sms_broadcast,
     log_broadcast_dispatch,
@@ -4463,7 +4467,8 @@ def _render_sidebar_file_2_quick_actions(
     )
     st.caption(
         f"Plant assets: {len(plant_assets)} | "
-        f"Pending serials: {sum(1 for asset in plant_assets if asset.is_pending)}"
+        "Inspection refs outstanding: "
+        f"{sum(1 for asset in plant_assets if _plant_asset_requires_inspection_reference(asset))}"
     )
     st.caption(
         f"Latest site check: {_format_site_check_timestamp(latest_site_check)}"
@@ -12322,16 +12327,53 @@ def _get_file_2_plant_assets(
 def _plant_asset_status_label(asset: PlantAssetDocument) -> str:
     """Return a UI label for one plant asset record."""
 
-    return "Pending" if asset.is_pending else asset.status.label
+    return "On Hire" if asset.status != DocumentStatus.ARCHIVED else asset.status.label
+
+
+def _plant_asset_requires_inspection_reference(asset: PlantAssetDocument) -> bool:
+    """Return True when the live record still needs an inspection/cert reference logged."""
+
+    return is_pending_plant_inspection_reference(asset.inspection)
 
 
 def _plant_asset_inspection_alert_label(asset: PlantAssetDocument) -> str:
     """Return the inspection attention label for one plant asset."""
 
+    if _plant_asset_requires_inspection_reference(asset):
+        return "Ref Needed"
     due_date = asset.inspection_due_date()
     if due_date is None:
-        return ""
+        return "Logged"
     return "CRITICAL" if asset.inspection_requires_attention() else "OK"
+
+
+def _plant_asset_inspection_display_value(asset: PlantAssetDocument) -> str:
+    """Return the inspection cell label shown in the live File 2 register."""
+
+    return format_plant_inspection_reference(
+        asset.inspection_type,
+        asset.inspection,
+    )
+
+
+def _plant_asset_inspection_type_label(asset: PlantAssetDocument) -> str:
+    """Return the human-readable evidence type for one plant asset."""
+
+    return asset.inspection_type.label
+
+
+def _plant_asset_inspection_input_value(asset: PlantAssetDocument) -> str:
+    """Return the editable inspection reference value for the update form."""
+
+    if is_pending_plant_inspection_reference(asset.inspection):
+        return ""
+    return asset.inspection
+
+
+def _plant_asset_serial_display_value(asset: PlantAssetDocument) -> str:
+    """Return the best available plant identifier for the serial column."""
+
+    return asset.serial or asset.stock_code or "Pending"
 
 
 def _render_file_2_plant_register_panel(
@@ -12345,7 +12387,7 @@ def _render_file_2_plant_register_panel(
         icon="🏗️",
         kicker="Plant Register",
         title="Site Plant Register",
-        caption="Keep live hire assets current, update pending serials and inspection records, and print the File 2 plant register when needed.",
+        caption="Keep live hire assets current, review stock references and inspection evidence, and print the File 2 plant register when needed.",
     )
     flash_message = st.session_state.pop("plant_register_flash", None)
     if flash_message is not None:
@@ -12358,7 +12400,9 @@ def _render_file_2_plant_register_panel(
         repository,
         site_name=project_setup.current_site_name,
     )
-    pending_assets = sum(1 for asset in plant_assets if asset.is_pending)
+    inspection_reference_outstanding_count = sum(
+        1 for asset in plant_assets if _plant_asset_requires_inspection_reference(asset)
+    )
     inspection_attention_count = sum(
         1 for asset in plant_assets if asset.inspection_requires_attention()
     )
@@ -12367,7 +12411,11 @@ def _render_file_2_plant_register_panel(
     with summary_columns[0]:
         _render_inline_metric("Assets On Register", str(len(plant_assets)), icon="🏗️")
     with summary_columns[1]:
-        _render_inline_metric("Pending Assets", str(pending_assets), icon="⏳")
+        _render_inline_metric(
+            "Inspection Refs Outstanding",
+            str(inspection_reference_outstanding_count),
+            icon="🧾",
+        )
     with summary_columns[2]:
         _render_inline_metric(
             "Inspection Attention",
@@ -12382,7 +12430,7 @@ def _render_file_2_plant_register_panel(
     st.divider()
     _render_workspace_zone_heading(
         "Primary Action",
-        "Update serial numbers and inspection details here so pending hire records become fully usable site assets.",
+        "Review stock references and log inspection or certificate details here so the live hire register stays site-ready.",
     )
     with st.expander("Update Plant Asset", expanded=False):
         asset_options = {
@@ -12396,22 +12444,33 @@ def _render_file_2_plant_register_panel(
         selected_asset = asset_options[selected_asset_label]
         with st.form("file_2_plant_asset_update_form", clear_on_submit=False):
             serial_value = st.text_input(
-                "Serial Number",
+                "Serial Number / Stock Ref",
                 value=selected_asset.serial,
             )
+            inspection_type_value = st.selectbox(
+                "Inspection Evidence Type",
+                options=list(PlantInspectionType),
+                index=list(PlantInspectionType).index(selected_asset.inspection_type),
+                format_func=lambda item: item.label,
+            )
             inspection_value = st.text_input(
-                "LOLER / Inspection",
-                value=selected_asset.inspection,
+                "Inspection / Cert Reference",
+                value=_plant_asset_inspection_input_value(selected_asset),
+                placeholder="Report / cert / service sheet / next due / asset tag",
             )
             status_value = st.selectbox(
-                "Record Status",
-                options=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE],
-                index=[DocumentStatus.DRAFT, DocumentStatus.ACTIVE].index(
+                "Hire Record State",
+                options=[DocumentStatus.ACTIVE, DocumentStatus.ARCHIVED],
+                index=[DocumentStatus.ACTIVE, DocumentStatus.ARCHIVED].index(
                     selected_asset.status
-                    if selected_asset.status in {DocumentStatus.DRAFT, DocumentStatus.ACTIVE}
-                    else DocumentStatus.DRAFT
+                    if selected_asset.status in {DocumentStatus.ACTIVE, DocumentStatus.ARCHIVED}
+                    else DocumentStatus.ACTIVE
                 ),
-                format_func=lambda item: item.label,
+                format_func=lambda item: (
+                    "Live On-Hire Asset"
+                    if item == DocumentStatus.ACTIVE
+                    else "Archive / Off Hire"
+                ),
             )
             submitted = st.form_submit_button(
                 "💾 Save Plant Asset",
@@ -12419,17 +12478,12 @@ def _render_file_2_plant_register_panel(
             )
 
         if submitted:
-            resolved_status = (
-                DocumentStatus.ACTIVE
-                if serial_value.strip() and status_value == DocumentStatus.DRAFT
-                else status_value
-            )
             repository.save(
                 PlantAssetDocument(
                     doc_id=selected_asset.doc_id,
                     site_name=selected_asset.site_name,
                     created_at=selected_asset.created_at,
-                    status=resolved_status,
+                    status=status_value,
                     hire_num=selected_asset.hire_num,
                     description=selected_asset.description,
                     company=selected_asset.company,
@@ -12437,7 +12491,9 @@ def _render_file_2_plant_register_panel(
                     on_hire=selected_asset.on_hire,
                     hired_by=selected_asset.hired_by,
                     serial=serial_value,
-                    inspection=inspection_value,
+                    stock_code=selected_asset.stock_code,
+                    inspection_type=inspection_type_value,
+                    inspection=inspection_value.strip() or PLANT_PENDING_INSPECTION_TEXT,
                     source_reference=selected_asset.source_reference,
                     purchase_order=selected_asset.purchase_order,
                 )
@@ -12458,10 +12514,11 @@ def _render_file_2_plant_register_panel(
                 "Phone": plant_asset.phone,
                 "On Hire": plant_asset.on_hire.strftime("%d/%m/%Y"),
                 "Hired By": plant_asset.hired_by,
-                "Serial": plant_asset.serial or "Pending",
-                "Inspection": plant_asset.inspection or "Pending",
-                "Inspection Status": _plant_asset_inspection_alert_label(plant_asset),
-                "Status": _plant_asset_status_label(plant_asset),
+                "Serial / Stock Ref": _plant_asset_serial_display_value(plant_asset),
+                "Evidence Type": _plant_asset_inspection_type_label(plant_asset),
+                "Inspection / Cert": _plant_asset_inspection_display_value(plant_asset),
+                "Inspection Ref Status": _plant_asset_inspection_alert_label(plant_asset),
+                "Hire Status": _plant_asset_status_label(plant_asset),
             }
         )
 
@@ -12469,10 +12526,15 @@ def _render_file_2_plant_register_panel(
 
     def _plant_register_row_styles(row: pd.Series) -> List[str]:
         styles = [""] * len(row)
-        if row["Inspection Status"] == "CRITICAL":
-            inspection_index = row.index.get_loc("Inspection")
+        if row["Inspection Ref Status"] == "CRITICAL":
+            inspection_index = row.index.get_loc("Inspection / Cert")
             styles[inspection_index] = (
                 "background-color: #FEE2E2; color: #991B1B; font-weight: 700;"
+            )
+        if row["Inspection Ref Status"] == "Ref Needed":
+            inspection_index = row.index.get_loc("Inspection / Cert")
+            styles[inspection_index] = (
+                "background-color: #FEF3C7; color: #92400E; font-weight: 600;"
             )
         return styles
 

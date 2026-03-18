@@ -45,6 +45,8 @@ from uplands_site_command_centre.permits.models import (
     LadderPermit,
     LadderStabilisationMethod,
     PlantAssetDocument,
+    PlantInspectionType,
+    PLANT_PENDING_INSPECTION_TEXT,
     RAMSDocument,
     SafetyAsset,
     SITE_CHECK_WEEKDAY_KEYS,
@@ -62,7 +64,10 @@ from uplands_site_command_centre.permits.models import (
     WasteRegister,
     WasteTransferNoteDocument,
     WasteTransferNoteSourceSnapshot,
+    format_plant_inspection_reference,
     get_weekly_site_check_frequency_for_row,
+    infer_plant_inspection_type,
+    is_pending_plant_inspection_reference,
 )
 from uplands_site_command_centre.permits.repository import (
     DocumentNotFoundError,
@@ -267,7 +272,6 @@ HSS_DATE_RANGE_PATTERN = re.compile(
 PHONE_PATTERN = re.compile(r"\b0\d{3,4}\s?\d{3}\s?\d{3,4}\b")
 EMAIL_PATTERN = re.compile(r"\b[^@\s]+@[^@\s]+\.[^@\s]+\b")
 HSS_DEFAULT_PHONE = "0161 749 4090"
-PLANT_PENDING_INSPECTION_TEXT = "Pending serial / LOLER details"
 PLANT_PENDING_SERIAL_TEXT = ""
 DEFAULT_LADDER_PERMIT_MANAGER_NAME = "Ceri Edwards"
 DEFAULT_LADDER_PERMIT_MANAGER_POSITION = "Project Manager"
@@ -2166,6 +2170,7 @@ def generate_waste_register_document(
             autoescape=False,
         )
         document_template.save(output_path)
+        _normalise_plant_register_table_rows(output_path)
 
     repository.index_file(
         file_name=output_path.name,
@@ -2610,7 +2615,9 @@ def _default_hired_by_for_project(project_setup: Mapping[str, str]) -> str:
         return "A. Archer Electrical"
     if "tde" in searchable_text:
         return "TDE"
-    return "TDE"
+    if any(alias in searchable_text for alias in ("uplands", "url", "uplands retail")):
+        return "URL (Uplands)"
+    return "URL (Uplands)"
 
 
 def _is_coshh_safety_source(source_path: Path, source_text: str = "") -> bool:
@@ -4184,6 +4191,60 @@ def _extract_hss_purchase_order(tokens: List[str], order_ref: str) -> str:
     return ""
 
 
+def _extract_hss_customer_name(tokens: List[str], order_ref: str) -> str:
+    """Return the best available customer/hirer label from one HSS order."""
+
+    try:
+        order_index = next(
+            index
+            for index, token in enumerate(tokens)
+            if order_ref.casefold() in token.casefold()
+        )
+    except StopIteration:
+        return ""
+
+    for offset in range(1, 8):
+        candidate_index = order_index - offset
+        if candidate_index < 0:
+            break
+        candidate_token = " ".join(tokens[candidate_index].split()).strip()
+        if not candidate_token:
+            continue
+        if EMAIL_PATTERN.search(candidate_token) or PHONE_PATTERN.search(candidate_token):
+            continue
+        if HSS_ORDER_REF_PATTERN.search(candidate_token):
+            continue
+        if _looks_like_purchase_order(candidate_token):
+            continue
+        if not re.search(r"[A-Za-z]", candidate_token):
+            continue
+        return candidate_token
+    return ""
+
+
+def _normalise_plant_hired_by_label(value: str) -> str:
+    """Normalize common plant hirer labels into a cleaner register value."""
+
+    cleaned_value = " ".join(value.split()).strip()
+    if not cleaned_value:
+        return ""
+
+    lowered_value = cleaned_value.casefold()
+    if any(alias in lowered_value for alias in ("uplands", "url", "uplands retail")):
+        return "URL (Uplands)"
+    if "archer" in lowered_value:
+        return "A. Archer Electrical"
+    if "tde" in lowered_value:
+        return "TDE"
+    return cleaned_value
+
+
+def _is_pending_plant_inspection_value(value: str) -> bool:
+    """Return True when one plant inspection value is only a placeholder."""
+
+    return is_pending_plant_inspection_reference(value)
+
+
 def _extract_hss_product_lines(pdf_text: str) -> List[Dict[str, Any]]:
     """Return one parsed plant entry per product line on an HSS contract PDF."""
 
@@ -4239,6 +4300,7 @@ def _extract_hss_product_lines(pdf_text: str) -> List[Dict[str, Any]]:
         product_lines.append(
             {
                 "description": display_description,
+                "stock_code": stock_token,
                 "company": "HSS",
                 "phone": company_phone,
                 "on_hire": _coerce_date_or_none(date_match.group("start")) or date.today(),
@@ -4259,6 +4321,7 @@ def _parse_hss_order_confirmation(pdf_text: str) -> Dict[str, Any]:
     order_ref = order_ref_match.group(0).upper()
     return {
         "order_ref": order_ref,
+        "customer_name": _extract_hss_customer_name(tokens, order_ref),
         "purchase_order": _extract_hss_purchase_order(tokens, order_ref),
         "product_lines": _extract_hss_product_lines(pdf_text),
     }
@@ -4354,7 +4417,11 @@ def _upsert_plant_assets_from_pdf(
         or _infer_default_site_name(repository)
     )
     job_number = project_setup.get("job_number", "")
-    hired_by = _default_hired_by_for_project(project_setup)
+    default_hired_by = _default_hired_by_for_project(project_setup)
+    parsed_hired_by = _normalise_plant_hired_by_label(
+        str(parsed_contract.get("customer_name") or "")
+    )
+    hired_by = parsed_hired_by or default_hired_by
     purchase_order = str(parsed_contract.get("purchase_order") or "").strip()
     created_at = datetime.now()
     next_sequence = _next_plant_hire_sequence(repository, site_name)
@@ -4371,6 +4438,59 @@ def _upsert_plant_assets_from_pdf(
         if existing_document is None:
             next_sequence += 1
 
+        existing_hired_by = (
+            _normalise_plant_hired_by_label(existing_document.hired_by)
+            if existing_document is not None
+            else ""
+        )
+        if parsed_hired_by and existing_hired_by in {"", "TDE", default_hired_by}:
+            resolved_hired_by = parsed_hired_by
+        else:
+            resolved_hired_by = existing_hired_by or hired_by
+
+        existing_inspection = (
+            str(existing_document.inspection or "")
+            if existing_document is not None
+            else ""
+        )
+        resolved_inspection = (
+            existing_inspection
+            if existing_inspection and not _is_pending_plant_inspection_value(existing_inspection)
+            else PLANT_PENDING_INSPECTION_TEXT
+        )
+        existing_inspection_type = (
+            existing_document.inspection_type
+            if existing_document is not None
+            else ""
+        )
+        resolved_inspection_type = (
+            existing_inspection_type
+            if str(existing_inspection_type or "").strip()
+            else infer_plant_inspection_type(str(product_line["description"]))
+        )
+        resolved_stock_code = (
+            str(product_line.get("stock_code") or "").strip()
+            or (
+                existing_document.stock_code
+                if existing_document is not None
+                else ""
+            )
+        )
+        existing_serial = (
+            str(existing_document.serial or "")
+            if existing_document is not None
+            else ""
+        )
+        resolved_serial = (
+            existing_serial
+            if existing_serial
+            else (
+                resolved_stock_code
+                if resolved_stock_code
+                else PLANT_PENDING_SERIAL_TEXT
+            )
+        )
+
         plant_asset = PlantAssetDocument(
             doc_id=doc_id,
             site_name=site_name,
@@ -4380,30 +4500,21 @@ def _upsert_plant_assets_from_pdf(
                 else created_at
             ),
             status=(
-                existing_document.status
+                DocumentStatus.ARCHIVED
                 if existing_document is not None
-                else DocumentStatus.DRAFT
+                and existing_document.status == DocumentStatus.ARCHIVED
+                else DocumentStatus.ACTIVE
             ),
             hire_num=hire_num,
             description=str(product_line["description"]),
             company=str(product_line["company"]),
             phone=str(product_line["phone"]),
             on_hire=product_line["on_hire"],
-            hired_by=(
-                existing_document.hired_by
-                if existing_document is not None and existing_document.hired_by
-                else hired_by
-            ),
-            serial=(
-                existing_document.serial
-                if existing_document is not None
-                else PLANT_PENDING_SERIAL_TEXT
-            ),
-            inspection=(
-                existing_document.inspection
-                if existing_document is not None and existing_document.inspection
-                else PLANT_PENDING_INSPECTION_TEXT
-            ),
+            hired_by=resolved_hired_by,
+            serial=resolved_serial,
+            stock_code=resolved_stock_code,
+            inspection_type=resolved_inspection_type,
+            inspection=resolved_inspection,
             source_reference=order_ref,
             purchase_order=(
                 existing_document.purchase_order
@@ -4824,6 +4935,40 @@ def _normalise_weekly_site_check_signoff_rows(output_path: Path) -> None:
             run.italic = False
             for extra_run in paragraph.runs[1:]:
                 extra_run.text = ""
+
+    document.save(output_path)
+
+
+def _normalise_plant_register_table_rows(output_path: Path) -> None:
+    """Normalize the rendered plant register rows so data text matches the template size."""
+
+    from docx.shared import Pt
+
+    document = Document(output_path)
+    target_table = None
+    for table in document.tables:
+        if not table.rows or len(table.columns) < 9:
+            continue
+        header_values = [table.cell(0, index).text.strip() for index in range(3)]
+        if header_values == ["Hire Number", "Plant description", "Hire Company"]:
+            target_table = table
+            break
+
+    if target_table is None or len(target_table.rows) <= 1:
+        document.save(output_path)
+        return
+
+    for row_index in range(1, len(target_table.rows)):
+        for column_index in range(len(target_table.columns)):
+            cell = target_table.cell(row_index, column_index)
+            for paragraph in cell.paragraphs:
+                if not paragraph.runs and paragraph.text:
+                    paragraph.add_run(paragraph.text)
+                for run in paragraph.runs:
+                    run.font.name = "Arial"
+                    run.font.size = Pt(10)
+                    run.bold = False
+                    run.italic = False
 
     document.save(output_path)
 
@@ -6593,8 +6738,11 @@ def generate_plant_register_document(
                 "phone": plant_asset.phone,
                 "on_hire": plant_asset.on_hire.strftime("%d/%m/%y"),
                 "hired_by": plant_asset.hired_by,
-                "serial": plant_asset.serial,
-                "inspection": plant_asset.inspection,
+                "serial": plant_asset.serial or plant_asset.stock_code,
+                "inspection": format_plant_inspection_reference(
+                    plant_asset.inspection_type,
+                    plant_asset.inspection,
+                ),
                 "in_file": "Yes" if plant_asset.source_reference else "",
             }
             for plant_asset in plant_assets
@@ -6644,6 +6792,7 @@ def generate_plant_register_document(
             autoescape=False,
         )
         document_template.save(output_path)
+        _normalise_plant_register_table_rows(output_path)
 
     repository.index_file(
         file_name=output_path.name,

@@ -18,6 +18,7 @@ from uplands_site_command_centre.permits.models import (
     LadderPermit,
     LadderStabilisationMethod,
     PlantAssetDocument,
+    PlantInspectionType,
     Permit,
     PermitDocument,
     RAMSDocument,
@@ -41,7 +42,11 @@ from uplands_site_command_centre.permits.models import (
     WeeklySiteCheckRowState,
     WasteRegister,
     WasteTransferNoteDocument,
+    format_plant_inspection_reference,
     get_weekly_site_check_frequency_for_row,
+    infer_plant_inspection_type,
+    is_pending_plant_inspection_reference,
+    PLANT_PENDING_INSPECTION_TEXT,
 )
 from uplands_site_command_centre.permits.carrier_compliance import (
     CarrierComplianceFinding,
@@ -84,6 +89,8 @@ __all__ = [
     "LadderPermit",
     "LadderStabilisationMethod",
     "PlantAssetDocument",
+    "PlantInspectionType",
+    "PLANT_PENDING_INSPECTION_TEXT",
     "Permit",
     "PermitDocument",
     "PermitNotFoundError",
@@ -111,5 +118,8 @@ __all__ = [
     "WeeklySiteCheckRowState",
     "WasteRegister",
     "WasteTransferNoteDocument",
+    "format_plant_inspection_reference",
     "get_weekly_site_check_frequency_for_row",
+    "infer_plant_inspection_type",
+    "is_pending_plant_inspection_reference",
 ]

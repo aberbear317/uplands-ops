@@ -34,6 +34,7 @@ from uplands_site_command_centre.permits import (
     LadderPermit,
     LadderStabilisationMethod,
     PlantAssetDocument,
+    PlantInspectionType,
     RAMSDocument,
     SITE_CHECK_WEEKDAY_KEYS,
     SiteDiaryDocument,
@@ -81,6 +82,7 @@ from uplands_site_command_centre.workspace import (
     generate_toolbox_talk_register_document,
     extract_expiry_date_from_pdf,
     extract_tonnage_from_ticket,
+    format_plant_inspection_reference,
     get_latest_toolbox_talk_document,
     generate_site_induction_poster,
     generate_plant_register_document,
@@ -91,6 +93,7 @@ from uplands_site_command_centre.workspace import (
     get_waste_kpi_sheet_metadata,
     get_valid_template_tags,
     get_weekly_site_check_row_definitions,
+    infer_plant_inspection_type,
     load_app_settings,
     log_uploaded_waste_transfer_note,
     list_daily_attendance_entries,
@@ -3795,9 +3798,12 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             self.assertEqual(plant_asset.on_hire, date(2026, 1, 26))
             self.assertEqual(plant_asset.source_reference, "H-3YXFCBWH")
             self.assertEqual(plant_asset.purchase_order, "81888")
-            self.assertEqual(plant_asset.status, DocumentStatus.DRAFT)
-            self.assertEqual(plant_asset.serial, "")
-            self.assertEqual(plant_asset.inspection, "Pending serial / LOLER details")
+            self.assertEqual(plant_asset.hired_by, "URL (Uplands)")
+            self.assertEqual(plant_asset.status, DocumentStatus.ACTIVE)
+            self.assertEqual(plant_asset.stock_code, "52538")
+            self.assertEqual(plant_asset.serial, "52538")
+            self.assertEqual(plant_asset.inspection_type, PlantInspectionType.SERVICE)
+            self.assertEqual(plant_asset.inspection, "Inspection / cert ref not logged")
 
     def test_generate_plant_register_document_renders_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3853,6 +3859,9 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                 "DUST EXTRACTOR M CLASS 110V",
             )
             self.assertEqual(rendered.tables[0].cell(1, 8).text, "Yes")
+            data_run = rendered.tables[0].cell(1, 0).paragraphs[0].runs[0]
+            self.assertEqual(data_run.font.name, "Arial")
+            self.assertEqual(data_run.font.size.pt, 10.0)
 
     def test_create_site_induction_document_renders_signature_and_logs_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5806,6 +5815,36 @@ class PlantRegisterAutomationTests(unittest.TestCase):
         self.assertEqual(plant_asset.inspection_due_date(), date(2026, 3, 18))
         self.assertTrue(
             plant_asset.inspection_requires_attention(on_date=date(2026, 3, 12))
+        )
+
+    def test_infer_plant_inspection_type_uses_description(self) -> None:
+        self.assertEqual(
+            infer_plant_inspection_type("LOOSE EXTENSION LEAD 110V 15M 32AM"),
+            PlantInspectionType.PAT,
+        )
+        self.assertEqual(
+            infer_plant_inspection_type("FIRE EXTINGUISHER 6L FOAM"),
+            PlantInspectionType.EXTINGUISHER,
+        )
+        self.assertEqual(
+            infer_plant_inspection_type("DUST EXTRACTOR M CLASS 110V"),
+            PlantInspectionType.SERVICE,
+        )
+
+    def test_format_plant_inspection_reference_combines_type_and_reference(self) -> None:
+        self.assertEqual(
+            format_plant_inspection_reference(
+                PlantInspectionType.PAT,
+                "Label 51 | Next due 18/03/2026",
+            ),
+            "PAT - Label 51 | Next due 18/03/2026",
+        )
+        self.assertEqual(
+            format_plant_inspection_reference(
+                PlantInspectionType.EXTINGUISHER,
+                "",
+            ),
+            "Extinguisher - cert ref not logged",
         )
 
 

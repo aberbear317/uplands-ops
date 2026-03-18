@@ -94,6 +94,29 @@ class VerificationStatus(str, Enum):
     UNVERIFIED = "UNVERIFIED"
 
 
+class PlantInspectionType(str, Enum):
+    """Inspection evidence categories used on the live plant register."""
+
+    PAT = "pat"
+    SERVICE = "service"
+    LOLER = "loler"
+    EXTINGUISHER = "extinguisher"
+    OTHER = "other"
+
+    @property
+    def label(self) -> str:
+        """Return a human-readable label for the plant register."""
+
+        labels = {
+            PlantInspectionType.PAT: "PAT",
+            PlantInspectionType.SERVICE: "Service",
+            PlantInspectionType.LOLER: "LOLER",
+            PlantInspectionType.EXTINGUISHER: "Extinguisher",
+            PlantInspectionType.OTHER: "Other",
+        }
+        return labels[self]
+
+
 class WeeklySiteCheckFrequency(str, Enum):
     """Applicability of one UHSF19.1 row across daily and weekly scopes."""
 
@@ -274,6 +297,15 @@ WEEKLY_SITE_CHECK_REQUIRED_TEMPLATE_PLACEHOLDERS: FrozenSet[str] = frozenset(
     | {f"initials_{day_key}" for day_key in SITE_CHECK_WEEKDAY_KEYS}
     | {f"time_{day_key}" for day_key in SITE_CHECK_WEEKDAY_KEYS}
 )
+PLANT_PENDING_INSPECTION_TEXT = "Inspection / cert ref not logged"
+PLANT_PENDING_INSPECTION_ALIASES: FrozenSet[str] = frozenset(
+    {
+        "",
+        "pending serial / loler details",
+        "awaiting serial / loler",
+        PLANT_PENDING_INSPECTION_TEXT.casefold(),
+    }
+)
 
 
 def _require_text(value: str, field_name: str) -> str:
@@ -327,6 +359,112 @@ def _normalise_optional_text(value: Optional[str], field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string or None.")
     return value.strip()
+
+
+def infer_plant_inspection_type(description: str) -> PlantInspectionType:
+    """Infer the most likely evidence type for one plant item description."""
+
+    normalized_description = " ".join(description.split()).strip().casefold()
+    if not normalized_description:
+        return PlantInspectionType.OTHER
+
+    if "extinguisher" in normalized_description:
+        return PlantInspectionType.EXTINGUISHER
+
+    if any(
+        keyword in normalized_description
+        for keyword in (
+            "hoist",
+            "chain block",
+            "shackle",
+            "sling",
+            "lifting",
+            "gin wheel",
+            "man basket",
+            "beam clamp",
+            "harness",
+        )
+    ):
+        return PlantInspectionType.LOLER
+
+    if any(
+        keyword in normalized_description
+        for keyword in (
+            "dust extractor",
+            "generator",
+            "rubble truck",
+            "chemical store",
+            "guard barrier",
+            "fire point",
+        )
+    ):
+        return PlantInspectionType.SERVICE
+
+    if any(
+        keyword in normalized_description
+        for keyword in (
+            "extension lead",
+            "worklight",
+            "transformer",
+            "charger",
+            "distribution board",
+            "task light",
+            "site light",
+            "flood light",
+        )
+    ):
+        return PlantInspectionType.PAT
+
+    return PlantInspectionType.SERVICE
+
+
+def _coerce_plant_inspection_type(
+    value: Any,
+    field_name: str,
+    *,
+    description: str = "",
+) -> PlantInspectionType:
+    """Return one validated plant inspection evidence type."""
+
+    if isinstance(value, PlantInspectionType):
+        return value
+    if value is None:
+        return infer_plant_inspection_type(description)
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a PlantInspectionType or string.")
+
+    cleaned_value = value.strip().lower()
+    if not cleaned_value:
+        return infer_plant_inspection_type(description)
+    try:
+        return PlantInspectionType(cleaned_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be one of: "
+            + ", ".join(item.value for item in PlantInspectionType)
+        ) from exc
+
+
+def is_pending_plant_inspection_reference(value: Optional[str]) -> bool:
+    """Return True when a plant inspection reference is still only a placeholder."""
+
+    normalized_value = " ".join(str(value or "").split()).strip().casefold()
+    return normalized_value in PLANT_PENDING_INSPECTION_ALIASES
+
+
+def format_plant_inspection_reference(
+    inspection_type: PlantInspectionType | str,
+    inspection_reference: Optional[str],
+) -> str:
+    """Return one printable plant inspection value combining type and reference."""
+
+    resolved_type = _coerce_plant_inspection_type(
+        inspection_type,
+        "inspection_type",
+    )
+    if is_pending_plant_inspection_reference(inspection_reference):
+        return f"{resolved_type.label} - cert ref not logged"
+    return f"{resolved_type.label} - {_normalise_optional_text(inspection_reference, 'inspection_reference')}"
 
 
 def _format_person_name(value: str) -> str:
@@ -1849,6 +1987,8 @@ class PlantAssetDocument(BaseDocument):
     on_hire: date
     hired_by: str
     serial: str = ""
+    stock_code: str = ""
+    inspection_type: PlantInspectionType = PlantInspectionType.OTHER
     inspection: str = ""
     source_reference: str = ""
     purchase_order: str = ""
@@ -1878,6 +2018,12 @@ class PlantAssetDocument(BaseDocument):
         self.on_hire = _coerce_date(self.on_hire, "on_hire")
         self.hired_by = _require_text(self.hired_by, "hired_by")
         self.serial = _normalise_optional_text(self.serial, "serial")
+        self.stock_code = _normalise_optional_text(self.stock_code, "stock_code")
+        self.inspection_type = _coerce_plant_inspection_type(
+            self.inspection_type,
+            "inspection_type",
+            description=self.description,
+        )
         self.inspection = _normalise_optional_text(self.inspection, "inspection")
         self.source_reference = _normalise_optional_text(
             self.source_reference,
@@ -1936,6 +2082,10 @@ class PlantAssetDocument(BaseDocument):
 
         context = super().to_template_context()
         context["on_hire"] = self.on_hire.strftime("%d/%m/%y")
+        context["inspection"] = format_plant_inspection_reference(
+            self.inspection_type,
+            self.inspection,
+        )
         context["in_file"] = "Yes" if self.source_reference else ""
         return context
 
@@ -1953,6 +2103,8 @@ class PlantAssetDocument(BaseDocument):
 
         payload = cls._deserialize_base_fields(data)
         payload["on_hire"] = _coerce_date(payload["on_hire"], "on_hire")
+        payload["stock_code"] = payload.get("stock_code", "")
+        payload["inspection_type"] = payload.get("inspection_type", "")
         return cls(**payload)
 
 
