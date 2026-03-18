@@ -175,6 +175,11 @@ INDUCTION_EVIDENCE_LABEL_ORDER = (
     "CPCS Card",
     "Client Training Evidence",
 )
+WASTE_MISSING_TONNAGE_REVIEW_OPTIONS = (
+    "Weight not shown on supplier ticket",
+    "Awaiting monthly waste report",
+    "Resolved by manager",
+)
 LADDER_CHECKLIST_QUESTIONS: Dict[int, str] = {
     1: "Safer alternative eliminated",
     2: "Task-specific RAMS prepared and approved",
@@ -4966,11 +4971,10 @@ def _render_file_1_waste_register_panel(
     needs_review_count = sum(
         1
         for waste_note in waste_notes
-        if _get_waste_note_quality_status(
+        if _waste_note_requires_queue_review(
             waste_note,
             waste_source_conflict_lookup=waste_source_conflict_lookup,
         )
-        != "Ready"
     )
     file_1_indexed_files = repository.list_indexed_files(file_group=FileGroup.FILE_1)
     filed_ticket_pdfs = [
@@ -5163,15 +5167,19 @@ def _build_file_1_waste_review_queue_rows(
         key=lambda note: (note.date, note.created_at, note.wtn_number),
         reverse=True,
     ):
-        quality_status = _get_waste_note_quality_status(
+        if not _waste_note_requires_queue_review(
             waste_note,
             waste_source_conflict_lookup=waste_source_conflict_lookup,
-        )
-        if quality_status == "Ready":
+        ):
             continue
         source_conflict = _get_waste_source_conflict_for_note(
             waste_note,
             waste_source_conflict_lookup,
+        )
+        issue_label = (
+            "Source Conflict"
+            if source_conflict is not None
+            else "Missing Tonnage"
         )
         canonical_source_name = (
             source_conflict.canonical_source.source_path.name
@@ -5181,14 +5189,10 @@ def _build_file_1_waste_review_queue_rows(
         queue_rows.append(
             {
                 "WTN": waste_note.wtn_number,
-                "Issue": quality_status,
+                "Issue": issue_label,
                 "Date": waste_note.date.strftime("%d/%m/%Y"),
                 "Carrier": waste_note.carrier_name,
-                "Tonnes": (
-                    "Needs review"
-                    if waste_note.quantity_tonnes <= 0
-                    else f"{waste_note.quantity_tonnes:.2f}"
-                ),
+                "Tonnes": _format_waste_note_tonnage_label(waste_note),
                 "Source": canonical_source_name or "Filed source linked",
             }
         )
@@ -5204,6 +5208,7 @@ def _render_file_1_waste_note_review_workspace(
     source_conflict_lookup: Dict[tuple[str, str], Any],
     key_prefix: str,
     queue_state_key: Optional[str] = None,
+    queue_pending_state_key: Optional[str] = None,
     next_queue_label: Optional[str] = None,
 ) -> None:
     """Render the review/editor workspace for one File 1 waste note."""
@@ -5398,6 +5403,11 @@ def _render_file_1_waste_note_review_workspace(
         if scanned_waste_note is not None and scanned_waste_note.destination_facility
         else selected_waste_note.destination_facility
     )
+    default_tonnage_review_status = (
+        selected_waste_note.tonnage_review_status
+        if selected_waste_note.quantity_tonnes <= 0
+        else ""
+    )
 
     with st.form(
         f"{key_prefix}-{selected_waste_note.doc_id}-waste-log-form",
@@ -5458,6 +5468,36 @@ def _render_file_1_waste_note_review_workspace(
                 key=f"{key_prefix}-{selected_waste_note.doc_id}-destination-facility",
             )
 
+        tonnage_review_status = ""
+        if quantity_tonnes <= 0:
+            tonnage_review_status = str(
+                st.selectbox(
+                    "Missing Tonnage Handling",
+                    options=["-- Select resolution --", *WASTE_MISSING_TONNAGE_REVIEW_OPTIONS],
+                    index=(
+                        0
+                        if not default_tonnage_review_status
+                        else (
+                            list(WASTE_MISSING_TONNAGE_REVIEW_OPTIONS).index(
+                                default_tonnage_review_status
+                            )
+                            + 1
+                        )
+                    ),
+                    key=f"{key_prefix}-{selected_waste_note.doc_id}-tonnage-review-status",
+                    help=(
+                        "Use this when the supplier ticket genuinely does not show a weight, "
+                        "or when the final tonnage is being resolved outside the ticket."
+                    ),
+                )
+            )
+            if tonnage_review_status == "-- Select resolution --":
+                tonnage_review_status = ""
+            if _is_tanker_waste_note(selected_waste_note):
+                st.caption(
+                    "Tanker runs can be closed honestly here without inventing a tonne value."
+                )
+
         if queue_state_key is not None:
             submit_columns = st.columns(2)
             with submit_columns[0]:
@@ -5479,10 +5519,13 @@ def _render_file_1_waste_note_review_workspace(
                 st.text(scanned_waste_note.extracted_text[:3000])
         return
 
-    if quantity_tonnes <= 0:
+    if quantity_tonnes <= 0 and not tonnage_review_status:
         st.session_state["waste_log_flash"] = {
             "level": "error",
-            "message": "Quantity (tonnes) must be greater than zero before logging waste.",
+            "message": (
+                "Enter Quantity (tonnes) or choose a Missing Tonnage Handling option "
+                "before logging waste."
+            ),
         }
         st.rerun()
 
@@ -5498,6 +5541,7 @@ def _render_file_1_waste_note_review_workspace(
             quantity_tonnes=float(quantity_tonnes),
             ewc_code=ewc_code,
             destination_facility=destination_facility,
+            tonnage_review_status=tonnage_review_status,
         )
     except ValidationError as exc:
         st.session_state["waste_log_flash"] = {
@@ -5519,11 +5563,11 @@ def _render_file_1_waste_note_review_workspace(
             f"Source file: {logged_waste_note.stored_file_path.name if logged_waste_note.stored_file_path else 'already filed'}"
         ),
     }
-    if resolve_and_next and queue_state_key is not None:
+    if resolve_and_next and queue_pending_state_key is not None:
         if next_queue_label is not None:
-            st.session_state[queue_state_key] = next_queue_label
+            st.session_state[queue_pending_state_key] = next_queue_label
         else:
-            st.session_state.pop(queue_state_key, None)
+            st.session_state[queue_pending_state_key] = ""
     st.rerun()
 
 
@@ -5545,11 +5589,10 @@ def _render_file_1_waste_review_queue_panel(
         [
             waste_note
             for waste_note in waste_notes
-            if _get_waste_note_quality_status(
+            if _waste_note_requires_queue_review(
                 waste_note,
                 waste_source_conflict_lookup=source_conflict_lookup,
             )
-            != "Ready"
         ]
     )
     queue_rows = _build_file_1_waste_review_queue_rows(
@@ -5598,6 +5641,12 @@ def _render_file_1_waste_review_queue_panel(
 
     queue_option_labels = list(queue_note_options)
     queue_state_key = "file_1_review_queue_selected_note"
+    queue_pending_state_key = f"{queue_state_key}_pending"
+    queued_queue_label = st.session_state.pop(queue_pending_state_key, None)
+    if queued_queue_label in queue_option_labels:
+        st.session_state[queue_state_key] = queued_queue_label
+    elif queued_queue_label == "":
+        st.session_state.pop(queue_state_key, None)
     selected_queue_label = st.session_state.get(queue_state_key)
     if selected_queue_label not in queue_option_labels:
         st.session_state[queue_state_key] = queue_option_labels[0]
@@ -5621,7 +5670,7 @@ def _render_file_1_waste_review_queue_panel(
             disabled=current_index == len(queue_option_labels) - 1,
             width="stretch",
         ):
-            st.session_state[queue_state_key] = queue_option_labels[current_index + 1]
+            st.session_state[queue_pending_state_key] = queue_option_labels[current_index + 1]
             st.rerun()
     with navigation_columns[1]:
         if st.button(
@@ -5630,7 +5679,7 @@ def _render_file_1_waste_review_queue_panel(
             disabled=current_index == 0,
             width="stretch",
         ):
-            st.session_state[queue_state_key] = queue_option_labels[current_index - 1]
+            st.session_state[queue_pending_state_key] = queue_option_labels[current_index - 1]
             st.rerun()
     with navigation_columns[2]:
         st.caption(
@@ -5651,6 +5700,7 @@ def _render_file_1_waste_review_queue_panel(
         source_conflict_lookup=source_conflict_lookup,
         key_prefix="file_1_review_queue",
         queue_state_key=queue_state_key,
+        queue_pending_state_key=queue_pending_state_key,
         next_queue_label=next_queue_label,
     )
 
@@ -14504,11 +14554,7 @@ def _build_live_waste_register_rows(
             "Collection Type": _get_waste_note_collection_type_label(waste_note),
             "Waste Reg / Ticket": _format_waste_register_reference_for_ui(waste_note),
             "Description": waste_note.waste_description,
-            "Tonnes": (
-                "Needs review"
-                if waste_note.quantity_tonnes <= 0
-                else f"{waste_note.quantity_tonnes:.2f}"
-            ),
+            "Tonnes": _format_waste_note_tonnage_label(waste_note),
             "QA": _get_waste_note_quality_status(
                 waste_note,
                 waste_source_conflict_lookup=waste_source_conflict_lookup or {},
@@ -14537,6 +14583,23 @@ def _get_waste_note_collection_type_label(
         if source_candidate.collection_type:
             return source_candidate.collection_type
     return "-"
+
+
+def _format_waste_note_tonnage_label(
+    waste_note: WasteTransferNoteDocument,
+) -> str:
+    """Return the File 1 tonnage display for one waste note."""
+
+    if waste_note.quantity_tonnes > 0:
+        return f"{waste_note.quantity_tonnes:.2f}"
+
+    if waste_note.tonnage_review_status == "Weight not shown on supplier ticket":
+        return "Not shown on ticket"
+    if waste_note.tonnage_review_status == "Awaiting monthly waste report":
+        return "Awaiting report"
+    if waste_note.tonnage_review_status == "Resolved by manager":
+        return "Manager reviewed"
+    return "Needs review"
 
 
 def _is_tanker_waste_note(waste_note: WasteTransferNoteDocument) -> bool:
@@ -14594,6 +14657,21 @@ def _get_waste_source_conflict_for_note(
     ) or waste_source_conflict_lookup.get(waste_note.wtn_number)
 
 
+def _waste_note_requires_queue_review(
+    waste_note: WasteTransferNoteDocument,
+    *,
+    waste_source_conflict_lookup: Dict[Any, Any],
+) -> bool:
+    """Return True when the WTN still needs operator action in File 1."""
+
+    if _get_waste_source_conflict_for_note(
+        waste_note,
+        waste_source_conflict_lookup,
+    ) is not None:
+        return True
+    return waste_note.quantity_tonnes <= 0 and not waste_note.tonnage_review_status
+
+
 def _get_waste_note_quality_status(
     waste_note: WasteTransferNoteDocument,
     *,
@@ -14607,6 +14685,8 @@ def _get_waste_note_quality_status(
     ) is not None:
         return "Source Conflict"
     if waste_note.quantity_tonnes <= 0:
+        if waste_note.tonnage_review_status:
+            return waste_note.tonnage_review_status
         return "Needs Review"
     return "Ready"
 

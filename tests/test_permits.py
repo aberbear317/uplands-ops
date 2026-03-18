@@ -6519,6 +6519,31 @@ class WasteRegisterAutomationTests(unittest.TestCase):
         self.assertEqual(rows_by_ticket["30649"]["QA"], "Needs Review")
         self.assertEqual(rows_by_ticket["30649"]["Tonnes"], "Needs review")
 
+    def test_build_live_waste_register_rows_shows_reviewed_missing_tonnage_status(self) -> None:
+        reviewed_note = WasteTransferNoteDocument(
+            doc_id="WTN-TANKER",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 5),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="30879",
+            date=date(2026, 3, 16),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=0.0,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+            tonnage_review_status="Weight not shown on supplier ticket",
+        )
+
+        register_rows = app_module._build_live_waste_register_rows(
+            [reviewed_note],
+            waste_source_conflict_lookup={},
+        )
+
+        self.assertEqual(register_rows[0]["QA"], "Weight not shown on supplier ticket")
+        self.assertEqual(register_rows[0]["Tonnes"], "Not shown on ticket")
+
     def test_build_file_1_waste_review_queue_rows_only_returns_unresolved_tickets(self) -> None:
         ready_note = WasteTransferNoteDocument(
             doc_id="WTN-READY",
@@ -6533,6 +6558,21 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             carrier_name="Abucs",
             destination_facility="Not captured from ticket PDF",
             vehicle_registration="",
+        )
+        reviewed_tanker_note = WasteTransferNoteDocument(
+            doc_id="WTN-TANKER",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 4),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="30879",
+            date=date(2026, 3, 16),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=0.0,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+            tonnage_review_status="Awaiting monthly waste report",
         )
         unresolved_note = WasteTransferNoteDocument(
             doc_id="WTN-UNRESOLVED",
@@ -6549,13 +6589,52 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             vehicle_registration="",
         )
         queue_rows = app_module._build_file_1_waste_review_queue_rows(
-            [ready_note, unresolved_note],
+            [ready_note, reviewed_tanker_note, unresolved_note],
             waste_source_conflict_lookup={},
         )
 
         self.assertEqual(len(queue_rows), 1)
         self.assertEqual(queue_rows[0]["WTN"], "30649")
-        self.assertEqual(queue_rows[0]["Issue"], "Needs Review")
+        self.assertEqual(queue_rows[0]["Issue"], "Missing Tonnage")
+
+    def test_update_logged_waste_transfer_note_persists_missing_tonnage_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+            source_document = WasteTransferNoteDocument(
+                doc_id="WTN-30879-2026-03-16",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 17, 8, 5),
+                status=DocumentStatus.ACTIVE,
+                wtn_number="30879",
+                date=date(2026, 3, 16),
+                waste_description="Mixed Construction",
+                ewc_code="17 09 04",
+                quantity_tonnes=0.0,
+                carrier_name="Abucs",
+                destination_facility="Not captured from ticket PDF",
+                vehicle_registration="",
+            )
+            repository.save(source_document)
+
+            logged_waste_note = workspace_module.update_logged_waste_transfer_note(
+                repository,
+                source_document=source_document,
+                site_name="NG Lovedean Substation",
+                carrier_name="Abucs",
+                vehicle_registration="",
+                waste_description="Mixed Construction",
+                ticket_date=date(2026, 3, 16),
+                quantity_tonnes=0.0,
+                ewc_code="17 09 04",
+                destination_facility="Not captured from ticket PDF",
+                tonnage_review_status="Resolved by manager",
+            )
+
+            self.assertEqual(
+                logged_waste_note.waste_transfer_note.tonnage_review_status,
+                "Resolved by manager",
+            )
 
     def test_generate_waste_register_document_renders_and_indexes_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6582,6 +6661,16 @@ class WasteRegisterAutomationTests(unittest.TestCase):
                     carrier_name="Abucs",
                     destination_facility="Not captured from ticket PDF",
                     vehicle_registration="AB12 CDE",
+                    canonical_source_path="/tmp/31194.PDF",
+                    source_conflict_candidates=[
+                        {
+                            "source_path": "/tmp/31194.PDF",
+                            "ticket_date": "2026-03-11",
+                            "collection_type": "Tanker-Municipal W",
+                            "waste_description": "Mixed Construction",
+                            "quantity_tonnes": 2.4,
+                        }
+                    ],
                 )
             )
 
@@ -6605,7 +6694,69 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             rendered = Document(generated.output_path)
             self.assertIn("Client Uplands", rendered.paragraphs[0].text)
             self.assertEqual(rendered.tables[0].cell(1, 0).text, "Abucs")
+            self.assertEqual(
+                rendered.tables[0].cell(1, 2).text,
+                "Tanker-Municipal W - Mixed Construction",
+            )
             self.assertEqual(rendered.tables[0].cell(1, 3).text, "AB12 CDE / 31194")
+
+    def test_generate_waste_register_document_includes_skip_type_in_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_directory = Path(temp_dir) / "output"
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            template_path = Path(temp_dir) / "waste-register-template.docx"
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_file_1_output_dir = app_config.FILE_1_OUTPUT_DIR
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+            self._build_waste_register_template(template_path)
+
+            repository.save(
+                WasteTransferNoteDocument(
+                    doc_id="WTN-31420",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 12, 8, 0),
+                    status=DocumentStatus.ACTIVE,
+                    wtn_number="31420",
+                    date=date(2026, 3, 12),
+                    waste_description="Mixed Construction",
+                    ewc_code="17 09 04",
+                    quantity_tonnes=1.42,
+                    carrier_name="Abucs",
+                    destination_facility="Not captured from ticket PDF",
+                    vehicle_registration="",
+                    canonical_source_path="/tmp/31420.PDF",
+                    source_conflict_candidates=[
+                        {
+                            "source_path": "/tmp/31420.PDF",
+                            "ticket_date": "2026-03-12",
+                            "collection_type": "12 Yard ENCLOSED Exchange",
+                            "waste_description": "Mixed Construction",
+                            "quantity_tonnes": 1.42,
+                        }
+                    ],
+                )
+            )
+
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["waste_register"] = template_path
+                app_config.FILE_1_OUTPUT_DIR = output_directory
+                generated = generate_waste_register_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    client_name="Uplands",
+                    site_address="National Grid, Broadway Lane, Waterlooville, Hampshire, PO8 0SJ",
+                    manager_name="Ceri Edwards",
+                )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                app_config.FILE_1_OUTPUT_DIR = original_file_1_output_dir
+
+            rendered = Document(generated.output_path)
+            self.assertEqual(
+                rendered.tables[0].cell(1, 2).text,
+                "12 Yard ENCLOSED Exchange - Mixed Construction",
+            )
 
 
 class SafetyScannerAutomationTests(unittest.TestCase):

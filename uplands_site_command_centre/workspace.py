@@ -2051,6 +2051,7 @@ def update_logged_waste_transfer_note(
     quantity_tonnes: float,
     ewc_code: str,
     destination_facility: str = DEFAULT_DESTINATION_FACILITY,
+    tonnage_review_status: str = "",
 ) -> LoggedWasteTransferNote:
     """Update an already-filed WTN document from the File 1 smart-scan form."""
 
@@ -2072,6 +2073,11 @@ def update_logged_waste_transfer_note(
         source_file_override_path=source_document.source_file_override_path,
         canonical_source_path=source_document.canonical_source_path,
         source_conflict_candidates=source_document.source_conflict_candidates,
+        tonnage_review_status=(
+            tonnage_review_status.strip()
+            if quantity_tonnes <= 0
+            else ""
+        ),
     )
     repository.save(refreshed_waste_transfer_note)
     register_document = _upsert_site_waste_register(
@@ -2124,7 +2130,7 @@ def generate_waste_register_document(
             {
                 "carrier": waste_transfer_note.carrier_name,
                 "date": waste_transfer_note.date.strftime("%d/%m/%y"),
-                "description": waste_transfer_note.waste_description,
+                "description": _format_waste_register_description(waste_transfer_note),
                 "reg_no": _format_waste_register_reference(waste_transfer_note),
             }
             for waste_transfer_note in waste_transfer_notes
@@ -8779,6 +8785,11 @@ def _upsert_waste_transfer_note_document_from_candidate(
             else 0.0
         )
     )
+    tonnage_review_status = (
+        existing_document.tonnage_review_status
+        if existing_document is not None and quantity_tonnes <= 0
+        else ""
+    )
     document = WasteTransferNoteDocument(
         doc_id=(
             existing_document.doc_id
@@ -8849,6 +8860,7 @@ def _upsert_waste_transfer_note_document_from_candidate(
                 else []
             )
         ),
+        tonnage_review_status=tonnage_review_status,
     )
     repository.save(document)
     return document
@@ -9042,6 +9054,8 @@ def list_waste_transfer_note_source_conflicts(
                 source_candidates.append(source_candidate)
             if len(source_candidates) >= 2:
                 grouped_candidates[group_key] = source_candidates
+        if not grouped_candidates:
+            return []
 
     if not grouped_candidates:
         for source_candidate in _list_waste_transfer_note_source_candidates(
@@ -10000,6 +10014,39 @@ def _format_waste_register_reference(
         if part and part.strip()
     ]
     return " / ".join(parts)
+
+
+def _get_waste_register_collection_type(
+    waste_transfer_note: WasteTransferNoteDocument,
+) -> str:
+    """Return the best available collection type for one printed File 1 row."""
+
+    canonical_source_path = waste_transfer_note.canonical_source_path.strip()
+    if canonical_source_path:
+        for source_candidate in waste_transfer_note.source_conflict_candidates:
+            if source_candidate.source_path.strip() == canonical_source_path:
+                return source_candidate.collection_type.strip()
+
+    for source_candidate in waste_transfer_note.source_conflict_candidates:
+        if source_candidate.collection_type.strip():
+            return source_candidate.collection_type.strip()
+    return ""
+
+
+def _format_waste_register_description(
+    waste_transfer_note: WasteTransferNoteDocument,
+) -> str:
+    """Return the printed File 1 description with the collection type when available."""
+
+    description = waste_transfer_note.waste_description.strip()
+    collection_type = _get_waste_register_collection_type(waste_transfer_note)
+    if not collection_type:
+        return description
+    if not description:
+        return collection_type
+    if collection_type.casefold() in description.casefold():
+        return description
+    return f"{collection_type} - {description}"
 
 
 def _build_project_number(site_name: str) -> str:

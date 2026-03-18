@@ -3177,6 +3177,7 @@ class WasteTransferNoteDocument(BaseDocument):
     source_file_override_path: str = ""
     canonical_source_path: str = ""
     source_conflict_candidates: List[WasteTransferNoteSourceSnapshot] = field(default_factory=list)
+    tonnage_review_status: str = ""
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
     verification_notes: str = ""
 
@@ -3229,6 +3230,10 @@ class WasteTransferNoteDocument(BaseDocument):
             else WasteTransferNoteSourceSnapshot.from_storage_dict(source_candidate)
             for source_candidate in self.source_conflict_candidates
         ]
+        self.tonnage_review_status = _normalise_optional_text(
+            self.tonnage_review_status,
+            "tonnage_review_status",
+        )
         self.destination_facility = _require_text(
             self.destination_facility,
             "destination_facility",
@@ -3296,6 +3301,7 @@ class WasteTransferNoteDocument(BaseDocument):
             else WasteTransferNoteSourceSnapshot.from_storage_dict(source_candidate)
             for source_candidate in payload.get("source_conflict_candidates", [])
         ]
+        payload["tonnage_review_status"] = payload.get("tonnage_review_status", "")
         payload["verification_status"] = _coerce_verification_status(
             payload.get("verification_status", VerificationStatus.UNVERIFIED.value)
         )
