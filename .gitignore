@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 gps.log
 tunnel.log
+streamlit.log
 
 # Site Command Centre Data (STRICTLY IGNORE)
 Uplands_Workspace/
