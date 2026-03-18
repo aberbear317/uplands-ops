@@ -68,19 +68,24 @@ from uplands_site_command_centre import (
     WeeklySiteCheck,
     WasteRegister,
     WasteTransferNoteDocument,
+    WASTE_DESTINATION,
     build_live_site_broadcast_contacts,
     build_site_alert_sms_link,
     build_site_alert_sms_links,
     build_pending_toolbox_talk_contacts,
     build_site_worker_roster,
     build_site_gate_access_code,
+    build_toolbox_talk_document_view_url,
     build_toolbox_talk_sms_message,
     calculate_haversine_distance_meters,
     check_carrier_compliance,
     complete_daily_attendance_sign_out,
     create_weekly_site_check_checklist_draft,
     create_daily_attendance_sign_in,
+    update_daily_attendance_entry,
     create_site_induction_document,
+    add_site_induction_evidence_files,
+    update_site_induction_document,
     create_ladder_permit_draft,
     file_and_index_all,
     generate_toolbox_talk_register_document,
@@ -98,6 +103,7 @@ from uplands_site_command_centre import (
     get_site_induction_url,
     get_daily_contractor_headcount,
     get_waste_kpi_sheet_metadata,
+    list_waste_transfer_note_source_conflicts,
     get_valid_template_tags,
     get_weekly_site_check_row_definitions,
     list_daily_attendance_entries,
@@ -105,6 +111,7 @@ from uplands_site_command_centre import (
     list_toolbox_talk_completions,
     log_toolbox_talk_completion,
     load_app_settings,
+    normalize_public_app_url,
     lookup_uk_postcode_details,
     list_broadcast_dispatches,
     read_toolbox_talk_document_bytes,
@@ -113,6 +120,7 @@ from uplands_site_command_centre import (
     run_workspace_diagnostic,
     save_toolbox_talk_document,
     save_app_settings,
+    set_waste_transfer_note_source_override,
     smart_scan_waste_transfer_note,
     sync_file_4_permit_records,
     update_logged_waste_transfer_note,
@@ -153,6 +161,20 @@ ATTENDANCE_FORM_METADATA = (
 )
 GEOFENCE_RADIUS_METERS = 500
 SITE_GATE_CODE_SLOT_MINUTES = 30
+MANDATORY_MANUAL_HANDLING_LABEL = "Manual Handling Certificate"
+OTHER_INDUCTION_EVIDENCE_OPTION = "🗂️ Other Evidence (Type Below)"
+INDUCTION_EVIDENCE_LABEL_ORDER = (
+    "CSCS Card",
+    MANDATORY_MANUAL_HANDLING_LABEL,
+    "Asbestos Certificate",
+    "CISRS Card",
+    "First Aid Certificate",
+    "Fire Warden Certificate",
+    "Supervisor Certificate",
+    "SMSTS Certificate",
+    "CPCS Card",
+    "Client Training Evidence",
+)
 LADDER_CHECKLIST_QUESTIONS: Dict[int, str] = {
     1: "Safer alternative eliminated",
     2: "Task-specific RAMS prepared and approved",
@@ -989,7 +1011,9 @@ def _load_project_setup() -> ProjectSetup:
         site_address=str(payload.get("site_address") or "").strip(),
         client_name=str(payload.get("client_name") or default_setup.client_name).strip()
         or default_setup.client_name,
-        public_tunnel_url=str(payload.get("public_tunnel_url") or "").strip(),
+        public_tunnel_url=normalize_public_app_url(
+            str(payload.get("public_tunnel_url") or "").strip()
+        ),
         site_latitude=_coerce_float(
             payload.get("site_latitude"),
             default_setup.site_latitude,
@@ -1024,6 +1048,7 @@ def _save_project_setup(project_setup: ProjectSetup) -> ProjectSetup:
     project_setup = _normalize_project_setup(project_setup)
     project_setup_to_save = replace(
         project_setup,
+        public_tunnel_url=normalize_public_app_url(project_setup.public_tunnel_url),
         known_sites=_merge_known_site_profiles(project_setup),
     )
     PROJECT_SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1239,10 +1264,14 @@ def _get_project_setup() -> ProjectSetup:
 
     loaded_setup = _load_project_setup()
     root_settings = load_app_settings()
+    loaded_setup = replace(
+        loaded_setup,
+        public_tunnel_url=normalize_public_app_url(loaded_setup.public_tunnel_url),
+    )
     if not loaded_setup.public_tunnel_url and root_settings["public_tunnel_url"]:
         loaded_setup = replace(
             loaded_setup,
-            public_tunnel_url=root_settings["public_tunnel_url"],
+            public_tunnel_url=normalize_public_app_url(root_settings["public_tunnel_url"]),
         )
     st.session_state["project_setup"] = loaded_setup
     return loaded_setup
@@ -1265,7 +1294,7 @@ def _synchronise_public_tunnel_settings(project_setup: ProjectSetup) -> ProjectS
 
     detected_tunnel_url = detect_public_tunnel_url_from_log()
     saved_tunnel_url = load_app_settings()["public_tunnel_url"]
-    resolved_tunnel_url = (
+    resolved_tunnel_url = normalize_public_app_url(
         detected_tunnel_url
         or project_setup.public_tunnel_url.strip()
         or saved_tunnel_url
@@ -1350,6 +1379,7 @@ def _reset_site_induction_form_state() -> None:
     for transient_key in (
         "site_induction_competency_cards",
         "site_induction_cscs_card_upload",
+        "site_induction_manual_handling_upload",
         "site_induction_asbestos_card_upload",
         "site_induction_cisrs_card_upload",
         "site_induction_cpcs_card_upload",
@@ -1373,22 +1403,30 @@ def _build_site_induction_competency_file_payloads(
     for competency_label, uploaded_file in labelled_uploads:
         if uploaded_file is None:
             continue
-        file_name = Path(str(getattr(uploaded_file, "name", "") or "")).name
-        if not file_name:
-            continue
-        try:
-            file_bytes = uploaded_file.getvalue()
-        except Exception:
-            file_bytes = b""
-        if not file_bytes:
-            continue
-        payloads.append(
-            {
-                "label": competency_label,
-                "name": file_name,
-                "bytes": file_bytes,
-            }
+        uploaded_files = (
+            list(uploaded_file)
+            if isinstance(uploaded_file, (list, tuple))
+            else [uploaded_file]
         )
+        for uploaded_item in uploaded_files:
+            if uploaded_item is None:
+                continue
+            file_name = Path(str(getattr(uploaded_item, "name", "") or "")).name
+            if not file_name:
+                continue
+            try:
+                file_bytes = uploaded_item.getvalue()
+            except Exception:
+                file_bytes = b""
+            if not file_bytes:
+                continue
+            payloads.append(
+                {
+                    "label": competency_label,
+                    "name": file_name,
+                    "bytes": file_bytes,
+                }
+            )
     return payloads
 
 
@@ -3070,6 +3108,51 @@ def _inject_styles() -> None:
                 font-size: 0.94rem;
                 line-height: 1.55;
             }}
+            .dispatch-audit-card {{
+                background: #ffffff;
+                border: 1px solid {CARD_BORDER};
+                border-radius: 16px;
+                box-shadow: 0 8px 18px rgba(18, 24, 38, 0.06);
+                padding: 1rem 1.05rem;
+                min-height: 140px;
+            }}
+            .dispatch-audit-label {{
+                color: {TEXT_MUTED};
+                font-size: 0.76rem;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                margin-bottom: 0.7rem;
+                text-transform: uppercase;
+            }}
+            .dispatch-audit-value {{
+                color: {TEXT_DARK};
+                font-size: 1.9rem;
+                font-weight: 800;
+                line-height: 1.18;
+                margin-bottom: 0.45rem;
+                word-break: break-word;
+            }}
+            .dispatch-audit-value-compact {{
+                font-size: 1.38rem;
+                line-height: 1.28;
+            }}
+            .dispatch-audit-copy {{
+                color: {TEXT_MUTED};
+                font-size: 0.9rem;
+                line-height: 1.45;
+            }}
+            .dispatch-message-box {{
+                background: #f8fafc;
+                border: 1px solid {CARD_BORDER};
+                border-radius: 14px;
+                color: {TEXT_DARK};
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+                font-size: 0.96rem;
+                line-height: 1.55;
+                padding: 1rem;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }}
             .indicator-row {{
                 display: flex;
                 align-items: flex-start;
@@ -4632,6 +4715,10 @@ def _render_file_1_station(
         site_address=project_setup.site_address,
         fallback_project_number=project_setup.job_number,
     )
+    waste_source_conflicts = _get_cached_file_1_waste_source_conflicts(
+        site_name=project_setup.current_site_name,
+        repository=repository,
+    )
     carrier_status = (
         "OK"
         if abucs_rows and all(row.status == ComplianceAlertStatus.OK for row in abucs_rows)
@@ -4688,25 +4775,174 @@ def _render_file_1_station(
             ),
         )
 
-    register_tab, scan_tab, compliance_tab = st.tabs(
-        ["Waste Register", "Smart Scan & Updates", "Carrier Compliance"]
+    flash_message = st.session_state.pop("waste_log_flash", None)
+    if flash_message is not None:
+        if flash_message["level"] == "error":
+            st.error(flash_message["message"])
+        else:
+            st.success(flash_message["message"])
+
+    file_1_view_options = {
+        "Waste Register": "register",
+        "Needs Review Queue": "review",
+        "Smart Scan & Updates": "scan",
+        "Carrier Compliance": "compliance",
+    }
+    selected_file_1_view = str(
+        st.session_state.get("file_1_active_view", "register")
     )
-    with register_tab:
+    if selected_file_1_view not in file_1_view_options.values():
+        selected_file_1_view = "register"
+    st.session_state["file_1_active_view"] = selected_file_1_view
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Workspace View",
+        "Choose one File 1 workspace at a time. This keeps the page much snappier than rendering every heavy panel on each rerun.",
+    )
+    selected_file_1_view = str(
+        st.radio(
+            "File 1 Workspace View",
+            options=list(file_1_view_options.values()),
+            format_func=lambda option: next(
+                label for label, value in file_1_view_options.items() if value == option
+            ),
+            horizontal=True,
+            key="file_1_active_view",
+            label_visibility="collapsed",
+        )
+    )
+
+    if selected_file_1_view == "register":
         _render_file_1_waste_register_panel(
             repository,
             project_setup=project_setup,
             waste_notes=active_waste_notes,
             waste_kpi_metadata=waste_kpi_metadata,
+            waste_source_conflicts=waste_source_conflicts,
         )
-    with scan_tab:
+    elif selected_file_1_view == "review":
+        _render_file_1_waste_review_queue_panel(
+            repository,
+            project_setup=project_setup,
+            waste_kpi_metadata=waste_kpi_metadata,
+            waste_notes=active_waste_notes,
+            waste_source_conflicts=waste_source_conflicts,
+        )
+    elif selected_file_1_view == "scan":
         _render_file_1_waste_log_panel(
             repository,
             project_setup=project_setup,
             waste_kpi_metadata=waste_kpi_metadata,
             waste_notes=active_waste_notes,
+            waste_source_conflicts=waste_source_conflicts,
         )
-    with compliance_tab:
+    else:
         _render_carrier_compliance_panel(abucs_rows)
+
+
+def _format_waste_kpi_source_label(workbook_path: Optional[Path]) -> str:
+    """Return a cleaner user-facing label for the linked waste KPI workbook."""
+
+    if workbook_path is None:
+        return "Fallback"
+
+    source_label = workbook_path.stem.strip()
+    if not source_label:
+        source_label = workbook_path.name
+    source_label = re.sub(r"[_]+", " ", source_label)
+    source_label = re.sub(r"\s*-\s*", " · ", source_label)
+    source_label = re.sub(r"\s{2,}", " ", source_label).strip()
+    return source_label or workbook_path.name
+
+
+def _build_file_1_waste_source_conflict_cache_key(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+) -> tuple[tuple[tuple[Any, ...], ...], tuple[tuple[str, int, int], ...]]:
+    """Return a cache key that changes when waste files or overrides change."""
+
+    override_signature = tuple(
+        sorted(
+            (
+                waste_note.doc_id,
+                waste_note.wtn_number,
+                waste_note.source_file_override_path,
+                waste_note.canonical_source_path,
+                json.dumps(
+                    [
+                        source_candidate.to_storage_dict()
+                        if hasattr(source_candidate, "to_storage_dict")
+                        else {
+                            "source_path": source_candidate.source_path,
+                            "source_file_name": source_candidate.source_file_name,
+                            "ticket_date": source_candidate.ticket_date.isoformat(),
+                            "collection_type": source_candidate.collection_type,
+                            "quantity_tonnes": source_candidate.quantity_tonnes,
+                        }
+                        for source_candidate in waste_note.source_conflict_candidates
+                    ],
+                    sort_keys=True,
+                    default=str,
+                ),
+                waste_note.status.value,
+            )
+            for waste_note in repository.list_documents(
+                document_type=WasteTransferNoteDocument.document_type
+            )
+            if isinstance(waste_note, WasteTransferNoteDocument)
+            and waste_note.site_name.casefold() == site_name.casefold()
+        )
+    )
+    file_signature = tuple(
+        sorted(
+            (
+                source_path.name,
+                source_path.stat().st_mtime_ns,
+                source_path.stat().st_size,
+            )
+            for source_path in WASTE_DESTINATION.glob("*.pdf")
+            if source_path.is_file()
+        )
+    )
+    return override_signature, file_signature
+
+
+@st.cache_data(show_spinner=False)
+def _load_cached_file_1_waste_source_conflicts(
+    *,
+    site_name: str,
+    override_signature: tuple[tuple[Any, ...], ...],
+    file_signature: tuple[tuple[str, int, int], ...],
+) -> List[Any]:
+    """Return cached File 1 source conflicts for the current waste folder state."""
+
+    del override_signature
+    del file_signature
+    repository = DocumentRepository(DATABASE_PATH)
+    return list_waste_transfer_note_source_conflicts(
+        repository,
+        site_name=site_name,
+    )
+
+
+def _get_cached_file_1_waste_source_conflicts(
+    *,
+    site_name: str,
+    repository: DocumentRepository,
+) -> List[Any]:
+    """Return cached duplicate-source conflicts for File 1."""
+
+    override_signature, file_signature = _build_file_1_waste_source_conflict_cache_key(
+        repository,
+        site_name=site_name,
+    )
+    return _load_cached_file_1_waste_source_conflicts(
+        site_name=site_name,
+        override_signature=override_signature,
+        file_signature=file_signature,
+    )
 
 
 def _render_file_1_waste_register_panel(
@@ -4715,11 +4951,46 @@ def _render_file_1_waste_register_panel(
     project_setup: ProjectSetup,
     waste_notes: List[WasteTransferNoteDocument],
     waste_kpi_metadata: Any,
-    ) -> None:
+    waste_source_conflicts: List[Any],
+) -> None:
     """Render the live File 1 waste register and print action."""
 
-    register_rows = _build_live_waste_register_rows(waste_notes)
-    summary_columns = st.columns(3)
+    waste_source_conflict_lookup = _build_waste_source_conflict_lookup(
+        waste_notes,
+        waste_source_conflicts,
+    )
+    register_rows = _build_live_waste_register_rows(
+        waste_notes,
+        waste_source_conflict_lookup=waste_source_conflict_lookup,
+    )
+    needs_review_count = sum(
+        1
+        for waste_note in waste_notes
+        if _get_waste_note_quality_status(
+            waste_note,
+            waste_source_conflict_lookup=waste_source_conflict_lookup,
+        )
+        != "Ready"
+    )
+    file_1_indexed_files = repository.list_indexed_files(file_group=FileGroup.FILE_1)
+    filed_ticket_pdfs = [
+        indexed_file
+        for indexed_file in file_1_indexed_files
+        if indexed_file.file_category in {"abucs_pdf", "waste_ticket_pdf"}
+        and indexed_file.site_name == project_setup.current_site_name
+    ]
+    generated_register_files = [
+        indexed_file
+        for indexed_file in file_1_indexed_files
+        if indexed_file.file_category == "waste_register_docx"
+        and indexed_file.site_name == project_setup.current_site_name
+    ]
+    waste_report_workbooks = [
+        indexed_file
+        for indexed_file in file_1_indexed_files
+        if indexed_file.file_category in {"waste_report_excel", "waste_report_word"}
+    ]
+    summary_columns = st.columns(5)
     with summary_columns[0]:
         _render_inline_metric("Register Rows", str(len(register_rows)), icon="🧾")
     with summary_columns[1]:
@@ -4730,11 +5001,21 @@ def _render_file_1_waste_register_panel(
         )
     with summary_columns[2]:
         _render_inline_metric(
-            "KPI Source",
-            waste_kpi_metadata.workbook_path.name
-            if waste_kpi_metadata.workbook_path is not None
-            else "Fallback",
+            "KPI Workbook",
+            "Linked" if waste_kpi_metadata.workbook_path is not None else "Fallback",
             icon="📊",
+        )
+    with summary_columns[3]:
+        _render_inline_metric(
+            "Needs Review",
+            str(needs_review_count),
+            icon="🟠",
+        )
+    with summary_columns[4]:
+        _render_inline_metric(
+            "Source Conflicts",
+            str(len(waste_source_conflicts)),
+            icon="⚠️",
         )
 
     _render_workspace_hero(
@@ -4744,9 +5025,59 @@ def _render_file_1_waste_register_panel(
         caption="This view holds the active File 1 waste history and feeds the official UHSF50.0 register output.",
     )
     if waste_kpi_metadata.workbook_path is not None:
-        st.caption(f"KPI source: {waste_kpi_metadata.workbook_path.name}")
+        st.caption(
+            "KPI source: "
+            f"{_format_waste_kpi_source_label(waste_kpi_metadata.workbook_path)}"
+        )
     else:
         st.caption("KPI source: not found in FILE_1_Environment/Waste_Reports.")
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Evidence Snapshot",
+        "File 1 waste is grounded in filed ticket PDFs, KPI workbooks, and generated register outputs.",
+    )
+    evidence_columns = st.columns(3)
+    with evidence_columns[0]:
+        _render_inline_metric("Filed Ticket PDFs", str(len(filed_ticket_pdfs)), icon="📄")
+    with evidence_columns[1]:
+        _render_inline_metric("Waste Reports", str(len(waste_report_workbooks)), icon="📊")
+    with evidence_columns[2]:
+        _render_inline_metric("Generated Registers", str(len(generated_register_files)), icon="🖨️")
+
+    if waste_source_conflicts:
+        st.divider()
+        _render_workspace_zone_heading(
+            "Source Conflicts",
+            "These WTNs have more than one filed PDF. The register now uses a single canonical source for each ticket number.",
+        )
+        st.warning(
+            "Duplicate filed waste tickets were found. Review the canonical source below before printing the File 1 register."
+        )
+        conflict_rows = [
+            {
+                "WTN": source_conflict.wtn_number,
+                "Ticket Date": source_conflict.canonical_source.scanned_note.ticket_date.strftime("%d/%m/%Y"),
+                "Canonical Source": source_conflict.canonical_source.source_path.name,
+                "Chosen Date": source_conflict.canonical_source.scanned_note.ticket_date.strftime("%d/%m/%Y"),
+                "Chosen Tonnes": (
+                    f"{source_conflict.canonical_source.scanned_note.quantity_tonnes:.2f}"
+                    if source_conflict.canonical_source.scanned_note.quantity_tonnes is not None
+                    else "Needs review"
+                ),
+                "Alt Sources": ", ".join(
+                    source_candidate.source_path.name
+                    for source_candidate in source_conflict.source_candidates
+                    if source_candidate.source_path != source_conflict.canonical_source.source_path
+                ),
+            }
+            for source_conflict in waste_source_conflicts
+        ]
+        st.dataframe(
+            pd.DataFrame(conflict_rows),
+            hide_index=True,
+            width="stretch",
+        )
 
     st.divider()
     _render_workspace_zone_heading(
@@ -4801,50 +5132,12 @@ def _render_file_1_waste_register_panel(
             )
 
 
-def _render_file_1_waste_log_panel(
-    repository: DocumentRepository,
-    *,
-    project_setup: ProjectSetup,
-    waste_kpi_metadata: Any,
+def _build_file_1_waste_note_options(
     waste_notes: List[WasteTransferNoteDocument],
-) -> None:
-    """Render the File 1 WTN smart-scan form for already-filed notes."""
+) -> Dict[str, WasteTransferNoteDocument]:
+    """Return selectbox options for File 1 waste-note review."""
 
-    summary_columns = st.columns(3)
-    with summary_columns[0]:
-        _render_inline_metric("Filed WTNs", str(len(waste_notes)), icon="📥")
-    with summary_columns[1]:
-        _render_inline_metric(
-            "KPI Workbook",
-            "Connected" if waste_kpi_metadata.workbook_path is not None else "Fallback",
-            icon="📊",
-        )
-    with summary_columns[2]:
-        _render_inline_metric(
-            "Project",
-            project_setup.job_number or "Not set",
-            icon="🏷️",
-        )
-
-    _render_workspace_hero(
-        icon="🔎",
-        kicker="Smart Scan",
-        title="Filed Waste Transfer Notes",
-        caption="Review the filed WTNs, trust the smart scan where it is strong, and correct the live register before printing.",
-    )
-
-    flash_message = st.session_state.pop("waste_log_flash", None)
-    if flash_message is not None:
-        if flash_message["level"] == "error":
-            st.error(flash_message["message"])
-        else:
-            st.success(flash_message["message"])
-
-    if not waste_notes:
-        st.info("No filed WTNs found in File 1 yet. Run SYNC WORKSPACE to ingest the waste PDFs first.")
-        return
-
-    note_options = {
+    return {
         (
             f"{waste_note.wtn_number} | {waste_note.date.strftime('%d/%m/%Y')} | "
             f"{waste_note.quantity_tonnes:.2f} t | {waste_note.carrier_name}"
@@ -4855,15 +5148,70 @@ def _render_file_1_waste_log_panel(
             reverse=True,
         )
     }
-    selected_note_label = st.selectbox(
-        "Select Waste Transfer Note",
-        options=list(note_options),
-        key="file_1_selected_waste_note",
-    )
-    selected_waste_note = note_options[selected_note_label]
+
+
+def _build_file_1_waste_review_queue_rows(
+    waste_notes: List[WasteTransferNoteDocument],
+    *,
+    waste_source_conflict_lookup: Dict[tuple[str, str], Any],
+) -> List[Dict[str, str]]:
+    """Return the queue rows for WTNs that still need File 1 review."""
+
+    queue_rows: List[Dict[str, str]] = []
+    for waste_note in sorted(
+        waste_notes,
+        key=lambda note: (note.date, note.created_at, note.wtn_number),
+        reverse=True,
+    ):
+        quality_status = _get_waste_note_quality_status(
+            waste_note,
+            waste_source_conflict_lookup=waste_source_conflict_lookup,
+        )
+        if quality_status == "Ready":
+            continue
+        source_conflict = _get_waste_source_conflict_for_note(
+            waste_note,
+            waste_source_conflict_lookup,
+        )
+        canonical_source_name = (
+            source_conflict.canonical_source.source_path.name
+            if source_conflict is not None
+            else ""
+        )
+        queue_rows.append(
+            {
+                "WTN": waste_note.wtn_number,
+                "Issue": quality_status,
+                "Date": waste_note.date.strftime("%d/%m/%Y"),
+                "Carrier": waste_note.carrier_name,
+                "Tonnes": (
+                    "Needs review"
+                    if waste_note.quantity_tonnes <= 0
+                    else f"{waste_note.quantity_tonnes:.2f}"
+                ),
+                "Source": canonical_source_name or "Filed source linked",
+            }
+        )
+    return queue_rows
+
+
+def _render_file_1_waste_note_review_workspace(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+    waste_kpi_metadata: Any,
+    selected_waste_note: WasteTransferNoteDocument,
+    source_conflict_lookup: Dict[tuple[str, str], Any],
+    key_prefix: str,
+    queue_state_key: Optional[str] = None,
+    next_queue_label: Optional[str] = None,
+) -> None:
+    """Render the review/editor workspace for one File 1 waste note."""
+
     selected_source_path = _get_file_1_waste_note_source_path(
         repository,
         selected_waste_note,
+        source_conflict_lookup=source_conflict_lookup,
     )
 
     scanned_waste_note = None
@@ -4879,15 +5227,15 @@ def _render_file_1_waste_log_panel(
     else:
         st.caption("WTN source file is not currently indexed on disk.")
 
-    workbook_client_name = waste_kpi_metadata.client_name or project_setup.client_name
-    workbook_site_address = (
-        waste_kpi_metadata.site_address or project_setup.site_address
-    )
-    workbook_project_number = (
-        waste_kpi_metadata.project_number or project_setup.job_number
-    )
-    workbook_manager_name = (
-        waste_kpi_metadata.manager_name or SITE_MANAGER_NAME
+    if scanned_waste_note is not None and scanned_waste_note.collection_type:
+        st.info(
+            "Supplier collection type detected: "
+            f"{scanned_waste_note.collection_type}"
+        )
+
+    selected_source_conflict = _get_waste_source_conflict_for_note(
+        selected_waste_note,
+        source_conflict_lookup,
     )
 
     if waste_kpi_metadata.workbook_path is None:
@@ -4895,10 +5243,102 @@ def _render_file_1_waste_log_panel(
             "No File 1 KPI workbook was found. The form is using the current Project Setup values."
         )
 
+    if selected_source_conflict is not None:
+        st.warning(
+            "This WTN has more than one filed PDF. Choose the correct source first, then save the waste details below."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Source File": source_candidate.source_path.name,
+                        "Chosen": (
+                            "Yes"
+                            if selected_source_path is not None
+                            and source_candidate.source_path.resolve() == selected_source_path.resolve()
+                            else ""
+                        ),
+                        "Date": source_candidate.scanned_note.ticket_date.strftime("%d/%m/%Y"),
+                        "Collection": source_candidate.scanned_note.collection_type or "Not shown",
+                        "Tonnes": (
+                            f"{source_candidate.scanned_note.quantity_tonnes:.2f}"
+                            if source_candidate.scanned_note.quantity_tonnes is not None
+                            else "Needs review"
+                        ),
+                    }
+                    for source_candidate in selected_source_conflict.source_candidates
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption("Pick the filed PDF you trust. The register will keep using that source on future syncs.")
+        for source_candidate in selected_source_conflict.source_candidates:
+            is_current_source = (
+                selected_source_path is not None
+                and source_candidate.source_path.resolve() == selected_source_path.resolve()
+            )
+            action_columns = st.columns([4, 1])
+            with action_columns[0]:
+                detail_parts = [
+                    source_candidate.source_path.name,
+                    source_candidate.scanned_note.ticket_date.strftime("%d/%m/%Y"),
+                ]
+                if source_candidate.scanned_note.collection_type:
+                    detail_parts.append(source_candidate.scanned_note.collection_type)
+                if source_candidate.scanned_note.quantity_tonnes is not None:
+                    detail_parts.append(f"{source_candidate.scanned_note.quantity_tonnes:.2f} t")
+                st.markdown("**Source Review**  \n" + " | ".join(detail_parts))
+            with action_columns[1]:
+                if is_current_source:
+                    st.button(
+                        "✅ In Use",
+                        key=f"{key_prefix}-use-waste-source-{selected_waste_note.doc_id}-{source_candidate.source_path.name}",
+                        disabled=True,
+                        width="stretch",
+                    )
+                elif st.button(
+                    "Use This Source",
+                    key=f"{key_prefix}-use-waste-source-{selected_waste_note.doc_id}-{source_candidate.source_path.name}",
+                    width="stretch",
+                ):
+                    try:
+                        set_waste_transfer_note_source_override(
+                            repository,
+                            source_document=selected_waste_note,
+                            source_path=source_candidate.source_path,
+                        )
+                    except ValidationError as exc:
+                        st.session_state["waste_log_flash"] = {
+                            "level": "error",
+                            "message": str(exc),
+                        }
+                    except Exception as exc:
+                        st.session_state["waste_log_flash"] = {
+                            "level": "error",
+                            "message": f"Unable to switch the waste source file: {exc}",
+                        }
+                    else:
+                        st.session_state["waste_log_flash"] = {
+                            "level": "success",
+                            "message": (
+                                "Canonical waste source updated to "
+                                f"{source_candidate.source_path.name}."
+                            ),
+                        }
+                    st.rerun()
+
     st.divider()
     _render_workspace_zone_heading(
         "Primary Action",
-        "Select a filed WTN, review the smart scan values, and save the corrected live record back into File 1.",
+        "Review the current ticket, correct the live File 1 record, and save it back into the register.",
+    )
+    workbook_client_name = waste_kpi_metadata.client_name or project_setup.client_name
+    workbook_site_address = (
+        waste_kpi_metadata.site_address or project_setup.site_address
+    )
+    workbook_project_number = (
+        waste_kpi_metadata.project_number or project_setup.job_number
     )
     scan_columns = st.columns(3)
     with scan_columns[0]:
@@ -4906,18 +5346,21 @@ def _render_file_1_waste_log_panel(
             "Client Name",
             value=workbook_client_name,
             disabled=True,
+            key=f"{key_prefix}-{selected_waste_note.doc_id}-client-name",
         )
     with scan_columns[1]:
         st.text_input(
             "Site Address",
             value=workbook_site_address,
             disabled=True,
+            key=f"{key_prefix}-{selected_waste_note.doc_id}-site-address",
         )
     with scan_columns[2]:
         st.text_input(
             "Project Number",
             value=workbook_project_number,
             disabled=True,
+            key=f"{key_prefix}-{selected_waste_note.doc_id}-project-number",
         )
 
     default_carrier_name = (
@@ -4956,28 +5399,35 @@ def _render_file_1_waste_log_panel(
         else selected_waste_note.destination_facility
     )
 
-    with st.form("file_1_waste_log_form", clear_on_submit=False):
+    with st.form(
+        f"{key_prefix}-{selected_waste_note.doc_id}-waste-log-form",
+        clear_on_submit=False,
+    ):
         detail_columns = st.columns(3)
         with detail_columns[0]:
             carrier_name = st.text_input(
                 "Carrier Name",
                 value=default_carrier_name,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-carrier-name",
             )
         with detail_columns[1]:
             vehicle_registration = st.text_input(
                 "Vehicle Reg",
                 value=default_vehicle_registration,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-vehicle-registration",
             )
         with detail_columns[2]:
-            wtn_number = st.text_input(
+            st.text_input(
                 "WTN Reference",
                 value=selected_waste_note.wtn_number,
                 disabled=True,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-wtn-number",
             )
 
         waste_description = st.text_input(
             "Description of Waste",
             value=default_waste_description,
+            key=f"{key_prefix}-{selected_waste_note.doc_id}-waste-description",
         )
 
         detail_columns = st.columns(4)
@@ -4985,6 +5435,7 @@ def _render_file_1_waste_log_panel(
             ticket_date = st.date_input(
                 "Date",
                 value=default_ticket_date,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-ticket-date",
             )
         with detail_columns[1]:
             quantity_tonnes = st.number_input(
@@ -4992,21 +5443,32 @@ def _render_file_1_waste_log_panel(
                 min_value=0.0,
                 step=0.01,
                 value=float(default_quantity_tonnes or 0.0),
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-quantity-tonnes",
             )
         with detail_columns[2]:
             ewc_code = st.text_input(
                 "EWC Code",
                 value=default_ewc_code,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-ewc-code",
             )
         with detail_columns[3]:
             destination_facility = st.text_input(
                 "Destination Facility",
                 value=default_destination_facility,
+                key=f"{key_prefix}-{selected_waste_note.doc_id}-destination-facility",
             )
 
-        submitted = st.form_submit_button("➕ Log Waste", width="stretch")
+        if queue_state_key is not None:
+            submit_columns = st.columns(2)
+            with submit_columns[0]:
+                submitted = st.form_submit_button("💾 Save Waste Record", width="stretch")
+            with submit_columns[1]:
+                resolve_and_next = st.form_submit_button("✅ Resolve & Next", width="stretch")
+        else:
+            submitted = st.form_submit_button("💾 Save Waste Record", width="stretch")
+            resolve_and_next = False
 
-    if not submitted:
+    if not submitted and not resolve_and_next:
         if scanned_waste_note is not None and scanned_waste_note.extracted_text.strip():
             st.divider()
             _render_workspace_zone_heading(
@@ -5057,7 +5519,205 @@ def _render_file_1_waste_log_panel(
             f"Source file: {logged_waste_note.stored_file_path.name if logged_waste_note.stored_file_path else 'already filed'}"
         ),
     }
+    if resolve_and_next and queue_state_key is not None:
+        if next_queue_label is not None:
+            st.session_state[queue_state_key] = next_queue_label
+        else:
+            st.session_state.pop(queue_state_key, None)
     st.rerun()
+
+
+def _render_file_1_waste_review_queue_panel(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+    waste_kpi_metadata: Any,
+    waste_notes: List[WasteTransferNoteDocument],
+    waste_source_conflicts: List[Any],
+) -> None:
+    """Render the dedicated File 1 review queue for unresolved waste tickets."""
+
+    source_conflict_lookup = _build_waste_source_conflict_lookup(
+        waste_notes,
+        waste_source_conflicts,
+    )
+    queue_note_options = _build_file_1_waste_note_options(
+        [
+            waste_note
+            for waste_note in waste_notes
+            if _get_waste_note_quality_status(
+                waste_note,
+                waste_source_conflict_lookup=source_conflict_lookup,
+            )
+            != "Ready"
+        ]
+    )
+    queue_rows = _build_file_1_waste_review_queue_rows(
+        list(queue_note_options.values()),
+        waste_source_conflict_lookup=source_conflict_lookup,
+    )
+    weightless_count = sum(
+        1 for waste_note in queue_note_options.values() if waste_note.quantity_tonnes <= 0
+    )
+    conflict_count = sum(
+        1
+        for waste_note in queue_note_options.values()
+        if _get_waste_source_conflict_for_note(waste_note, source_conflict_lookup)
+        is not None
+    )
+
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric("Tickets in Queue", str(len(queue_rows)), icon="🧭")
+    with summary_columns[1]:
+        _render_inline_metric("Missing Tonnage", str(weightless_count), icon="⚖️")
+    with summary_columns[2]:
+        _render_inline_metric("Source Conflicts", str(conflict_count), icon="⚠️")
+
+    _render_workspace_hero(
+        icon="🧭",
+        kicker="Needs Review",
+        title="Waste Review Queue",
+        caption="Work through the tickets that still block confidence in the File 1 register: missing tonnage first, duplicate source files second.",
+    )
+
+    if not queue_rows:
+        st.success("File 1 waste is looking clean. No live tickets currently need review.")
+        return
+
+    st.divider()
+    _render_workspace_zone_heading(
+        "Queue Snapshot",
+        "This is the short list of waste tickets that still need attention before the printed register is fully comfortable to trust.",
+    )
+    st.dataframe(
+        pd.DataFrame(queue_rows),
+        hide_index=True,
+        width="stretch",
+    )
+
+    queue_option_labels = list(queue_note_options)
+    queue_state_key = "file_1_review_queue_selected_note"
+    selected_queue_label = st.session_state.get(queue_state_key)
+    if selected_queue_label not in queue_option_labels:
+        st.session_state[queue_state_key] = queue_option_labels[0]
+        selected_queue_label = queue_option_labels[0]
+    current_index = queue_option_labels.index(selected_queue_label)
+    next_queue_label = (
+        queue_option_labels[current_index + 1]
+        if current_index + 1 < len(queue_option_labels)
+        else (
+            queue_option_labels[current_index - 1]
+            if current_index - 1 >= 0 and len(queue_option_labels) > 1
+            else None
+        )
+    )
+
+    navigation_columns = st.columns([1, 1, 3])
+    with navigation_columns[0]:
+        if st.button(
+            "← Older",
+            key="file_1_review_queue_previous",
+            disabled=current_index == len(queue_option_labels) - 1,
+            width="stretch",
+        ):
+            st.session_state[queue_state_key] = queue_option_labels[current_index + 1]
+            st.rerun()
+    with navigation_columns[1]:
+        if st.button(
+            "Newer →",
+            key="file_1_review_queue_next",
+            disabled=current_index == 0,
+            width="stretch",
+        ):
+            st.session_state[queue_state_key] = queue_option_labels[current_index - 1]
+            st.rerun()
+    with navigation_columns[2]:
+        st.caption(
+            f"Reviewing {current_index + 1} of {len(queue_option_labels)} unresolved tickets. The queue is ordered newest first."
+        )
+
+    selected_queue_label = st.selectbox(
+        "Choose the next ticket to review",
+        options=queue_option_labels,
+        key=queue_state_key,
+    )
+    selected_waste_note = queue_note_options[selected_queue_label]
+    _render_file_1_waste_note_review_workspace(
+        repository,
+        project_setup=project_setup,
+        waste_kpi_metadata=waste_kpi_metadata,
+        selected_waste_note=selected_waste_note,
+        source_conflict_lookup=source_conflict_lookup,
+        key_prefix="file_1_review_queue",
+        queue_state_key=queue_state_key,
+        next_queue_label=next_queue_label,
+    )
+
+
+def _render_file_1_waste_log_panel(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+    waste_kpi_metadata: Any,
+    waste_notes: List[WasteTransferNoteDocument],
+    waste_source_conflicts: List[Any],
+) -> None:
+    """Render the File 1 WTN smart-scan form for already-filed notes."""
+
+    summary_columns = st.columns(3)
+    with summary_columns[0]:
+        _render_inline_metric("Filed WTNs", str(len(waste_notes)), icon="📥")
+    with summary_columns[1]:
+        _render_inline_metric(
+            "KPI Workbook",
+            "Connected" if waste_kpi_metadata.workbook_path is not None else "Fallback",
+            icon="📊",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Project",
+            project_setup.job_number or "Not set",
+            icon="🏷️",
+        )
+
+    _render_workspace_hero(
+        icon="🔎",
+        kicker="Smart Scan",
+        title="Filed Waste Transfer Notes",
+        caption="Review the filed WTNs, trust the smart scan where it is strong, and correct the live register before printing.",
+    )
+    st.caption("Use `Needs Review Queue` for the short list of problem tickets. This tab remains the full review space for any filed WTN.")
+
+    if not waste_notes:
+        st.info("No filed WTNs found in File 1 yet. Run SYNC WORKSPACE to ingest the waste PDFs first.")
+        return
+
+    note_options = _build_file_1_waste_note_options(waste_notes)
+    note_option_labels = list(note_options)
+    note_state_key = "file_1_selected_waste_note"
+    selected_note_label = st.session_state.get(note_state_key)
+    if selected_note_label not in note_option_labels:
+        st.session_state[note_state_key] = note_option_labels[0]
+
+    selected_note_label = st.selectbox(
+        "Select Waste Transfer Note",
+        options=note_option_labels,
+        key=note_state_key,
+    )
+    selected_waste_note = note_options[selected_note_label]
+    source_conflict_lookup = _build_waste_source_conflict_lookup(
+        waste_notes,
+        waste_source_conflicts,
+    )
+    _render_file_1_waste_note_review_workspace(
+        repository,
+        project_setup=project_setup,
+        waste_kpi_metadata=waste_kpi_metadata,
+        selected_waste_note=selected_waste_note,
+        source_conflict_lookup=source_conflict_lookup,
+        key_prefix="file_1_smart_scan",
+    )
 
 
 def _render_file_2_station(
@@ -5552,6 +6212,22 @@ def _attendance_sign_out_label(attendance_entry: DailyAttendanceEntryDocument) -
     )
 
 
+def _attendance_manager_correction_label(
+    attendance_entry: DailyAttendanceEntryDocument,
+) -> str:
+    """Return the manager correction label for one saved attendance entry."""
+
+    if attendance_entry.time_out is None:
+        status_text = "On Site"
+    else:
+        status_text = f"Out {attendance_entry.time_out.strftime('%H:%M')}"
+    return (
+        f"{attendance_entry.individual_name} "
+        f"({attendance_entry.contractor_name}) · "
+        f"In {attendance_entry.time_in.strftime('%H:%M')} · {status_text}"
+    )
+
+
 def _resolve_attendance_sign_in_selection(
     *,
     filtered_records: List[InductionDocument],
@@ -5576,6 +6252,21 @@ def _resolve_attendance_sign_out_selection(
     current_doc_id: str,
 ) -> str:
     """Return the best live attendance doc id to preselect for sign-out."""
+
+    available_doc_ids = {entry.doc_id for entry in filtered_entries}
+    if current_doc_id and current_doc_id in available_doc_ids:
+        return current_doc_id
+    if len(filtered_entries) == 1:
+        return filtered_entries[0].doc_id
+    return ""
+
+
+def _resolve_attendance_correction_selection(
+    *,
+    filtered_entries: List[DailyAttendanceEntryDocument],
+    current_doc_id: str,
+) -> str:
+    """Return the best attendance record to preselect in manager corrections."""
 
     available_doc_ids = {entry.doc_id for entry in filtered_entries}
     if current_doc_id and current_doc_id in available_doc_ids:
@@ -6589,6 +7280,341 @@ def _render_todays_attendance_activity_panel(
         st.info("No UHSF16.09 attendance activity has been logged for today yet.")
 
 
+def _format_gate_verification_method_option(method_value: str) -> str:
+    """Return the manager-facing label for one gate verification method value."""
+
+    normalized_value = str(method_value or "").strip().casefold()
+    if normalized_value == "gps":
+        return "GPS"
+    if normalized_value == "trusted_device":
+        return "Trusted Device"
+    if normalized_value == "gate_code":
+        return "Gate Code"
+    if normalized_value == "manager_correction":
+        return "Manager Correction"
+    if not normalized_value:
+        return "Not Recorded"
+    return normalized_value.replace("_", " ").title()
+
+
+def _build_gate_verification_method_options(current_method: str) -> List[str]:
+    """Return gate verification method options while preserving unknown legacy values."""
+
+    options = ["", "gps", "trusted_device", "gate_code", "manager_correction"]
+    normalized_current = str(current_method or "").strip()
+    if normalized_current and normalized_current not in options:
+        options.append(normalized_current)
+    return options
+
+
+def _render_manager_attendance_correction_panel(
+    repository: DocumentRepository,
+    *,
+    project_setup: ProjectSetup,
+) -> None:
+    """Render manager-side attendance recovery controls for fixing gate mistakes."""
+
+    st.markdown(
+        "<div class='file-2-section-heading'>Manager Corrections</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Fix a mistaken sign-in or sign-out without leaving the app. You can update company, vehicle, travel, gate method, times, or remove one bad record entirely."
+    )
+
+    correction_date = st.date_input(
+        "Correction Date",
+        value=st.session_state.get("site_attendance_correction_date", date.today()),
+        key="site_attendance_correction_date",
+    )
+    correction_search = st.text_input(
+        "Search Attendance Record",
+        key="site_attendance_correction_search",
+        placeholder="Search by name, company, vehicle, or time",
+    ).strip()
+
+    correction_entries = list_daily_attendance_entries(
+        repository,
+        site_name=project_setup.current_site_name,
+        on_date=correction_date,
+        active_only=False,
+    )
+    filtered_entries = [
+        entry
+        for entry in correction_entries
+        if not correction_search
+        or correction_search.casefold() in entry.individual_name.casefold()
+        or correction_search.casefold() in entry.contractor_name.casefold()
+        or correction_search.casefold() in entry.vehicle_registration.casefold()
+        or correction_search.casefold() in entry.time_in.strftime("%H:%M").casefold()
+        or (
+            entry.time_out is not None
+            and correction_search.casefold()
+            in entry.time_out.strftime("%H:%M").casefold()
+        )
+    ]
+
+    correction_metrics = st.columns(3, gap="large")
+    with correction_metrics[0]:
+        _render_inline_metric(
+            "Matching Entries",
+            str(len(filtered_entries)),
+            icon="🧰",
+        )
+    with correction_metrics[1]:
+        _render_inline_metric(
+            "On Site",
+            str(sum(1 for entry in filtered_entries if entry.is_on_site)),
+            icon="🔥",
+        )
+    with correction_metrics[2]:
+        _render_inline_metric(
+            "Signed Out",
+            str(sum(1 for entry in filtered_entries if not entry.is_on_site)),
+            icon="📤",
+        )
+
+    if not filtered_entries:
+        st.info("No attendance records match this date and search filter.")
+        return
+
+    selection_key = "site_attendance_correction_doc_id"
+    current_doc_id = str(st.session_state.get(selection_key, "")).strip()
+    resolved_doc_id = _resolve_attendance_correction_selection(
+        filtered_entries=filtered_entries,
+        current_doc_id=current_doc_id,
+    )
+    if st.session_state.get(selection_key) != resolved_doc_id:
+        st.session_state[selection_key] = resolved_doc_id
+
+    selected_doc_id = st.selectbox(
+        "Select Attendance Record",
+        options=[""] + [entry.doc_id for entry in filtered_entries],
+        format_func=lambda doc_id: (
+            "Choose a saved attendance entry"
+            if not doc_id
+            else _attendance_manager_correction_label(
+                next(entry for entry in filtered_entries if entry.doc_id == doc_id)
+            )
+        ),
+        key=selection_key,
+    )
+    if not selected_doc_id:
+        return
+
+    selected_entry = next(
+        entry for entry in filtered_entries if entry.doc_id == selected_doc_id
+    )
+    field_key_prefix = f"attendance-correction-{selected_entry.doc_id}"
+
+    summary_columns = st.columns(4, gap="medium")
+    with summary_columns[0]:
+        _render_inline_metric("Operative", selected_entry.individual_name, icon="👤")
+    with summary_columns[1]:
+        _render_inline_metric(
+            "Time In",
+            selected_entry.time_in.strftime("%d/%m %H:%M"),
+            icon="📥",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Status",
+            "On Site" if selected_entry.is_on_site else "Signed Out",
+            icon="📍",
+        )
+    with summary_columns[3]:
+        _render_inline_metric(
+            "Hours",
+            (
+                f"{selected_entry.hours_worked:.2f}"
+                if selected_entry.hours_worked is not None
+                else "—"
+            ),
+            icon="⏱️",
+        )
+
+    with st.form(f"{field_key_prefix}-form"):
+        st.markdown(
+            "<div class='file-2-section-heading'>Edit Selected Record</div>",
+            unsafe_allow_html=True,
+        )
+        identity_columns = st.columns(2, gap="medium")
+        with identity_columns[0]:
+            company_name = st.text_input(
+                "Company / Contractor",
+                value=selected_entry.contractor_name,
+                key=f"{field_key_prefix}-company",
+            )
+        with identity_columns[1]:
+            vehicle_registration = st.text_input(
+                "Vehicle Registration",
+                value=selected_entry.vehicle_registration,
+                key=f"{field_key_prefix}-vehicle",
+            )
+
+        detail_columns = st.columns(2, gap="medium")
+        with detail_columns[0]:
+            distance_travelled = st.text_input(
+                "Distance Travelled",
+                value=selected_entry.distance_travelled,
+                key=f"{field_key_prefix}-distance",
+            )
+        with detail_columns[1]:
+            gate_method_options = _build_gate_verification_method_options(
+                selected_entry.gate_verification_method
+            )
+            current_gate_method = str(selected_entry.gate_verification_method or "").strip()
+            gate_method_index = (
+                gate_method_options.index(current_gate_method)
+                if current_gate_method in gate_method_options
+                else 0
+            )
+            gate_verification_method = st.selectbox(
+                "Gate Verification",
+                options=gate_method_options,
+                index=gate_method_index,
+                format_func=_format_gate_verification_method_option,
+                key=f"{field_key_prefix}-gate-method",
+            )
+
+        gate_note = st.text_input(
+            "Gate Verification Note",
+            value=selected_entry.gate_verification_note,
+            key=f"{field_key_prefix}-gate-note",
+        )
+
+        timing_columns = st.columns(3, gap="medium")
+        with timing_columns[0]:
+            corrected_date = st.date_input(
+                "Attendance Date",
+                value=selected_entry.time_in.date(),
+                key=f"{field_key_prefix}-date",
+            )
+        with timing_columns[1]:
+            corrected_time_in = st.time_input(
+                "Time In",
+                value=selected_entry.time_in.time().replace(second=0, microsecond=0),
+                key=f"{field_key_prefix}-time-in",
+            )
+        with timing_columns[2]:
+            status_label = st.radio(
+                "Entry Status",
+                options=["On Site", "Signed Out"],
+                index=0 if selected_entry.is_on_site else 1,
+                horizontal=True,
+                key=f"{field_key_prefix}-status",
+            )
+
+        corrected_time_out: Optional[datetime] = None
+        if status_label == "Signed Out":
+            sign_out_columns = st.columns(2, gap="medium")
+            existing_time_out = selected_entry.time_out or selected_entry.time_in
+            with sign_out_columns[0]:
+                corrected_time_out_date = st.date_input(
+                    "Time Out Date",
+                    value=existing_time_out.date(),
+                    key=f"{field_key_prefix}-time-out-date",
+                )
+            with sign_out_columns[1]:
+                corrected_time_out_time = st.time_input(
+                    "Time Out",
+                    value=existing_time_out.time().replace(second=0, microsecond=0),
+                    key=f"{field_key_prefix}-time-out-time",
+                )
+            corrected_time_out = datetime.combine(
+                corrected_time_out_date,
+                corrected_time_out_time,
+            )
+        corrected_time_in_datetime = datetime.combine(corrected_date, corrected_time_in)
+
+        save_correction = st.form_submit_button(
+            "💾 Save Attendance Correction",
+            width="stretch",
+        )
+
+    if save_correction:
+        try:
+            updated_entry = update_daily_attendance_entry(
+                repository,
+                attendance_doc_id=selected_entry.doc_id,
+                contractor_name=company_name,
+                vehicle_registration=vehicle_registration,
+                distance_travelled=distance_travelled,
+                gate_verification_method=gate_verification_method,
+                gate_verification_note=gate_note,
+                time_in=corrected_time_in_datetime,
+                time_out=corrected_time_out,
+            )
+        except ValidationError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Unable to save the attendance correction: {exc}")
+        else:
+            st.session_state["site_attendance_correction_date"] = (
+                updated_entry.attendance_date
+            )
+            st.session_state["site_attendance_edit_flash"] = (
+                f"Updated attendance record for {updated_entry.individual_name}."
+            )
+            st.rerun()
+
+    signature_summary: List[str] = []
+    if selected_entry.sign_in_signature_path:
+        signature_summary.append("Sign-in signature saved")
+    if selected_entry.sign_out_signature_path:
+        signature_summary.append("Sign-out signature saved")
+    if not signature_summary:
+        signature_summary.append("No signature files linked")
+    st.caption(" • ".join(signature_summary))
+
+    delete_pending_doc_id = str(
+        st.session_state.get("site_attendance_delete_pending_doc_id", "")
+    ).strip()
+    delete_columns = st.columns([1.2, 4.8], gap="medium")
+    with delete_columns[0]:
+        if st.button(
+            "🗑️ Remove This Record",
+            key=f"{field_key_prefix}-delete",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["site_attendance_delete_pending_doc_id"] = selected_entry.doc_id
+            st.rerun()
+    with delete_columns[1]:
+        st.caption(
+            "Use remove only when the operative signed in or out against the wrong record and the full attendance entry needs to be deleted."
+        )
+
+    if delete_pending_doc_id == selected_entry.doc_id:
+        st.warning(
+            "Remove this attendance record and any linked signature files? This cannot be undone from inside the app."
+        )
+        confirm_columns = st.columns([1.2, 1.0, 4.0], gap="small")
+        if confirm_columns[0].button(
+            "Confirm Remove",
+            key=f"{field_key_prefix}-confirm-delete",
+            width="stretch",
+        ):
+            deleted_paths = repository.delete_document_and_files(selected_entry.doc_id)
+            st.session_state.pop("site_attendance_delete_pending_doc_id", None)
+            st.session_state["site_attendance_edit_flash"] = (
+                f"Removed attendance record for {selected_entry.individual_name}."
+                + (
+                    f" Removed {len(deleted_paths)} linked file(s)."
+                    if deleted_paths
+                    else " No linked files were present on disk."
+                )
+            )
+            st.rerun()
+        if confirm_columns[1].button(
+            "Cancel",
+            key=f"{field_key_prefix}-cancel-delete",
+            width="stretch",
+        ):
+            st.session_state.pop("site_attendance_delete_pending_doc_id", None)
+            st.rerun()
+
+
 def _coerce_site_diary_table_rows(
     raw_rows: Any,
     *,
@@ -7377,6 +8403,150 @@ def _build_broadcast_dispatch_rows(
     ]
 
 
+def _build_dispatch_recipient_rows(
+    dispatch: BroadcastDispatchDocument,
+) -> List[Dict[str, str]]:
+    """Return one recipient audit table for a saved dispatch."""
+
+    recipient_rows: List[Dict[str, str]] = []
+    recipient_names = list(dispatch.recipient_names)
+    recipient_numbers = list(dispatch.recipient_numbers)
+    total_rows = max(len(recipient_names), len(recipient_numbers))
+    for row_index in range(total_rows):
+        recipient_rows.append(
+            {
+                "Name": recipient_names[row_index]
+                if row_index < len(recipient_names)
+                else "Unknown",
+                "Mobile": recipient_numbers[row_index]
+                if row_index < len(recipient_numbers)
+                else "—",
+            }
+        )
+    return recipient_rows
+
+
+def _build_toolbox_talk_audience_rows(
+    contacts: List[SiteBroadcastContact],
+    *,
+    status_label: str,
+) -> List[Dict[str, str]]:
+    """Return one named audience preview for TBT sends."""
+
+    return [
+        {
+            "Name": contact.individual_name,
+            "Company": contact.contractor_name,
+            "Mobile": contact.mobile_number,
+            "Vehicle Reg": contact.vehicle_registration or "—",
+            "Status": status_label,
+        }
+        for contact in contacts
+    ]
+
+
+def _build_pending_toolbox_talk_attendance_entries(
+    attendance_entries: List[DailyAttendanceEntryDocument],
+    completions: List[ToolboxTalkCompletionDocument],
+) -> List[DailyAttendanceEntryDocument]:
+    """Return active on-site operatives who still need to sign the current TBT."""
+
+    signed_induction_ids = {
+        completion.linked_induction_doc_id.strip()
+        for completion in completions
+        if completion.linked_induction_doc_id.strip()
+    }
+    signed_people = {
+        (
+            completion.individual_name.casefold(),
+            completion.contractor_name.casefold(),
+        )
+        for completion in completions
+    }
+    return [
+        entry
+        for entry in attendance_entries
+        if not (
+            (
+                entry.linked_induction_doc_id.strip()
+                and entry.linked_induction_doc_id.strip() in signed_induction_ids
+            )
+            or (
+                entry.individual_name.casefold(),
+                entry.contractor_name.casefold(),
+            )
+            in signed_people
+        )
+    ]
+
+
+def _render_dispatch_history_audit(
+    dispatches: List[BroadcastDispatchDocument],
+    *,
+    empty_message: str,
+    expander_prefix: str,
+) -> None:
+    """Render one richer dispatch history view with recipient detail."""
+
+    if not dispatches:
+        st.caption(empty_message)
+        return
+
+    st.dataframe(
+        pd.DataFrame(_build_broadcast_dispatch_rows(dispatches[:12])),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        "Open any batch below to inspect exactly who the app opened in Messages and the wording used."
+    )
+    for dispatch_index, dispatch in enumerate(dispatches[:8]):
+        recipient_count = len(dispatch.recipient_numbers)
+        expander_label = (
+            f"{dispatch.dispatched_at:%d/%m/%Y %H:%M} · "
+            f"{dispatch.dispatch_kind.replace('_', ' ').title()} · "
+            f"{recipient_count} recipient{'s' if recipient_count != 1 else ''}"
+        )
+        with st.expander(expander_label, expanded=dispatch_index == 0):
+            audit_columns = st.columns(4, gap="medium")
+            with audit_columns[0]:
+                _render_dispatch_audit_card(
+                    label="Audience",
+                    value=dispatch.audience_label,
+                    caption=dispatch.dispatch_kind.replace("_", " ").title(),
+                )
+            with audit_columns[1]:
+                _render_dispatch_audit_card(
+                    label="Recipients",
+                    value=str(recipient_count),
+                    caption="People opened in Messages",
+                )
+            with audit_columns[2]:
+                _render_dispatch_audit_card(
+                    label="Drafts",
+                    value=str(dispatch.chunk_count or 1),
+                    caption="Messages draft windows opened",
+                )
+            with audit_columns[3]:
+                _render_dispatch_audit_card(
+                    label="Status",
+                    value="Opened" if dispatch.launched_successfully else "Needs attention",
+                    caption=dispatch.launch_mode.replace("_", " ").title(),
+                )
+            if dispatch.message_body.strip():
+                st.caption("Message body")
+                _render_dispatch_message_box(dispatch.message_body.strip())
+            recipient_rows = _build_dispatch_recipient_rows(dispatch)
+            if recipient_rows:
+                st.caption("Recipients opened in Messages")
+                st.dataframe(
+                    pd.DataFrame(recipient_rows),
+                    width="stretch",
+                    hide_index=True,
+                    key=f"{expander_prefix}_dispatch_recipients_{dispatch.doc_id}",
+                )
+
+
 def _build_broadcast_company_options(
     live_contacts: List[SiteBroadcastContact],
 ) -> List[str]:
@@ -8019,14 +9189,11 @@ def _render_site_broadcast_station(
             site_name=project_setup.current_site_name,
             dispatch_kind="mass_broadcast",
         )
-        if broadcast_dispatches:
-            st.dataframe(
-                pd.DataFrame(_build_broadcast_dispatch_rows(broadcast_dispatches[:12])),
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.caption("No broadcast batches have been launched yet.")
+        _render_dispatch_history_audit(
+            broadcast_dispatches,
+            empty_message="No broadcast batches have been launched yet.",
+            expander_prefix="mass_broadcast",
+        )
 
     with tbt_tab:
         pending_tbt_topic_key = "site_tbt_topic_pending"
@@ -8070,8 +9237,13 @@ def _render_site_broadcast_station(
             "Upload TBT Document",
             type=["pdf", "doc", "docx"],
             key="site_broadcast_tbt_document",
-            help="Upload the toolbox talk file the operatives must read before signing.",
+            help="Upload the toolbox talk file the operatives must read before signing. PDF gives the best phone viewing experience.",
         )
+        st.caption("Best mobile experience: upload PDF.")
+        if uploaded_tbt_document is not None and not uploaded_tbt_document.name.lower().endswith(".pdf"):
+            st.info(
+                "This file will still work, but PDF is the smoothest option for phone viewing."
+            )
         if st.button(
             "➕ Create Toolbox Talk",
             key="create_remote_tbt_link",
@@ -8189,6 +9361,10 @@ def _render_site_broadcast_station(
         )
 
         if selected_tbt_document is not None:
+            selected_tbt_document_view_url = build_toolbox_talk_document_view_url(
+                selected_tbt_document.doc_id,
+                public_url=project_setup.public_tunnel_url,
+            )
             try:
                 document_bytes, mime_type = read_toolbox_talk_document_bytes(
                     selected_tbt_document
@@ -8205,8 +9381,14 @@ def _render_site_broadcast_station(
                         f"Storage folder: {FILE_2_TBT_ACTIVE_DOCS_DIR.name}"
                     )
                 with document_columns[1]:
+                    if selected_tbt_document_view_url:
+                        st.link_button(
+                            "📖 Open TBT Document",
+                            url=selected_tbt_document_view_url,
+                            width="stretch",
+                        )
                     st.download_button(
-                        "📥 Download / View TBT Document",
+                        "📥 Download TBT Document",
                         data=document_bytes,
                         file_name=selected_tbt_document.original_file_name,
                         mime=mime_type,
@@ -8224,6 +9406,7 @@ def _render_site_broadcast_station(
             else []
         )
         if selected_tbt_topic:
+            signed_live_count = max(len(live_contacts) - len(pending_contacts), 0)
             st.divider()
             tbt_metric_columns = st.columns(4, gap="large")
             with tbt_metric_columns[0]:
@@ -8252,6 +9435,61 @@ def _render_site_broadcast_station(
             st.caption(
                 f"Current toolbox talk: {selected_tbt_topic} | Live link stays pinned to the active site audience."
             )
+
+            st.markdown(
+                "<div class='file-2-section-heading'>Pre-Send Audience Preview</div>",
+                unsafe_allow_html=True,
+            )
+            _render_broadcast_status_badges(
+                [
+                    (
+                        f"Signed {signed_live_count}",
+                        "success" if signed_live_count else "neutral",
+                    ),
+                    (
+                        f"Pending {len(pending_contacts)}",
+                        "warning" if pending_contacts else "success",
+                    ),
+                    (
+                        f"Not Reachable {missing_mobile_count}",
+                        "danger" if missing_mobile_count else "neutral",
+                    ),
+                ]
+            )
+            preview_columns = st.columns(2, gap="large")
+            with preview_columns[0]:
+                st.caption("Everyone on the live fire roll who will get the first send")
+                if live_contacts:
+                    st.dataframe(
+                        pd.DataFrame(
+                            _build_toolbox_talk_audience_rows(
+                                live_contacts,
+                                status_label="Ready now",
+                            )
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No live operatives with mobile numbers are currently reachable.")
+            with preview_columns[1]:
+                st.caption("Reminder queue if you resend to pending signers later")
+                if pending_contacts:
+                    st.dataframe(
+                        pd.DataFrame(
+                            _build_toolbox_talk_audience_rows(
+                                pending_contacts,
+                                status_label="Pending signature",
+                            )
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                else:
+                    st.success("No live reminder queue right now. Everyone on site is signed or unreachable.")
+
+            st.caption("Message preview")
+            st.code(selected_tbt_message, language="text")
 
             if selected_tbt_link:
                 action_columns = st.columns([1, 1, 1], gap="large")
@@ -8378,14 +9616,11 @@ def _render_site_broadcast_station(
                 "<div class='file-2-section-heading'>Delivery History</div>",
                 unsafe_allow_html=True,
             )
-            if tbt_dispatches:
-                st.dataframe(
-                    pd.DataFrame(_build_broadcast_dispatch_rows(tbt_dispatches[:12])),
-                    width="stretch",
-                    hide_index=True,
-                )
-            else:
-                st.caption("No TBT delivery batches have been launched for this topic yet.")
+            _render_dispatch_history_audit(
+                tbt_dispatches,
+                empty_message="No TBT delivery batches have been launched for this topic yet.",
+                expander_prefix="toolbox_talk",
+            )
 
             st.divider()
             if st.button(
@@ -8465,6 +9700,22 @@ def _render_toolbox_talk_kiosk(
         on_date=date.today(),
         active_only=True,
     )
+    pending_attendance_entries = sorted(
+        _build_pending_toolbox_talk_attendance_entries(
+            active_attendance_entries,
+            list_toolbox_talk_completions(
+                repository,
+                site_name=project_setup.current_site_name,
+                topic=resolved_topic,
+                on_date=date.today(),
+            ),
+        ),
+        key=lambda entry: (
+            entry.individual_name.casefold(),
+            entry.contractor_name.casefold(),
+            entry.time_in,
+        ),
+    )
 
     if UPLANDS_LOGO.exists():
         logo_columns = st.columns([1, 1.2, 1])
@@ -8477,11 +9728,19 @@ def _render_toolbox_talk_kiosk(
             "<div class='panel-heading'>UHSF16.2 TOOLBOX TALK</div>"
             f"<div class='panel-title'>{html.escape(resolved_topic)}</div>"
             "<div class='panel-caption'>"
-            "Select your name, sign on screen, and submit your remote toolbox talk acknowledgement."
+            "Read the document, pick your name, confirm you understand it, then sign once on screen."
             "</div>"
             "</div>"
         ),
         unsafe_allow_html=True,
+    )
+    _render_broadcast_status_badges(
+        [
+            ("1 Read document", "neutral"),
+            ("2 Choose your name", "neutral"),
+            ("3 Confirm", "neutral"),
+            ("4 Sign", "success"),
+        ]
     )
 
     try:
@@ -8492,15 +9751,30 @@ def _render_toolbox_talk_kiosk(
         st.error("The attached toolbox talk document is missing. Ask the manager to upload it again.")
         return
 
-    st.download_button(
-        "📥 Download / View TBT Document",
-        data=source_document_bytes,
-        file_name=source_document.original_file_name,
-        mime=source_document_mime_type,
-        width="stretch",
-        key=f"toolbox_talk_source_doc_{source_document.doc_id}",
+    source_document_view_url = build_toolbox_talk_document_view_url(
+        source_document.doc_id,
+        public_url=project_setup.public_tunnel_url,
     )
-    st.info("Open the toolbox talk document, read it fully, then return here to confirm and sign.")
+    document_action_columns = st.columns(2, gap="medium")
+    with document_action_columns[0]:
+        if source_document_view_url:
+            st.link_button(
+                "📖 Open TBT Document",
+                url=source_document_view_url,
+                width="stretch",
+            )
+    with document_action_columns[1]:
+        st.download_button(
+            "📥 Download Copy",
+            data=source_document_bytes,
+            file_name=source_document.original_file_name,
+            mime=source_document_mime_type,
+            width="stretch",
+            key=f"toolbox_talk_source_doc_{source_document.doc_id}",
+        )
+    st.info(
+        "Open the toolbox talk in your browser first. Download is still there if your phone cannot preview the file type."
+    )
 
     if completed_message:
         st.success(completed_message)
@@ -8521,7 +9795,36 @@ def _render_toolbox_talk_kiosk(
         st.info("Nobody is currently on the live fire roll, so the toolbox talk signer is paused.")
         return
 
-    signer_options = [""] + [entry.doc_id for entry in active_attendance_entries]
+    if not pending_attendance_entries:
+        st.success("Everyone currently on site has already signed this toolbox talk.")
+        return
+
+    if len(pending_attendance_entries) == 1 and not str(
+        st.session_state.get("toolbox_talk_selected_attendance_doc_id", "")
+    ).strip():
+        st.session_state["toolbox_talk_selected_attendance_doc_id"] = (
+            pending_attendance_entries[0].doc_id
+        )
+
+    signer_search = st.text_input(
+        "Find Your Name",
+        key="toolbox_talk_signer_search",
+        placeholder="Start typing your name or company",
+    )
+    search_value = signer_search.strip().casefold()
+    filtered_attendance_entries = [
+        entry
+        for entry in pending_attendance_entries
+        if not search_value
+        or search_value in entry.individual_name.casefold()
+        or search_value in entry.contractor_name.casefold()
+        or search_value in (entry.vehicle_registration or "").casefold()
+    ]
+    if not filtered_attendance_entries:
+        st.warning("No pending signer matches that search. Clear it and try again.")
+        filtered_attendance_entries = pending_attendance_entries
+
+    signer_options = [""] + [entry.doc_id for entry in filtered_attendance_entries]
     if (
         st.session_state.get("toolbox_talk_selected_attendance_doc_id")
         not in signer_options
@@ -8537,7 +9840,7 @@ def _render_toolbox_talk_kiosk(
             else _toolbox_talk_signer_label(
                 next(
                     entry
-                    for entry in active_attendance_entries
+                    for entry in filtered_attendance_entries
                     if entry.doc_id == doc_id
                 )
             )
@@ -8546,11 +9849,29 @@ def _render_toolbox_talk_kiosk(
     selected_attendance_entry = next(
         (
             entry
-            for entry in active_attendance_entries
+            for entry in filtered_attendance_entries
             if entry.doc_id == selected_attendance_doc_id
         ),
         None,
     )
+    st.caption(
+        f"Pending live signers: {len(pending_attendance_entries)} | Showing: {len(filtered_attendance_entries)}"
+    )
+    if selected_attendance_entry is not None:
+        st.markdown(
+            (
+                "<div class='panel-card'>"
+                "<div class='panel-heading'>Signing As</div>"
+                f"<div class='panel-title'>{html.escape(selected_attendance_entry.individual_name)}</div>"
+                "<div class='panel-caption'>"
+                f"{html.escape(selected_attendance_entry.contractor_name)}"
+                f" | On site since {selected_attendance_entry.time_in:%H:%M}"
+                f"{' | Vehicle ' + html.escape(selected_attendance_entry.vehicle_registration) if selected_attendance_entry.vehicle_registration else ''}"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
 
     read_confirmed = st.checkbox(
         "I confirm I have read and understood the attached Toolbox Talk document.",
@@ -8568,7 +9889,7 @@ def _render_toolbox_talk_kiosk(
         update_streamlit=True,
         key=f"toolbox_talk_canvas_{canvas_revision}",
         height=200,
-        width=420,
+        width=340,
         stroke_width=3,
         stroke_color="#000000",
         background_color="#ffffff",
@@ -8591,7 +9912,7 @@ def _render_toolbox_talk_kiosk(
             "✅ Submit",
             key="submit_toolbox_talk_completion",
             width="stretch",
-            disabled=not read_confirmed,
+            disabled=(not read_confirmed or selected_attendance_entry is None),
         ):
             try:
                 if selected_attendance_entry is None:
@@ -8665,23 +9986,41 @@ def _render_site_induction_capture_form(
         key="site_induction_company_selection",
     )
 
-    personnel_columns = st.columns(2, gap="large")
-    with personnel_columns[0]:
+    _render_workspace_zone_heading(
+        "Step 1 · Operative & Employer",
+        "Start with the operative, employer, and the contact details that must appear on the filed induction.",
+    )
+    if selected_company_option == "🏢 New Company (Type Below)":
+        company = st.text_input(
+            "Enter New Company Name",
+            key="site_induction_new_company_name",
+        )
+    else:
+        company = selected_company_option
+
+    identity_columns = st.columns(2, gap="large")
+    with identity_columns[0]:
         full_name = st.text_input("Full Name", key="site_induction_full_name")
-        home_address = st.text_input("Home Address", key="site_induction_home_address")
+        occupation = st.text_input("Occupation", key="site_induction_occupation")
         contact_number = st.text_input(
             "Contact Number",
             key="site_induction_contact_number",
+            placeholder="Enter your mobile number",
         )
-        if selected_company_option == "🏢 New Company (Type Below)":
-            company = st.text_input(
-                "Enter New Company Name",
-                key="site_induction_new_company_name",
-            )
-        else:
-            company = selected_company_option
-        occupation = st.text_input("Occupation", key="site_induction_occupation")
-    with personnel_columns[1]:
+    with identity_columns[1]:
+        home_address = st.text_area(
+            "Home Address",
+            key="site_induction_home_address",
+            height=110,
+            placeholder="Enter your full home address",
+        )
+
+    _render_workspace_zone_heading(
+        "Step 2 · Emergency & Welfare",
+        "Capture the key welfare and emergency details before moving into competence evidence.",
+    )
+    emergency_columns = st.columns(2, gap="large")
+    with emergency_columns[0]:
         emergency_contact = st.text_input(
             "Emergency Contact",
             key="site_induction_emergency_contact",
@@ -8690,7 +10029,20 @@ def _render_site_induction_capture_form(
             "Emergency Tel",
             key="site_induction_emergency_tel",
         )
-        medical = st.text_input("Medical", key="site_induction_medical")
+    with emergency_columns[1]:
+        medical = st.text_area(
+            "Medical / Welfare Notes",
+            key="site_induction_medical",
+            height=110,
+            placeholder="Enter any declared conditions, medication, or relevant site welfare notes",
+        )
+
+    _render_workspace_zone_heading(
+        "Step 3 · Core Cards & Mandatory Evidence",
+        "The digital induction now requires the operative's core card details and a manual handling certificate upload.",
+    )
+    core_competence_columns = st.columns(2, gap="large")
+    with core_competence_columns[0]:
         cscs_number = st.text_input("CSCS No.", key="site_induction_cscs_number")
         cscs_expiry = st.date_input(
             "CSCS Expiry Date",
@@ -8704,6 +10056,12 @@ def _render_site_induction_capture_form(
             accept_multiple_files=False,
             key="site_induction_cscs_card_upload",
         )
+        competency_expiry_date = st.date_input(
+            "📅 Primary Competency Card Expiry Date",
+            format="DD/MM/YYYY",
+            key="site_induction_competency_expiry_date",
+        )
+    with core_competence_columns[1]:
         asbestos_cert = _render_site_induction_yes_no_field(
             "Asbestos Awareness Certificate",
             key="site_induction_asbestos_cert",
@@ -8716,6 +10074,16 @@ def _render_site_induction_capture_form(
                 accept_multiple_files=False,
                 key="site_induction_asbestos_card_upload",
             )
+        manual_handling_card_upload = st.file_uploader(
+            f"📄 Upload {MANDATORY_MANUAL_HANDLING_LABEL}",
+            type=["png", "jpg", "jpeg", "pdf"],
+            accept_multiple_files=False,
+            key="site_induction_manual_handling_upload",
+            help="This certificate is mandatory for the app induction workflow.",
+        )
+        st.caption(
+            "Manual handling evidence is mandatory for this digital induction workflow."
+        )
 
     if is_kiosk:
         scaffold_section = st.container()
@@ -8724,6 +10092,10 @@ def _render_site_induction_capture_form(
         competence_columns = st.columns(2, gap="large")
         scaffold_section, plant_section = competence_columns
 
+    _render_workspace_zone_heading(
+        "Step 4 · Specialist Activities & Role Evidence",
+        "Only capture the extra cards and certificates that apply to this operative's work on site.",
+    )
     with scaffold_section:
         erect_scaffold = _render_site_induction_yes_no_field(
             "Are you erecting scaffold?",
@@ -8823,6 +10195,10 @@ def _render_site_induction_capture_form(
                 accept_multiple_files=False,
                 key="site_induction_cpcs_card_upload",
             )
+        st.markdown("**Site-Specific Training**")
+        st.caption(
+            "Record any client-specific training and attach the supporting evidence if the operative has it."
+        )
         client_training_desc = st.text_area(
             "Client Specific Training",
             key="site_induction_client_training_desc",
@@ -8851,18 +10227,72 @@ def _render_site_induction_capture_form(
             key="site_induction_client_training_upload",
         )
 
-    st.caption(
-        "On mobile, tap each upload field to take a live photo of the relevant card or certificate."
+    uploaded_evidence_count = len(
+        [
+            uploaded_file
+            for uploaded_file in (
+                cscs_card_upload,
+                asbestos_card_upload if asbestos_cert else None,
+                manual_handling_card_upload,
+                cisrs_card_upload if erect_scaffold else None,
+                first_aider_upload if first_aider else None,
+                fire_warden_upload if fire_warden else None,
+                supervisor_upload if supervisor else None,
+                smsts_upload if smsts else None,
+                cpcs_card_upload if operate_plant else None,
+                client_training_upload,
+            )
+            if uploaded_file is not None
+        ]
     )
-    competency_expiry_date = st.date_input(
-        "📅 Primary Competency Card Expiry Date",
-        format="DD/MM/YYYY",
-        key="site_induction_competency_expiry_date",
+    company_readiness_value = (
+        company.strip()
+        if selected_company_option != "-- Select Company --" and company.strip()
+        else "Needed"
+    )
+    if is_kiosk:
+        readiness_rows = [
+            st.columns(2, gap="medium"),
+            st.columns(2, gap="medium"),
+        ]
+        readiness_targets = [
+            (readiness_rows[0][0], "Company", company_readiness_value, "🏢"),
+            (readiness_rows[0][1], "Phone", "Ready" if contact_number.strip() else "Missing", "📱"),
+            (readiness_rows[1][0], "Evidence Files", str(uploaded_evidence_count), "🎫"),
+            (
+                readiness_rows[1][1],
+                "Manual Handling",
+                "Ready" if manual_handling_card_upload is not None else "Required",
+                "🧰",
+            ),
+        ]
+        for column, label, value, icon in readiness_targets:
+            with column:
+                _render_inline_metric(label, value, icon=icon)
+    else:
+        readiness_columns = st.columns(4, gap="medium")
+        readiness_targets = [
+            (readiness_columns[0], "Company", company_readiness_value, "🏢"),
+            (readiness_columns[1], "Phone", "Ready" if contact_number.strip() else "Missing", "📱"),
+            (readiness_columns[2], "Evidence Files", str(uploaded_evidence_count), "🎫"),
+            (
+                readiness_columns[3],
+                "Manual Handling",
+                "Ready" if manual_handling_card_upload is not None else "Required",
+                "🧰",
+            ),
+        ]
+        for column, label, value, icon in readiness_targets:
+            with column:
+                _render_inline_metric(label, value, icon=icon)
+
+    st.caption(
+        "On mobile, tap each upload field to take a live photo of the relevant card or certificate. Manual handling evidence is mandatory."
     )
 
-    st.markdown(
-        "<div class='file-2-section-heading'>Operative Signature</div>",
-        unsafe_allow_html=True,
+    _render_workspace_zone_heading(
+        "Step 6 · Operative Signature",
+        "Once the details and evidence are complete, capture the operative signature to lock the induction into the site file.",
     )
     canvas_revision = int(st.session_state.get("site_induction_canvas_revision", 0))
     canvas_result = st_canvas(
@@ -8919,12 +10349,18 @@ def _render_site_induction_capture_form(
                     raise ValidationError(
                         "Please select or enter your company name."
                     )
+                resolved_home_address = str(
+                    st.session_state.get("site_induction_home_address", home_address)
+                ).strip()
+                resolved_contact_number = str(
+                    st.session_state.get("site_induction_contact_number", contact_number)
+                ).strip()
                 generated_document = create_site_induction_document(
                     repository,
                     site_name=project_setup.current_site_name,
                     full_name=full_name,
-                    home_address=home_address,
-                    contact_number=contact_number,
+                    home_address=resolved_home_address,
+                    contact_number=resolved_contact_number,
                     company=resolved_company_name,
                     occupation=occupation,
                     emergency_contact=emergency_contact,
@@ -8950,6 +10386,7 @@ def _render_site_induction_capture_form(
                     competency_files=_build_site_induction_competency_file_payloads(
                         [
                             ("CSCS Card", cscs_card_upload),
+                            (MANDATORY_MANUAL_HANDLING_LABEL, manual_handling_card_upload),
                             ("Asbestos Certificate", asbestos_card_upload if asbestos_cert else None),
                             ("CISRS Card", cisrs_card_upload if erect_scaffold else None),
                             ("First Aid Certificate", first_aider_upload if first_aider else None),
@@ -9012,6 +10449,12 @@ def _render_manager_attendance_register_tab(
     )
     if attendance_flash_message:
         st.success(attendance_flash_message)
+    attendance_edit_flash_message = st.session_state.pop(
+        "site_attendance_edit_flash",
+        None,
+    )
+    if attendance_edit_flash_message:
+        st.success(attendance_edit_flash_message)
 
     st.caption(
         "Run the live sign-in console, monitor who is on site, and keep an eye on competency risk from one operational view."
@@ -9020,6 +10463,10 @@ def _render_manager_attendance_register_tab(
     _render_site_gate_fallback_panel(project_setup)
     _render_live_fire_roll_panel(active_attendance_entries)
     _render_todays_attendance_activity_panel(todays_attendance_entries)
+    _render_manager_attendance_correction_panel(
+        repository,
+        project_setup=project_setup,
+    )
 
     site_attendance_history = [
         document
@@ -9607,9 +11054,6 @@ def _render_site_induction_station(
                 ),
             )
 
-        with st.expander("Induction Admin", expanded=False):
-            _render_site_induction_bulk_reset_panel(repository, inductions)
-
         manager_tabs = st.tabs(
             ["Daily Register", "Print & Export", "Manual Induction", "Recent Inductions"]
         )
@@ -9624,13 +11068,43 @@ def _render_site_induction_station(
         with manager_tabs[1]:
             _render_manager_attendance_export_tab(repository, project_setup)
         with manager_tabs[2]:
-            st.markdown(
-                "<div class='file-2-section-heading'>UHSF16.01 Induction Capture</div>",
-                unsafe_allow_html=True,
+            _render_workspace_zone_heading(
+                "UHSF16.01 Induction Capture",
+                "Use this builder when a new operative needs their first induction before they can appear in the daily sign-in roster.",
             )
-            st.caption(
-                "Use the induction builder below when a new operative needs their first site induction before appearing in the daily sign-in list."
-            )
+            manual_induction_metrics = st.columns(4, gap="large")
+            with manual_induction_metrics[0]:
+                _render_inline_metric(
+                    "Saved Inductions",
+                    str(len(inductions)),
+                    icon="📝",
+                )
+            with manual_induction_metrics[1]:
+                _render_inline_metric(
+                    "Added Today",
+                    str(sum(induction.created_at.date() == date.today() for induction in inductions)),
+                    icon="📅",
+                )
+            with manual_induction_metrics[2]:
+                _render_inline_metric(
+                    "Manual Handling Missing",
+                    str(
+                        sum(
+                            not _induction_has_evidence_label(
+                                induction,
+                                MANDATORY_MANUAL_HANDLING_LABEL,
+                            )
+                            for induction in inductions
+                        )
+                    ),
+                    icon="⚠️",
+                )
+            with manual_induction_metrics[3]:
+                _render_inline_metric(
+                    "Current Site",
+                    project_setup.current_site_name,
+                    icon="📍",
+                )
             if st.button(
                 "↺ Reset Manual Induction Form",
                 key="manager_reset_site_induction_form",
@@ -9647,7 +11121,7 @@ def _render_site_induction_station(
                 )
                 st.rerun()
             st.caption(
-                "Reset clears the current manual induction form, signature canvas, and any staged competency uploads."
+                "Reset clears the current manual induction form, signature canvas, and staged competency uploads, including the mandatory manual handling evidence."
             )
             with st.expander("Open Manual Induction Builder", expanded=False):
                 _render_site_induction_capture_form(
@@ -9658,17 +11132,9 @@ def _render_site_induction_station(
                     st_canvas=st_canvas,
                 )
         with manager_tabs[3]:
-            st.markdown(
-                (
-                    "<div class='panel-card'>"
-                    "<div class='panel-heading'>Recent Submissions</div>"
-                    "<div class='panel-title'>Completed Inductions</div>"
-                    "<div class='panel-caption'>"
-                    "Review, remove, or fully reset the saved induction records for the active site."
-                    "</div>"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
+            _render_workspace_zone_heading(
+                "Completed Inductions",
+                "Open a richer saved-record view, print the full induction pack, or correct the filed details without leaving the app.",
             )
             _render_site_induction_recent_submissions(repository, inductions)
         return
@@ -9908,6 +11374,36 @@ def _render_metric_card(
             f"{body_html}"
             "</div>"
         ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_dispatch_audit_card(
+    *,
+    label: str,
+    value: str,
+    caption: str = "",
+) -> None:
+    """Render one compact audit card inside a dispatch history expander."""
+
+    compact_class = " dispatch-audit-value-compact" if len(value) > 18 else ""
+    st.markdown(
+        (
+            "<div class='dispatch-audit-card'>"
+            f"<div class='dispatch-audit-label'>{html.escape(label)}</div>"
+            f"<div class='dispatch-audit-value{compact_class}'>{html.escape(value)}</div>"
+            f"<div class='dispatch-audit-copy'>{html.escape(caption)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_dispatch_message_box(message_body: str) -> None:
+    """Render one wrapped message body panel for broadcast history."""
+
+    st.markdown(
+        f"<div class='dispatch-message-box'>{html.escape(message_body)}</div>",
         unsafe_allow_html=True,
     )
 
@@ -12081,45 +13577,583 @@ def _build_induction_rows(
     ]
 
 
+def _format_optional_date_label(value: Optional[date]) -> str:
+    """Return one induction-friendly date string."""
+
+    return value.strftime("%d/%m/%Y") if isinstance(value, date) else "-"
+
+
+def _build_induction_role_labels(induction: InductionDocument) -> List[str]:
+    """Return enabled role labels for one induction."""
+
+    return [
+        role_label
+        for role_label, enabled in (
+            ("First Aider", induction.first_aider),
+            ("Fire Warden", induction.fire_warden),
+            ("Supervisor", induction.supervisor),
+            ("SMSTS", induction.smsts),
+        )
+        if enabled
+    ]
+
+
+def _resolve_induction_evidence_label(competency_path: Path) -> str:
+    """Best-effort label for one saved induction evidence file."""
+
+    normalized_name = competency_path.name.casefold().replace("_", " ").replace("-", " ")
+    label_keywords = {
+        "CSCS Card": ("cscs",),
+        MANDATORY_MANUAL_HANDLING_LABEL: ("manual handling",),
+        "Asbestos Certificate": ("asbestos",),
+        "CISRS Card": ("cisrs",),
+        "First Aid Certificate": ("first aid",),
+        "Fire Warden Certificate": ("fire warden",),
+        "Supervisor Certificate": ("supervisor",),
+        "SMSTS Certificate": ("smsts",),
+        "CPCS Card": ("cpcs",),
+        "Client Training Evidence": ("client training",),
+    }
+    for label, keywords in label_keywords.items():
+        if any(keyword in normalized_name for keyword in keywords):
+            return label
+    return competency_path.stem.replace("_", " ").replace("-", " ").strip() or competency_path.name
+
+
+def _build_induction_evidence_rows(
+    induction: InductionDocument,
+) -> List[Dict[str, str]]:
+    """Return UI rows for one induction's saved evidence pack."""
+
+    rows: List[Dict[str, str]] = []
+    label_order = {label: index for index, label in enumerate(INDUCTION_EVIDENCE_LABEL_ORDER)}
+    for competency_path in _split_induction_competency_paths(induction):
+        resolved_path = competency_path.expanduser()
+        if not resolved_path.exists():
+            continue
+        evidence_label = _resolve_induction_evidence_label(resolved_path)
+        rows.append(
+            {
+                "Evidence": evidence_label,
+                "File": resolved_path.name,
+                "Type": resolved_path.suffix.lstrip(".").upper() or "-",
+                "Updated": datetime.fromtimestamp(resolved_path.stat().st_mtime).strftime(
+                    "%d/%m/%Y %H:%M"
+                ),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            label_order.get(row["Evidence"], len(label_order) + 1),
+            row["Evidence"].casefold(),
+            row["File"].casefold(),
+        ),
+    )
+
+
+def _induction_has_evidence_label(
+    induction: InductionDocument,
+    evidence_label: str,
+) -> bool:
+    """Return True when one saved induction has a specific evidence label."""
+
+    target = evidence_label.casefold()
+    return any(
+        row["Evidence"].casefold() == target
+        for row in _build_induction_evidence_rows(induction)
+    )
+
+
+def _render_induction_key_value_table(
+    title: str,
+    rows: List[tuple[str, str]],
+) -> None:
+    """Render one clean key/value table for the induction detail view."""
+
+    st.markdown(f"**{title}**")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Field": field_label,
+                    "Value": value_text.strip() if value_text.strip() else "-",
+                }
+                for field_label, value_text in rows
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Field": st.column_config.TextColumn("Field", width="medium"),
+            "Value": st.column_config.TextColumn("Value", width="large"),
+        },
+    )
+
+
+def _render_site_induction_edit_panel(
+    repository: DocumentRepository,
+    induction: InductionDocument,
+) -> None:
+    """Render the editable saved-induction form inside the detail workspace."""
+
+    edit_key_prefix = f"edit-induction-{induction.doc_id}"
+    with st.form(f"{edit_key_prefix}-form"):
+        basics_columns = st.columns(3, gap="medium")
+        with basics_columns[0]:
+            full_name = st.text_input(
+                "Full Name",
+                value=induction.individual_name,
+                key=f"{edit_key_prefix}-full-name",
+            )
+        with basics_columns[1]:
+            company = st.text_input(
+                "Company",
+                value=induction.contractor_name,
+                key=f"{edit_key_prefix}-company",
+            )
+        with basics_columns[2]:
+            occupation = st.text_input(
+                "Occupation",
+                value=induction.occupation,
+                key=f"{edit_key_prefix}-occupation",
+            )
+
+        contact_columns = st.columns(2, gap="medium")
+        with contact_columns[0]:
+            home_address = st.text_area(
+                "Home Address",
+                value=induction.home_address,
+                key=f"{edit_key_prefix}-home-address",
+                height=100,
+            )
+        with contact_columns[1]:
+            contact_number = st.text_input(
+                "Contact Number",
+                value=induction.contact_number,
+                key=f"{edit_key_prefix}-contact-number",
+            )
+            emergency_contact = st.text_input(
+                "Emergency Contact",
+                value=induction.emergency_contact,
+                key=f"{edit_key_prefix}-emergency-contact",
+            )
+            emergency_tel = st.text_input(
+                "Emergency Tel",
+                value=induction.emergency_tel,
+                key=f"{edit_key_prefix}-emergency-tel",
+            )
+
+        medical = st.text_area(
+            "Medical Information",
+            value=induction.medical,
+            key=f"{edit_key_prefix}-medical",
+            height=90,
+        )
+
+        cscs_columns = st.columns(3, gap="medium")
+        with cscs_columns[0]:
+            cscs_number = st.text_input(
+                "CSCS Number",
+                value=induction.cscs_number,
+                key=f"{edit_key_prefix}-cscs-number",
+            )
+        with cscs_columns[1]:
+            cscs_expiry = st.date_input(
+                "CSCS Expiry",
+                value=induction.cscs_expiry,
+                key=f"{edit_key_prefix}-cscs-expiry",
+            )
+        with cscs_columns[2]:
+            competency_expiry_date = st.date_input(
+                "Primary Competency Expiry",
+                value=induction.competency_expiry_date,
+                key=f"{edit_key_prefix}-competency-expiry",
+            )
+
+        asbestos_cert = st.checkbox(
+            "Asbestos Awareness Certificate",
+            value=induction.asbestos_cert,
+            key=f"{edit_key_prefix}-asbestos-cert",
+        )
+        erect_scaffold = st.checkbox(
+            "Are you erecting scaffold?",
+            value=induction.erect_scaffold,
+            key=f"{edit_key_prefix}-erect-scaffold",
+        )
+        if erect_scaffold:
+            scaffold_columns = st.columns(2, gap="medium")
+            with scaffold_columns[0]:
+                cisrs_no = st.text_input(
+                    "CISRS Number",
+                    value=induction.cisrs_no,
+                    key=f"{edit_key_prefix}-cisrs-no",
+                )
+            with scaffold_columns[1]:
+                cisrs_expiry = st.date_input(
+                    "CISRS Expiry",
+                    value=induction.cisrs_expiry,
+                    key=f"{edit_key_prefix}-cisrs-expiry",
+                )
+        else:
+            cisrs_no = ""
+            cisrs_expiry = None
+
+        operate_plant = st.checkbox(
+            "Are you operating plant?",
+            value=induction.operate_plant,
+            key=f"{edit_key_prefix}-operate-plant",
+        )
+        if operate_plant:
+            plant_columns = st.columns(2, gap="medium")
+            with plant_columns[0]:
+                cpcs_no = st.text_input(
+                    "CPCS Number",
+                    value=induction.cpcs_no,
+                    key=f"{edit_key_prefix}-cpcs-no",
+                )
+            with plant_columns[1]:
+                cpcs_expiry = st.date_input(
+                    "CPCS Expiry",
+                    value=induction.cpcs_expiry,
+                    key=f"{edit_key_prefix}-cpcs-expiry",
+                )
+        else:
+            cpcs_no = ""
+            cpcs_expiry = None
+
+        client_training_desc = st.text_area(
+            "Client Training Description",
+            value=induction.client_training_desc,
+            key=f"{edit_key_prefix}-client-training-desc",
+            height=90,
+        )
+        client_training_columns = st.columns(2, gap="medium")
+        with client_training_columns[0]:
+            client_training_date = st.date_input(
+                "Client Training Date",
+                value=induction.client_training_date,
+                key=f"{edit_key_prefix}-client-training-date",
+            )
+        with client_training_columns[1]:
+            client_training_expiry = st.date_input(
+                "Client Training Expiry",
+                value=induction.client_training_expiry,
+                key=f"{edit_key_prefix}-client-training-expiry",
+            )
+
+        role_columns = st.columns(4, gap="medium")
+        with role_columns[0]:
+            first_aider = st.checkbox(
+                "First Aider",
+                value=induction.first_aider,
+                key=f"{edit_key_prefix}-first-aider",
+            )
+        with role_columns[1]:
+            fire_warden = st.checkbox(
+                "Fire Warden",
+                value=induction.fire_warden,
+                key=f"{edit_key_prefix}-fire-warden",
+            )
+        with role_columns[2]:
+            supervisor = st.checkbox(
+                "Supervisor",
+                value=induction.supervisor,
+                key=f"{edit_key_prefix}-supervisor",
+            )
+        with role_columns[3]:
+            smsts = st.checkbox(
+                "SMSTS",
+                value=induction.smsts,
+                key=f"{edit_key_prefix}-smsts",
+            )
+
+        save_induction_edit = st.form_submit_button(
+            "💾 Save Induction Changes",
+            width="stretch",
+        )
+
+    if not save_induction_edit:
+        return
+
+    try:
+        updated_document = update_site_induction_document(
+            repository,
+            induction_doc_id=induction.doc_id,
+            full_name=full_name,
+            home_address=home_address,
+            contact_number=contact_number,
+            company=company,
+            occupation=occupation,
+            emergency_contact=emergency_contact,
+            emergency_tel=emergency_tel,
+            medical=medical,
+            cscs_number=cscs_number,
+            cscs_expiry=cscs_expiry,
+            asbestos_cert=asbestos_cert,
+            erect_scaffold=erect_scaffold,
+            cisrs_no=cisrs_no,
+            cisrs_expiry=cisrs_expiry,
+            operate_plant=operate_plant,
+            cpcs_no=cpcs_no,
+            cpcs_expiry=cpcs_expiry,
+            client_training_desc=client_training_desc,
+            client_training_date=client_training_date,
+            client_training_expiry=client_training_expiry,
+            first_aider=first_aider,
+            fire_warden=fire_warden,
+            supervisor=supervisor,
+            smsts=smsts,
+            competency_expiry_date=competency_expiry_date,
+        )
+    except ValidationError as exc:
+        st.error(str(exc))
+    except Exception as exc:
+        st.error(f"Unable to update the saved induction: {exc}")
+    else:
+        st.session_state["site_induction_edit_flash"] = (
+            f"Updated induction for {updated_document.induction_document.individual_name}."
+        )
+        st.rerun()
+
+
+def _render_site_induction_extra_evidence_panel(
+    repository: DocumentRepository,
+    induction: InductionDocument,
+) -> None:
+    """Render a post-save evidence upload workflow for one saved induction."""
+
+    form_key_prefix = f"add-evidence-{induction.doc_id}"
+    with st.expander("➕ Add Extra Evidence", expanded=False):
+        st.caption(
+            "Use this when a certificate arrives after the induction has already been saved. New evidence is appended straight into the existing induction pack."
+        )
+        with st.form(f"{form_key_prefix}-form"):
+            evidence_type = st.selectbox(
+                "Evidence Type",
+                options=[*INDUCTION_EVIDENCE_LABEL_ORDER, OTHER_INDUCTION_EVIDENCE_OPTION],
+                key=f"{form_key_prefix}-type",
+            )
+            custom_label = ""
+            if evidence_type == OTHER_INDUCTION_EVIDENCE_OPTION:
+                custom_label = st.text_input(
+                    "Custom Evidence Label",
+                    key=f"{form_key_prefix}-custom-label",
+                    placeholder="Example: Face Fit Certificate",
+                )
+            uploaded_files = st.file_uploader(
+                "Upload Evidence Files",
+                type=["png", "jpg", "jpeg", "pdf", "doc", "docx"],
+                accept_multiple_files=True,
+                key=f"{form_key_prefix}-files",
+            )
+            submit_extra_evidence = st.form_submit_button(
+                "📎 Add Evidence to Saved Induction",
+                width="stretch",
+            )
+
+        if not submit_extra_evidence:
+            return
+
+        resolved_label = (
+            custom_label.strip()
+            if evidence_type == OTHER_INDUCTION_EVIDENCE_OPTION
+            else evidence_type
+        )
+        try:
+            if not resolved_label:
+                raise ValidationError("Enter a label for the extra evidence you are uploading.")
+            updated_induction = add_site_induction_evidence_files(
+                repository,
+                induction_doc_id=induction.doc_id,
+                competency_files=_build_site_induction_competency_file_payloads(
+                    [(resolved_label, uploaded_files)]
+                ),
+            )
+        except ValidationError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Unable to add extra evidence: {exc}")
+        else:
+            st.session_state["site_induction_edit_flash"] = (
+                f"Added {resolved_label} evidence to {updated_induction.individual_name}."
+            )
+            st.rerun()
+
+
 def _render_site_induction_recent_submissions(
     repository: DocumentRepository,
     inductions: List[InductionDocument],
 ) -> None:
-    """Render recent induction submissions with delete actions and confirmation."""
+    """Render a richer searchable workspace for saved induction records."""
 
     pending_delete_doc_id = st.session_state.get("site_induction_delete_pending_doc_id")
     selected_view_doc_id = st.session_state.get("site_induction_view_doc_id")
+    induction_edit_flash_message = st.session_state.pop("site_induction_edit_flash", None)
+    if induction_edit_flash_message:
+        st.success(induction_edit_flash_message)
+
+    _render_site_induction_bulk_reset_panel(repository, inductions)
 
     if not inductions:
         st.info("No inductions have been logged for this site yet.")
         return
 
-    header_columns = st.columns([1.25, 1.2, 1.0, 1.0, 1.2, 0.72, 0.55], gap="small")
-    for column, label in zip(
-        header_columns,
-        ("Date", "Full Name", "Company", "Occupation", "Roles", "View", "Delete"),
-    ):
-        column.markdown(f"**{label}**")
+    sorted_inductions = sorted(
+        inductions,
+        key=lambda induction_record: induction_record.created_at,
+        reverse=True,
+    )
+    companies = sorted(
+        {induction.contractor_name for induction in sorted_inductions if induction.contractor_name},
+        key=str.casefold,
+    )
 
-    for induction in inductions:
-        role_summary = ", ".join(
-            role_label
-            for role_label, enabled in (
-                ("First Aider", induction.first_aider),
-                ("Fire Warden", induction.fire_warden),
-                ("Supervisor", induction.supervisor),
-                ("SMSTS", induction.smsts),
+    summary_columns = st.columns(4, gap="large")
+    with summary_columns[0]:
+        _render_inline_metric("Saved Inductions", str(len(sorted_inductions)), icon="📝")
+    with summary_columns[1]:
+        _render_inline_metric(
+            "Added Today",
+            str(sum(induction.created_at.date() == date.today() for induction in sorted_inductions)),
+            icon="📅",
+        )
+    with summary_columns[2]:
+        _render_inline_metric(
+            "Evidence Packs Ready",
+            str(sum(bool(_build_induction_evidence_rows(induction)) for induction in sorted_inductions)),
+            icon="🎫",
+        )
+    with summary_columns[3]:
+        _render_inline_metric(
+            "Manual Handling Missing",
+            str(
+                sum(
+                    not _induction_has_evidence_label(
+                        induction,
+                        MANDATORY_MANUAL_HANDLING_LABEL,
+                    )
+                    for induction in sorted_inductions
+                )
+            ),
+            icon="⚠️",
+        )
+
+    _render_workspace_zone_heading(
+        "Saved Induction Records",
+        "Search the roster, open a richer record view, and print or correct the filed induction pack without leaving the app.",
+    )
+    filter_columns = st.columns([1.8, 1.1, 1.1], gap="medium")
+    with filter_columns[0]:
+        induction_search = st.text_input(
+            "Search by operative, company, or contact number",
+            key="site_induction_history_search",
+            placeholder="Start typing a name, company, or mobile number",
+        ).strip()
+    with filter_columns[1]:
+        company_filter = st.selectbox(
+            "Company Filter",
+            options=["All companies", *companies],
+            key="site_induction_history_company_filter",
+        )
+    with filter_columns[2]:
+        _render_inline_metric(
+            "Matching Records",
+            str(
+                len(
+                    [
+                        induction
+                        for induction in sorted_inductions
+                        if (
+                            company_filter == "All companies"
+                            or induction.contractor_name == company_filter
+                        )
+                        and (
+                            not induction_search
+                            or induction_search.casefold()
+                            in " ".join(
+                                [
+                                    induction.individual_name,
+                                    induction.contractor_name,
+                                    induction.contact_number,
+                                    induction.occupation,
+                                ]
+                            ).casefold()
+                        )
+                    ]
+                )
+            ),
+            icon="🔎",
+        )
+
+    filtered_inductions = [
+        induction
+        for induction in sorted_inductions
+        if (
+            company_filter == "All companies"
+            or induction.contractor_name == company_filter
+        )
+        and (
+            not induction_search
+            or induction_search.casefold()
+            in " ".join(
+                [
+                    induction.individual_name,
+                    induction.contractor_name,
+                    induction.contact_number,
+                    induction.occupation,
+                ]
+            ).casefold()
+        )
+    ]
+
+    if not filtered_inductions:
+        st.info("No saved inductions match the current search and company filter.")
+        return
+
+    for induction in filtered_inductions:
+        evidence_rows = _build_induction_evidence_rows(induction)
+        role_labels = _build_induction_role_labels(induction)
+        manual_handling_ready = _induction_has_evidence_label(
+            induction,
+            MANDATORY_MANUAL_HANDLING_LABEL,
+        )
+        print_pack_paths = _build_induction_print_pack_paths(induction)
+        print_pack_count = len(print_pack_paths["default"]) + len(print_pack_paths["preview"])
+
+        row_columns = st.columns([2.8, 0.95, 0.95, 0.95, 0.7, 0.55], gap="medium")
+        with row_columns[0]:
+            st.markdown(
+                f"**{html.escape(induction.individual_name)}**  \n"
+                f"{html.escape(induction.contractor_name)}"
             )
-            if enabled
-        ) or "-"
-
-        row_columns = st.columns([1.25, 1.2, 1.0, 1.0, 1.2, 0.72, 0.55], gap="small")
-        row_columns[0].caption(induction.created_at.strftime("%d/%m/%Y %H:%M"))
-        row_columns[1].write(induction.individual_name)
-        row_columns[2].write(induction.contractor_name)
-        row_columns[3].write(induction.occupation or "-")
-        row_columns[4].caption(role_summary)
-        if row_columns[5].button(
+            st.caption(
+                f"{induction.created_at:%d/%m/%Y %H:%M} · "
+                f"{induction.occupation or 'Occupation not recorded'}"
+            )
+            st.caption(
+                "Roles: "
+                + (", ".join(role_labels) if role_labels else "No specialist roles recorded")
+            )
+        with row_columns[1]:
+            _render_inline_metric(
+                "Evidence",
+                str(len(evidence_rows)),
+                icon="🎫",
+            )
+        with row_columns[2]:
+            _render_inline_metric(
+                "Contact",
+                "Ready" if induction.contact_number else "Missing",
+                icon="📱",
+            )
+        with row_columns[3]:
+            _render_inline_metric(
+                "Manual",
+                "Ready" if manual_handling_ready else "Missing",
+                icon="🧰",
+            )
+        if row_columns[4].button(
             "View",
             key=f"view-induction-{induction.doc_id}",
             width="stretch",
@@ -12129,7 +14163,7 @@ def _render_site_induction_recent_submissions(
             else:
                 st.session_state["site_induction_view_doc_id"] = induction.doc_id
             st.rerun()
-        if row_columns[6].button(
+        if row_columns[5].button(
             "🗑️",
             key=f"delete-induction-{induction.doc_id}",
             help="Delete this induction record",
@@ -12139,142 +14173,247 @@ def _render_site_induction_recent_submissions(
             st.rerun()
 
         if selected_view_doc_id == induction.doc_id:
-            detail_columns = st.columns([1.05, 1.1, 1.15], gap="large")
-            with detail_columns[0]:
-                st.markdown("**Operative Details**")
-                st.caption(f"Home Address: {induction.home_address or '-'}")
-                st.caption(f"Contact: {induction.contact_number or '-'}")
-                st.caption(f"Emergency Contact: {induction.emergency_contact or '-'}")
-                st.caption(f"Emergency Tel: {induction.emergency_tel or '-'}")
-                st.caption(f"Medical: {induction.medical or '-'}")
-            with detail_columns[1]:
-                st.markdown("**Competency & Roles**")
-                st.caption(f"CSCS No: {induction.cscs_number or '-'}")
-                st.caption(
-                    "Primary Competency Expiry: "
-                    + (
-                        induction.competency_expiry_date.strftime("%d/%m/%Y")
-                        if induction.competency_expiry_date is not None
-                        else "-"
-                    )
+            st.markdown(
+                (
+                    "<div class='panel-card'>"
+                    "<div class='panel-heading'>Saved Induction Record</div>"
+                    f"<div class='panel-title'>{html.escape(induction.individual_name)}</div>"
+                    "<div class='panel-caption'>"
+                    f"{html.escape(induction.contractor_name)}"
+                    f" | {html.escape(induction.occupation or 'Occupation not recorded')}"
+                    f" | Created {induction.created_at:%d/%m/%Y %H:%M}"
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            detail_metrics = st.columns(4, gap="large")
+            with detail_metrics[0]:
+                _render_inline_metric(
+                    "Phone",
+                    induction.contact_number or "Missing",
+                    icon="📞",
                 )
-                st.caption(
-                    "Client Training Expiry: "
-                    + (
-                        induction.client_training_expiry.strftime("%d/%m/%Y")
-                        if induction.client_training_expiry is not None
-                        else "-"
-                    )
+            with detail_metrics[1]:
+                _render_inline_metric(
+                    "Evidence Files",
+                    str(len(evidence_rows)),
+                    icon="📎",
                 )
-                st.caption(
-                    "Saved as: "
-                    + (
-                        Path(induction.completed_document_path).name
-                        if induction.completed_document_path
-                        else "-"
-                    )
+            with detail_metrics[2]:
+                _render_inline_metric(
+                    "Manual Handling",
+                    "Ready" if manual_handling_ready else "Missing",
+                    icon="🧰",
                 )
-            with detail_columns[2]:
-                st.markdown("**Files**")
-                completed_document_path = Path(induction.completed_document_path)
-                print_pack_paths = _build_induction_print_pack_paths(induction)
-                print_pack_count = (
-                    len(print_pack_paths["default"]) + len(print_pack_paths["preview"])
+            with detail_metrics[3]:
+                _render_inline_metric(
+                    "Print Pack",
+                    str(print_pack_count),
+                    icon="🖨️",
                 )
-                if st.button(
-                    "🖨️ Print Induction Pack",
-                    key=f"print-induction-pack-{induction.doc_id}",
-                    width="stretch",
-                    disabled=print_pack_count == 0,
-                ):
-                    opened_count = _open_induction_print_pack(induction)
-                    if opened_count:
-                        st.success(
-                            f"Opened {opened_count} induction pack file(s) for printing."
-                        )
-                    else:
-                        st.warning(
-                            "No induction form or competency certificates were available to print."
-                        )
-                st.caption(
-                    f"Pack contents: {print_pack_count} file(s) including the induction form and uploaded competency certificates."
-                )
-                if induction.completed_document_path and completed_document_path.exists():
-                    st.download_button(
-                        "Download Induction DOCX",
-                        data=completed_document_path.read_bytes(),
-                        file_name=completed_document_path.name,
-                        mime=_guess_download_mime_type(completed_document_path),
-                        key=f"download-induction-docx-{induction.doc_id}",
-                        width="stretch",
-                    )
-                signature_path = Path(induction.signature_image_path)
-                if induction.signature_image_path and signature_path.exists():
-                    st.download_button(
-                        "Download Signature",
-                        data=signature_path.read_bytes(),
-                        file_name=signature_path.name,
-                        mime=_guess_download_mime_type(signature_path),
-                        key=f"download-induction-signature-{induction.doc_id}",
-                        width="stretch",
-                    )
-                    st.image(str(signature_path), caption="Captured signature", width="stretch")
 
-                competency_paths = _split_induction_competency_paths(induction)
-                if competency_paths:
-                    st.caption("Competency Cards")
-                    for competency_path in competency_paths:
-                        if not competency_path.exists():
-                            continue
+            detail_tabs = st.tabs(
+                ["Overview", "Competency & Roles", "Files", "Edit"]
+            )
+            with detail_tabs[0]:
+                overview_columns = st.columns(2, gap="large")
+                with overview_columns[0]:
+                    _render_induction_key_value_table(
+                        "Operative Details",
+                        [
+                            ("Full Name", induction.individual_name),
+                            ("Company", induction.contractor_name),
+                            ("Occupation", induction.occupation or "-"),
+                            ("Home Address", induction.home_address or "-"),
+                            ("Contact Number", induction.contact_number or "-"),
+                        ],
+                    )
+                with overview_columns[1]:
+                    _render_induction_key_value_table(
+                        "Emergency & Welfare",
+                        [
+                            ("Emergency Contact", induction.emergency_contact or "-"),
+                            ("Emergency Tel", induction.emergency_tel or "-"),
+                            ("Medical", induction.medical or "-"),
+                            ("Signature File", Path(induction.signature_image_path).name if induction.signature_image_path else "-"),
+                            ("Saved Document", Path(induction.completed_document_path).name if induction.completed_document_path else "-"),
+                        ],
+                    )
+            with detail_tabs[1]:
+                competence_columns = st.columns(2, gap="large")
+                with competence_columns[0]:
+                    _render_induction_key_value_table(
+                        "Core Competence",
+                        [
+                            ("CSCS No.", induction.cscs_number or "-"),
+                            ("CSCS Expiry", _format_optional_date_label(induction.cscs_expiry)),
+                            (
+                                "Primary Competency Expiry",
+                                _format_optional_date_label(induction.competency_expiry_date),
+                            ),
+                            (
+                                "Asbestos Awareness",
+                                "Yes" if induction.asbestos_cert else "No",
+                            ),
+                            (
+                                MANDATORY_MANUAL_HANDLING_LABEL,
+                                "Evidence held" if manual_handling_ready else "Missing",
+                            ),
+                        ],
+                    )
+                with competence_columns[1]:
+                    _render_induction_key_value_table(
+                        "Activities, Roles & Training",
+                        [
+                            ("Erecting Scaffold", "Yes" if induction.erect_scaffold else "No"),
+                            ("CISRS No.", induction.cisrs_no or "-"),
+                            ("CISRS Expiry", _format_optional_date_label(induction.cisrs_expiry)),
+                            ("Operating Plant", "Yes" if induction.operate_plant else "No"),
+                            ("CPCS No.", induction.cpcs_no or "-"),
+                            ("CPCS Expiry", _format_optional_date_label(induction.cpcs_expiry)),
+                            (
+                                "Client Training",
+                                induction.client_training_desc or "No client-specific training recorded",
+                            ),
+                            (
+                                "Client Training Expiry",
+                                _format_optional_date_label(induction.client_training_expiry),
+                            ),
+                            (
+                                "Role Flags",
+                                ", ".join(role_labels) if role_labels else "No specialist roles recorded",
+                            ),
+                        ],
+                    )
+                st.markdown("**Saved Evidence Pack**")
+                if evidence_rows:
+                    st.dataframe(
+                        pd.DataFrame(evidence_rows),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                else:
+                    st.info("No competency evidence has been uploaded for this induction yet.")
+            with detail_tabs[2]:
+                file_columns = st.columns([1.05, 1.15], gap="large")
+                with file_columns[0]:
+                    completed_document_path = Path(induction.completed_document_path)
+                    if st.button(
+                        "🖨️ Print Induction Pack",
+                        key=f"print-induction-pack-{induction.doc_id}",
+                        width="stretch",
+                        disabled=print_pack_count == 0,
+                    ):
+                        opened_count = _open_induction_print_pack(induction)
+                        if opened_count:
+                            st.success(
+                                f"Opened {opened_count} induction pack file(s) for printing."
+                            )
+                        else:
+                            st.warning(
+                                "No induction form or competency certificates were available to print."
+                            )
+                    st.caption(
+                        f"Pack contents: {print_pack_count} file(s) including the induction form and uploaded competency certificates."
+                    )
+                    if induction.completed_document_path and completed_document_path.exists():
                         st.download_button(
-                            f"Download {competency_path.name}",
-                            data=competency_path.read_bytes(),
-                            file_name=competency_path.name,
-                            mime=_guess_download_mime_type(competency_path),
-                            key=f"download-competency-{induction.doc_id}-{competency_path.name}",
+                            "📥 Download Induction DOCX",
+                            data=completed_document_path.read_bytes(),
+                            file_name=completed_document_path.name,
+                            mime=_guess_download_mime_type(completed_document_path),
+                            key=f"download-induction-docx-{induction.doc_id}",
                             width="stretch",
                         )
-                        if competency_path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
-                            st.image(
-                                str(competency_path),
-                                caption=competency_path.name,
+                    signature_path = Path(induction.signature_image_path)
+                    if induction.signature_image_path and signature_path.exists():
+                        st.download_button(
+                            "📥 Download Signature",
+                            data=signature_path.read_bytes(),
+                            file_name=signature_path.name,
+                            mime=_guess_download_mime_type(signature_path),
+                            key=f"download-induction-signature-{induction.doc_id}",
+                            width="stretch",
+                        )
+                    if evidence_rows:
+                        st.markdown("**Evidence Downloads**")
+                        for competency_path in _split_induction_competency_paths(induction):
+                            resolved_path = competency_path.expanduser()
+                            if not resolved_path.exists():
+                                continue
+                            st.download_button(
+                                f"📥 {resolved_path.name}",
+                                data=resolved_path.read_bytes(),
+                                file_name=resolved_path.name,
+                                mime=_guess_download_mime_type(resolved_path),
+                                key=f"download-competency-{induction.doc_id}-{resolved_path.name}",
                                 width="stretch",
                             )
-                else:
-                    st.caption("No competency cards uploaded.")
+                    _render_site_induction_extra_evidence_panel(repository, induction)
+                with file_columns[1]:
+                    signature_path = Path(induction.signature_image_path)
+                    if induction.signature_image_path and signature_path.exists():
+                        st.image(
+                            str(signature_path),
+                            caption="Captured signature",
+                            width="stretch",
+                        )
+                    preview_paths = [
+                        competency_path.expanduser()
+                        for competency_path in _split_induction_competency_paths(induction)
+                        if competency_path.expanduser().exists()
+                        and competency_path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                    ]
+                    if preview_paths:
+                        st.markdown("**Image Evidence Previews**")
+                        for preview_path in preview_paths:
+                            st.image(
+                                str(preview_path),
+                                caption=_resolve_induction_evidence_label(preview_path),
+                                width="stretch",
+                            )
+                    elif evidence_rows:
+                        st.caption("This induction evidence pack contains documents without image previews.")
+                    else:
+                        st.caption("No evidence files are currently available for preview.")
+            with detail_tabs[3]:
+                st.caption(
+                    "Use this editor to correct induction details and regenerate the saved UHSF16.01 form without redoing the entire capture."
+                )
+                _render_site_induction_edit_panel(repository, induction)
             st.divider()
 
-        if pending_delete_doc_id != induction.doc_id:
-            continue
-
-        st.warning(
-            "Delete this induction record? This will remove the SQLite entry and "
-            "attempt to delete the saved signature PNG and completed Word document."
-        )
-        confirm_columns = st.columns([1.2, 1.0, 4.0], gap="small")
-        if confirm_columns[0].button(
-            "Confirm Delete",
-            key=f"confirm-delete-induction-{induction.doc_id}",
-            width="stretch",
-        ):
-            deleted_paths = repository.delete_document_and_files(induction.doc_id)
-            st.session_state.pop("site_induction_delete_pending_doc_id", None)
-            st.session_state["site_induction_delete_flash"] = (
-                f"Deleted induction for {induction.individual_name}."
-                + (
-                    f" Removed {len(deleted_paths)} linked file(s)."
-                    if deleted_paths
-                    else " No linked files were present on disk."
-                )
+        if pending_delete_doc_id == induction.doc_id:
+            st.warning(
+                "Delete this induction record? This removes the saved record from the app and deletes the linked signature, evidence files, and completed induction document where possible."
             )
-            st.rerun()
-        if confirm_columns[1].button(
-            "Cancel",
-            key=f"cancel-delete-induction-{induction.doc_id}",
-            width="stretch",
-        ):
-            st.session_state.pop("site_induction_delete_pending_doc_id", None)
-            st.rerun()
+            confirm_columns = st.columns([1.2, 1.0, 4.0], gap="small")
+            if confirm_columns[0].button(
+                "Confirm Delete",
+                key=f"confirm-delete-induction-{induction.doc_id}",
+                width="stretch",
+            ):
+                deleted_paths = repository.delete_document_and_files(induction.doc_id)
+                st.session_state.pop("site_induction_delete_pending_doc_id", None)
+                st.session_state["site_induction_delete_flash"] = (
+                    f"Deleted induction for {induction.individual_name}."
+                    + (
+                        f" Removed {len(deleted_paths)} linked file(s)."
+                        if deleted_paths
+                        else " No linked files were present on disk."
+                    )
+                )
+                st.rerun()
+            if confirm_columns[1].button(
+                "Cancel",
+                key=f"cancel-delete-induction-{induction.doc_id}",
+                width="stretch",
+            ):
+                st.session_state.pop("site_induction_delete_pending_doc_id", None)
+                st.rerun()
+
+        st.divider()
 
 
 def _render_site_induction_bulk_reset_panel(
@@ -12347,6 +14486,8 @@ def _render_site_induction_bulk_reset_panel(
 
 def _build_live_waste_register_rows(
     waste_notes: List[WasteTransferNoteDocument],
+    *,
+    waste_source_conflict_lookup: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """Return UI rows for the live File 1 waste register."""
 
@@ -12360,13 +14501,114 @@ def _build_live_waste_register_rows(
             "Date": waste_note.date.strftime("%d/%m/%Y"),
             "Ticket No": waste_note.wtn_number,
             "Carrier": waste_note.carrier_name,
+            "Collection Type": _get_waste_note_collection_type_label(waste_note),
             "Waste Reg / Ticket": _format_waste_register_reference_for_ui(waste_note),
             "Description": waste_note.waste_description,
-            "Tonnes": f"{waste_note.quantity_tonnes:.2f}",
-            "Status": waste_note.verification_status.value,
+            "Tonnes": (
+                "Needs review"
+                if waste_note.quantity_tonnes <= 0
+                else f"{waste_note.quantity_tonnes:.2f}"
+            ),
+            "QA": _get_waste_note_quality_status(
+                waste_note,
+                waste_source_conflict_lookup=waste_source_conflict_lookup or {},
+            ),
+            "Carrier Status": waste_note.verification_status.value,
         }
         for waste_note in sorted_waste_notes
     ]
+
+
+def _get_waste_note_collection_type_label(
+    waste_note: WasteTransferNoteDocument,
+) -> str:
+    """Return the best available collection type label for one saved WTN."""
+
+    if not waste_note.source_conflict_candidates:
+        return "-"
+
+    if waste_note.canonical_source_path:
+        canonical_source_path = waste_note.canonical_source_path.strip()
+        for source_candidate in waste_note.source_conflict_candidates:
+            if source_candidate.source_path.strip() == canonical_source_path:
+                return source_candidate.collection_type or "-"
+
+    for source_candidate in waste_note.source_conflict_candidates:
+        if source_candidate.collection_type:
+            return source_candidate.collection_type
+    return "-"
+
+
+def _is_tanker_waste_note(waste_note: WasteTransferNoteDocument) -> bool:
+    """Return True when the saved WTN represents a tanker run."""
+
+    return any(
+        "tanker" in source_candidate.collection_type.casefold()
+        for source_candidate in waste_note.source_conflict_candidates
+    )
+
+
+def _get_waste_note_conflict_lookup_key(waste_note: WasteTransferNoteDocument) -> tuple[str, str]:
+    """Return the key used to match a saved WTN to one source-conflict entry."""
+
+    if _is_tanker_waste_note(waste_note):
+        return (waste_note.wtn_number, waste_note.date.isoformat())
+    return (waste_note.wtn_number, "")
+
+
+def _build_waste_source_conflict_lookup(
+    waste_notes: List[WasteTransferNoteDocument],
+    waste_source_conflicts: List[Any],
+) -> Dict[tuple[str, str], Any]:
+    """Return a lookup that handles repeated tanker ticket numbers safely."""
+
+    lookup: Dict[tuple[str, str], Any] = {}
+    note_keys = {
+        _get_waste_note_conflict_lookup_key(waste_note)
+        for waste_note in waste_notes
+    }
+    for source_conflict in waste_source_conflicts:
+        collection_type = source_conflict.canonical_source.scanned_note.collection_type
+        conflict_key = (
+            source_conflict.wtn_number,
+            source_conflict.canonical_source.scanned_note.ticket_date.isoformat()
+            if "tanker" in collection_type.casefold()
+            else "",
+        )
+        if conflict_key in note_keys:
+            lookup[conflict_key] = source_conflict
+            continue
+        if (source_conflict.wtn_number, "") in note_keys:
+            lookup[(source_conflict.wtn_number, "")] = source_conflict
+    return lookup
+
+
+def _get_waste_source_conflict_for_note(
+    waste_note: WasteTransferNoteDocument,
+    waste_source_conflict_lookup: Dict[Any, Any],
+) -> Optional[Any]:
+    """Return the matching source conflict for one saved waste note."""
+
+    return waste_source_conflict_lookup.get(
+        _get_waste_note_conflict_lookup_key(waste_note)
+    ) or waste_source_conflict_lookup.get(waste_note.wtn_number)
+
+
+def _get_waste_note_quality_status(
+    waste_note: WasteTransferNoteDocument,
+    *,
+    waste_source_conflict_lookup: Dict[tuple[str, str], Any],
+) -> str:
+    """Return the register QA label for one waste note."""
+
+    if _get_waste_source_conflict_for_note(
+        waste_note,
+        waste_source_conflict_lookup,
+    ) is not None:
+        return "Source Conflict"
+    if waste_note.quantity_tonnes <= 0:
+        return "Needs Review"
+    return "Ready"
 
 
 def _format_waste_register_reference_for_ui(
@@ -12468,8 +14710,37 @@ def _open_induction_print_pack(induction: InductionDocument) -> int:
 def _get_file_1_waste_note_source_path(
     repository: DocumentRepository,
     waste_note: WasteTransferNoteDocument,
+    *,
+    source_conflict_lookup: Optional[Dict[tuple[str, str], Any]] = None,
 ) -> Optional[Path]:
     """Return the physical filed PDF linked to one File 1 WTN."""
+
+    if waste_note.canonical_source_path:
+        canonical_source_path = Path(waste_note.canonical_source_path)
+        if canonical_source_path.exists():
+            return canonical_source_path
+
+    if source_conflict_lookup is not None:
+        source_conflict = _get_waste_source_conflict_for_note(
+            waste_note,
+            source_conflict_lookup,
+        )
+        if source_conflict is not None:
+            return source_conflict.canonical_source.source_path
+    else:
+        source_conflicts = _get_cached_file_1_waste_source_conflicts(
+            site_name=waste_note.site_name,
+            repository=repository,
+        )
+        for source_conflict in source_conflicts:
+            if source_conflict.wtn_number != waste_note.wtn_number:
+                continue
+            if (
+                "tanker" in source_conflict.canonical_source.scanned_note.collection_type.casefold()
+                and source_conflict.canonical_source.scanned_note.ticket_date != waste_note.date
+            ):
+                continue
+            return source_conflict.canonical_source.source_path
 
     indexed_files = repository.list_indexed_files(related_doc_id=waste_note.doc_id)
     for indexed_file in indexed_files:

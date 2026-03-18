@@ -192,6 +192,7 @@ COMMON_CONSTRUCTION_EWC_CODES: FrozenSet[str] = frozenset(
         "17 08 02",
         "17 09 03*",
         "17 09 04",
+        "20 03 04",
         "20 01 21*",
         "20 01 35*",
     }
@@ -3087,6 +3088,79 @@ class CarrierComplianceDocument(BaseDocument):
 
 
 @dataclass
+class WasteTransferNoteSourceSnapshot:
+    """Persisted summary of one physical WTN source file."""
+
+    source_path: str
+    source_file_name: str
+    ticket_date: date
+    collection_type: str = ""
+    quantity_tonnes: Optional[float] = None
+    carrier_name: str = ""
+    vehicle_registration: str = ""
+    waste_description: str = ""
+    ewc_code: str = ""
+    destination_facility: str = ""
+
+    def __post_init__(self) -> None:
+        self.source_path = _normalise_optional_text(self.source_path, "source_path")
+        self.source_file_name = _require_text(self.source_file_name, "source_file_name")
+        self.ticket_date = _coerce_date(self.ticket_date, "ticket_date")
+        self.collection_type = _normalise_optional_text(
+            self.collection_type,
+            "collection_type",
+        )
+        if self.quantity_tonnes in ("", None):
+            self.quantity_tonnes = None
+        else:
+            self.quantity_tonnes = _coerce_non_negative_float(
+                self.quantity_tonnes,
+                "quantity_tonnes",
+            )
+        self.carrier_name = _normalise_optional_text(
+            self.carrier_name,
+            "carrier_name",
+        )
+        self.vehicle_registration = _normalise_optional_text(
+            self.vehicle_registration,
+            "vehicle_registration",
+        )
+        self.waste_description = _normalise_optional_text(
+            self.waste_description,
+            "waste_description",
+        )
+        self.ewc_code = _normalise_optional_text(self.ewc_code, "ewc_code")
+        self.destination_facility = _normalise_optional_text(
+            self.destination_facility,
+            "destination_facility",
+        )
+
+    @classmethod
+    def from_storage_dict(
+        cls,
+        data: Mapping[str, Any],
+    ) -> "WasteTransferNoteSourceSnapshot":
+        """Rehydrate one persisted waste source snapshot."""
+
+        return cls(
+            source_path=str(data.get("source_path") or "").strip(),
+            source_file_name=str(
+                data.get("source_file_name")
+                or Path(str(data.get("source_path") or "")).name
+                or "Unknown source"
+            ).strip(),
+            ticket_date=_coerce_date(data.get("ticket_date"), "ticket_date"),
+            collection_type=str(data.get("collection_type") or "").strip(),
+            quantity_tonnes=data.get("quantity_tonnes"),
+            carrier_name=str(data.get("carrier_name") or "").strip(),
+            vehicle_registration=str(data.get("vehicle_registration") or "").strip(),
+            waste_description=str(data.get("waste_description") or "").strip(),
+            ewc_code=str(data.get("ewc_code") or "").strip(),
+            destination_facility=str(data.get("destination_facility") or "").strip(),
+        )
+
+
+@dataclass
 class WasteTransferNoteDocument(BaseDocument):
     """Typed File 1 waste transfer note for environmental compliance."""
 
@@ -3100,6 +3174,9 @@ class WasteTransferNoteDocument(BaseDocument):
     carrier_name: str
     destination_facility: str
     vehicle_registration: str = ""
+    source_file_override_path: str = ""
+    canonical_source_path: str = ""
+    source_conflict_candidates: List[WasteTransferNoteSourceSnapshot] = field(default_factory=list)
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
     verification_notes: str = ""
 
@@ -3138,6 +3215,20 @@ class WasteTransferNoteDocument(BaseDocument):
             self.vehicle_registration,
             "vehicle_registration",
         )
+        self.source_file_override_path = _normalise_optional_text(
+            self.source_file_override_path,
+            "source_file_override_path",
+        )
+        self.canonical_source_path = _normalise_optional_text(
+            self.canonical_source_path,
+            "canonical_source_path",
+        )
+        self.source_conflict_candidates = [
+            source_candidate
+            if isinstance(source_candidate, WasteTransferNoteSourceSnapshot)
+            else WasteTransferNoteSourceSnapshot.from_storage_dict(source_candidate)
+            for source_candidate in self.source_conflict_candidates
+        ]
         self.destination_facility = _require_text(
             self.destination_facility,
             "destination_facility",
@@ -3197,6 +3288,14 @@ class WasteTransferNoteDocument(BaseDocument):
             "quantity_tonnes",
         )
         payload["vehicle_registration"] = payload.get("vehicle_registration", "")
+        payload["source_file_override_path"] = payload.get("source_file_override_path", "")
+        payload["canonical_source_path"] = payload.get("canonical_source_path", "")
+        payload["source_conflict_candidates"] = [
+            source_candidate
+            if isinstance(source_candidate, WasteTransferNoteSourceSnapshot)
+            else WasteTransferNoteSourceSnapshot.from_storage_dict(source_candidate)
+            for source_candidate in payload.get("source_conflict_candidates", [])
+        ]
         payload["verification_status"] = _coerce_verification_status(
             payload.get("verification_status", VerificationStatus.UNVERIFIED.value)
         )

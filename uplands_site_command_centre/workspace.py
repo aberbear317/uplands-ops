@@ -23,7 +23,7 @@ import tempfile
 import time as time_module
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlparse, urlunparse
 from urllib.request import urlopen
 import zipfile
 
@@ -61,6 +61,7 @@ from uplands_site_command_centre.permits.models import (
     WeeklySiteCheckRowDefinition,
     WasteRegister,
     WasteTransferNoteDocument,
+    WasteTransferNoteSourceSnapshot,
     get_weekly_site_check_frequency_for_row,
 )
 from uplands_site_command_centre.permits.repository import (
@@ -74,7 +75,7 @@ from uplands_site_command_centre.permits.template_manager import (
 )
 
 
-ABUCS_PDF_PATTERN = re.compile(r"^\d+\.pdf$", re.IGNORECASE)
+ABUCS_PDF_PATTERN = re.compile(r"^\d+(?:-\d+)?\.pdf$", re.IGNORECASE)
 TEMPLATE_TAG_PATTERN = re.compile(r"{{\s*([a-zA-Z0-9_\.]+)\s*}}")
 DATE_VALUE_PATTERN = (
     r"(?:\d{1,2}[./-]+\d{1,2}[./-]+\d{2,4}|"
@@ -188,13 +189,32 @@ LOVEDEAN_SITE_LONGITUDE = -1.036
 DEFAULT_WASTE_CARRIER_NAME = "Abucs"
 DEFAULT_WASTE_DESCRIPTION = "Mixed Construction"
 DEFAULT_EWC_CODE = "17 09 04"
+DEFAULT_FOUL_WASTE_DESCRIPTION = "Cess Pit / Foul Waste"
+DEFAULT_FOUL_WASTE_EWC_CODE = "20 03 04"
 DEFAULT_DESTINATION_FACILITY = "Not captured from ticket PDF"
 WASTE_TYPE_PATTERN = re.compile(
     r"\bwaste\s+type[:\s]*(?P<description>.+?)\s+"
     r"(?:customer|payment\s+type|total|i\s+confirm|print|sign)\b",
     re.IGNORECASE,
 )
+WASTE_COLLECTION_TYPE_PATTERN = re.compile(
+    r"\bskip\s+type\s*(?P<value>.+?)\s+"
+    r"(?:wastetruck|notes|movement\s+type|waste\s+type|customer|payment\s+type|account|total)\b",
+    re.IGNORECASE,
+)
 EWC_CODE_PATTERN = re.compile(r"\b\d{2}\s?\d{2}\s?\d{2}\*?\b")
+FOUL_WASTE_KEYWORDS = (
+    "cess pit",
+    "cesspit",
+    "foul",
+    "foul water",
+    "foul waste",
+    "septic",
+    "septic tank",
+    "sludge",
+    "effluent",
+    "tanker",
+)
 VEHICLE_REG_PRIORITY_PATTERNS = (
     re.compile(
         r"\b(?:vehicle\s+reg(?:istration)?|reg(?:istration)?\s+no\.?|vrm)\s*(?::|-)?\s*"
@@ -590,12 +610,39 @@ class SmartScannedWasteTransferNote:
     wtn_number: str
     carrier_name: str
     vehicle_registration: str
+    collection_type: str
     waste_description: str
     ticket_date: date
     quantity_tonnes: Optional[float]
     ewc_code: str
     destination_facility: str
     extracted_text: str
+
+
+@dataclass(frozen=True)
+class WasteTransferNoteSourceCandidate:
+    """One physical waste-ticket source file evaluated for a WTN."""
+
+    source_path: Path
+    scanned_note: SmartScannedWasteTransferNote
+    site_name: str
+    source_mtime: float
+
+
+@dataclass(frozen=True)
+class WasteTransferNoteSourceConflict:
+    """A WTN that has more than one physical source file on disk."""
+
+    wtn_number: str
+    site_name: str
+    canonical_source: WasteTransferNoteSourceCandidate
+    source_candidates: List[WasteTransferNoteSourceCandidate]
+
+    @property
+    def duplicate_count(self) -> int:
+        """Return the number of competing physical source files."""
+
+        return len(self.source_candidates)
 
 
 @dataclass(frozen=True)
@@ -714,6 +761,89 @@ class MessagesDraftLaunchResult:
     chunk_count: int
     launched_successfully: bool
     error_message: str = ""
+
+
+def _launch_messages_group_draft_via_gui_automation(
+    mobile_numbers: Iterable[str],
+    *,
+    message: str = "",
+) -> Tuple[bool, str]:
+    """Try to open one grouped Messages draft via macOS UI automation."""
+
+    resolved_numbers = _deduplicate_mobile_numbers(mobile_numbers)
+    if len(resolved_numbers) < 2:
+        return False, "A grouped Messages draft needs at least two recipients."
+
+    applescript_source = """
+on run argv
+    if (count of argv) < 2 then error "Expected a message followed by one or more recipients."
+    set messageBody to item 1 of argv
+    set recipientList to items 2 thru -1 of argv
+
+    tell application "Messages"
+        activate
+    end tell
+
+    delay 0.6
+
+    tell application "System Events"
+        tell process "Messages"
+            keystroke "n" using command down
+            delay 0.8
+
+            repeat with targetRecipient in recipientList
+                set the clipboard to (targetRecipient as text)
+                keystroke "v" using command down
+                delay 0.2
+                key code 36
+                delay 0.45
+            end repeat
+
+            key code 48
+            delay 0.35
+
+            if (messageBody as text) is not "" then
+                set the clipboard to (messageBody as text)
+                keystroke "v" using command down
+            end if
+        end tell
+    end tell
+
+    return "ok"
+end run
+""".strip()
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".applescript",
+        encoding="utf-8",
+        delete=False,
+    ) as script_file:
+        script_file.write(applescript_source)
+        script_path = Path(script_file.name)
+
+    try:
+        launch_result = subprocess.run(
+            ["osascript", str(script_path), message.strip(), *resolved_numbers],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        try:
+            script_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    if launch_result.returncode == 0:
+        return True, ""
+
+    launch_error = (
+        launch_result.stderr.strip()
+        or launch_result.stdout.strip()
+        or "Grouped Messages draft automation failed."
+    )
+    return False, launch_error
 
 
 @dataclass(frozen=True)
@@ -920,7 +1050,9 @@ def load_app_settings() -> Dict[str, Any]:
         }
 
     return {
-        "public_tunnel_url": str(payload.get("public_tunnel_url") or "").strip(),
+        "public_tunnel_url": normalize_public_app_url(
+            str(payload.get("public_tunnel_url") or "").strip()
+        ),
         "broadcast_message_history_by_site": _normalise_site_history_payload(
             payload.get("broadcast_message_history_by_site")
         ),
@@ -942,9 +1074,11 @@ def save_app_settings(
 
     existing_settings = load_app_settings()
     resolved_public_tunnel_url = (
-        str(public_tunnel_url).strip()
+        normalize_public_app_url(str(public_tunnel_url).strip())
         if public_tunnel_url is not None
-        else str(existing_settings.get("public_tunnel_url") or "").strip()
+        else normalize_public_app_url(
+            str(existing_settings.get("public_tunnel_url") or "").strip()
+        )
     )
     resolved_broadcast_history = (
         _normalise_site_history_payload(broadcast_message_history_by_site)
@@ -1188,6 +1322,34 @@ def get_site_induction_url(*, port: int = 8501) -> str:
     return build_site_induction_url(port=port)
 
 
+def normalize_public_app_url(public_url: str, *, port: int = 8501) -> str:
+    """Return the real app URL when a saved tunnel URL points at a component iframe."""
+
+    cleaned_public_url = str(public_url or "").strip()
+    if not cleaned_public_url:
+        return ""
+    if "://" not in cleaned_public_url:
+        cleaned_public_url = f"https://{cleaned_public_url}"
+
+    parsed_url = urlparse(cleaned_public_url)
+    streamlit_targets = parse_qs(parsed_url.query).get("streamlitUrl", [])
+    if streamlit_targets:
+        return normalize_public_app_url(streamlit_targets[0], port=port)
+
+    normalized_path = parsed_url.path or "/"
+    if normalized_path.startswith("/component/"):
+        normalized_path = "/"
+
+    rebuilt_url = parsed_url._replace(
+        path=normalized_path,
+        params="",
+        query="",
+        fragment="",
+    )
+    normalized_url = urlunparse(rebuilt_url).strip()
+    return normalized_url[:-1] if normalized_url.endswith("/") else normalized_url
+
+
 def build_site_induction_url(
     *,
     public_url: str = "",
@@ -1196,9 +1358,7 @@ def build_site_induction_url(
 ) -> str:
     """Return the best available induction URL for manager or kiosk use."""
 
-    cleaned_public_url = public_url.strip()
-    if cleaned_public_url and "://" not in cleaned_public_url:
-        cleaned_public_url = f"https://{cleaned_public_url}"
+    cleaned_public_url = normalize_public_app_url(public_url, port=port)
 
     if cleaned_public_url:
         parsed_url = urlparse(cleaned_public_url)
@@ -1228,9 +1388,7 @@ def build_toolbox_talk_url(
 ) -> str:
     """Return the remote mobile UHSF16.2 signing link for one toolbox talk topic."""
 
-    cleaned_public_url = public_url.strip()
-    if cleaned_public_url and "://" not in cleaned_public_url:
-        cleaned_public_url = f"https://{cleaned_public_url}"
+    cleaned_public_url = normalize_public_app_url(public_url, port=port)
 
     if cleaned_public_url:
         parsed_url = urlparse(cleaned_public_url)
@@ -1247,6 +1405,31 @@ def build_toolbox_talk_url(
     rebuilt_url = parsed_url._replace(
         path=normalized_path,
         query=urlencode(query_items),
+    )
+    return urlunparse(rebuilt_url)
+
+
+def build_toolbox_talk_document_view_url(
+    toolbox_talk_doc_id: str,
+    *,
+    public_url: str = "",
+    port: int = 8501,
+) -> str:
+    """Return one public browser preview URL for an uploaded toolbox talk document."""
+
+    resolved_doc_id = str(toolbox_talk_doc_id or "").strip()
+    if not resolved_doc_id:
+        return ""
+
+    cleaned_public_url = normalize_public_app_url(public_url, port=port)
+    if cleaned_public_url:
+        parsed_url = urlparse(cleaned_public_url)
+    else:
+        parsed_url = urlparse(f"http://{get_local_ip_address()}:{port}/")
+
+    rebuilt_url = parsed_url._replace(
+        path="/gps/tbt-preview",
+        query=urlencode({"doc_id": resolved_doc_id}),
     )
     return urlunparse(rebuilt_url)
 
@@ -1752,10 +1935,19 @@ def smart_scan_waste_transfer_note(
         vehicle_registration = _extract_vehicle_registration(normalized_text)
         wtn_number = _derive_waste_transfer_note_number(source_path, normalized_text)
 
+    if ABUCS_PDF_PATTERN.match(source_path.name):
+        duplicate_filename_match = re.fullmatch(r"(\d+)-\d+", source_path.stem)
+        if (
+            duplicate_filename_match is not None
+            and wtn_number.strip().casefold() == source_path.stem.casefold()
+        ):
+            wtn_number = duplicate_filename_match.group(1)
+
     if ABUCS_PDF_PATTERN.match(source_path.name) and (
         not carrier_name or carrier_name.isdigit()
     ):
         carrier_name = DEFAULT_WASTE_CARRIER_NAME
+    collection_type = _extract_waste_collection_type(normalized_text)
     waste_description = _extract_waste_description(normalized_text)
     ewc_code = _extract_ewc_code(normalized_text)
     ticket_date = _extract_waste_ticket_date(normalized_text) or date.today()
@@ -1765,6 +1957,7 @@ def smart_scan_waste_transfer_note(
         wtn_number=wtn_number,
         carrier_name=carrier_name,
         vehicle_registration=vehicle_registration,
+        collection_type=collection_type,
         waste_description=waste_description,
         ticket_date=ticket_date,
         quantity_tonnes=quantity_tonnes,
@@ -1876,6 +2069,9 @@ def update_logged_waste_transfer_note(
         carrier_name=carrier_name.strip() or source_document.carrier_name,
         destination_facility=destination_facility.strip() or source_document.destination_facility,
         vehicle_registration=vehicle_registration.strip(),
+        source_file_override_path=source_document.source_file_override_path,
+        canonical_source_path=source_document.canonical_source_path,
+        source_conflict_candidates=source_document.source_conflict_candidates,
     )
     repository.save(refreshed_waste_transfer_note)
     register_document = _upsert_site_waste_register(
@@ -2089,7 +2285,7 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
             repository.index_file(
                 file_name=destination_path.name,
                 file_path=destination_path,
-                file_category="abucs_pdf",
+                file_category=_classify_waste_ticket_file(destination_path),
                 file_group=FileGroup.FILE_1,
                 site_name=(
                     waste_transfer_note.site_name
@@ -2106,7 +2302,7 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
                 FiledAsset(
                     original_path=source_path,
                     destination_path=destination_path,
-                    file_category="abucs_pdf",
+                    file_category=_classify_waste_ticket_file(destination_path),
                     related_doc_id=(
                         waste_transfer_note.doc_id
                         if waste_transfer_note is not None
@@ -2118,6 +2314,64 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
 
         if source_path.suffix.lower() in FILE_3_SAFETY_SOURCE_SUFFIXES:
             source_text = _safe_extract_safety_source_text(source_path)
+            if source_path.suffix.lower() == ".pdf" and _looks_like_waste_ticket_source(
+                source_path,
+                source_text,
+            ):
+                destination_path = _move_file(source_path, waste_destination)
+                waste_transfer_note = _upsert_waste_transfer_note_document(
+                    repository,
+                    destination_path,
+                )
+                repository.index_file(
+                    file_name=destination_path.name,
+                    file_path=destination_path,
+                    file_category="waste_ticket_pdf",
+                    file_group=FileGroup.FILE_1,
+                    site_name=(
+                        waste_transfer_note.site_name
+                        if waste_transfer_note is not None
+                        else None
+                    ),
+                    related_doc_id=(
+                        waste_transfer_note.doc_id
+                        if waste_transfer_note is not None
+                        else None
+                    ),
+                )
+                filed_assets.append(
+                    FiledAsset(
+                        original_path=source_path,
+                        destination_path=destination_path,
+                        file_category="waste_ticket_pdf",
+                        related_doc_id=(
+                            waste_transfer_note.doc_id
+                            if waste_transfer_note is not None
+                            else None
+                        ),
+                    )
+                )
+                continue
+
+            if source_path.suffix.lower() in {".doc", ".docx"} and _looks_like_waste_support_document(
+                source_text
+            ):
+                destination_path = _move_file(source_path, waste_reports_destination)
+                repository.index_file(
+                    file_name=destination_path.name,
+                    file_path=destination_path,
+                    file_category="waste_report_word",
+                    file_group=FileGroup.FILE_1,
+                )
+                filed_assets.append(
+                    FiledAsset(
+                        original_path=source_path,
+                        destination_path=destination_path,
+                        file_category="waste_report_word",
+                    )
+                )
+                continue
+
             if _is_coshh_safety_source(source_path, source_text):
                 destination_path = _move_file(source_path, coshh_destination)
                 coshh_document = _upsert_coshh_document_from_source(
@@ -4743,10 +4997,23 @@ def create_site_induction_document(
     created_at = datetime.now().replace(second=0, microsecond=0)
     cleaned_full_name = full_name.strip()
     cleaned_company = company.strip()
+    cleaned_home_address = home_address.strip()
+    cleaned_contact_number = contact_number.strip()
     if not cleaned_full_name:
         raise ValidationError("Full Name is required.")
     if not cleaned_company:
         raise ValidationError("Company is required.")
+    if not cleaned_home_address:
+        raise ValidationError("Home Address is required.")
+    if not cleaned_contact_number:
+        raise ValidationError("Contact Number is required.")
+    manual_handling_uploaded = any(
+        str(uploaded_file.get("label", "") or "").strip().casefold()
+        == "manual handling certificate"
+        for uploaded_file in (competency_files or [])
+    )
+    if not manual_handling_uploaded:
+        raise ValidationError("Manual Handling Certificate upload is required.")
 
     repository.create_schema()
     config.FILE_3_COMPETENCY_CARDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -4773,8 +5040,8 @@ def create_site_induction_document(
         contractor_name=cleaned_company,
         individual_name=cleaned_full_name,
         linked_rams_doc_id=linked_rams_doc_id.strip(),
-        home_address=home_address.strip(),
-        contact_number=contact_number.strip(),
+        home_address=cleaned_home_address,
+        contact_number=cleaned_contact_number,
         occupation=occupation.strip(),
         emergency_contact=emergency_contact.strip(),
         emergency_tel=emergency_tel.strip(),
@@ -4811,6 +5078,76 @@ def create_site_induction_document(
         config.FILE_3_COMPLETED_INDUCTIONS_DIR,
     )
 
+    _render_site_induction_docx(
+        induction_document,
+        output_path=output_path,
+        signature_path=signature_path,
+    )
+
+    induction_document.completed_document_path = str(output_path)
+    repository.save(induction_document)
+    repository.index_file(
+        file_name=signature_path.name,
+        file_path=signature_path,
+        file_category="induction_signature_png",
+        file_group=FileGroup.FILE_3,
+        site_name=induction_document.site_name,
+        related_doc_id=induction_document.doc_id,
+    )
+    for competency_card_path in saved_competency_card_paths:
+        repository.index_file(
+            file_name=competency_card_path.name,
+            file_path=competency_card_path,
+            file_category="competency_card_upload",
+            file_group=FileGroup.FILE_3,
+            site_name=induction_document.site_name,
+            related_doc_id=induction_document.doc_id,
+        )
+    repository.index_file(
+        file_name=output_path.name,
+        file_path=output_path,
+        file_category="completed_induction_docx",
+        file_group=FileGroup.FILE_3,
+        site_name=induction_document.site_name,
+        related_doc_id=induction_document.doc_id,
+    )
+    return GeneratedInductionDocument(
+        induction_document=induction_document,
+        output_path=output_path,
+        signature_path=signature_path,
+    )
+
+
+def _render_site_induction_docx(
+    induction_document: InductionDocument,
+    *,
+    output_path: Path,
+    signature_path: Path,
+) -> None:
+    """Render one completed site induction DOCX from the official template."""
+
+    try:
+        from docxtpl import DocxTemplate, InlineImage
+    except ImportError as exc:
+        raise RuntimeError(
+            "docxtpl is required to generate the completed induction document."
+        ) from exc
+    try:
+        from docx.shared import Mm
+    except ImportError as exc:
+        raise RuntimeError(
+            "python-docx is required to size the induction signature image."
+        ) from exc
+    try:
+        from jinja2 import Environment
+    except ImportError as exc:
+        raise RuntimeError(
+            "jinja2 is required to generate the completed induction document."
+        ) from exc
+
+    template_path = TemplateRegistry.resolve_template_path("site_induction")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         repaired_template_path = Path(temp_dir) / "site-induction-template.docx"
         _build_patched_docxtpl_template(template_path, repaired_template_path)
@@ -4829,9 +5166,9 @@ def create_site_induction_document(
         template_context = induction_document.to_template_context()
         template_context.update(
             {
-                "date": created_at.strftime("%d/%m/%Y"),
-                "induction_date": created_at.strftime("%d/%m/%Y"),
-                "today_date": created_at.strftime("%d/%m/%Y"),
+                "date": induction_document.created_at.strftime("%d/%m/%Y"),
+                "induction_date": induction_document.created_at.strftime("%d/%m/%Y"),
+                "today_date": induction_document.created_at.strftime("%d/%m/%Y"),
                 "home_address": induction_document.home_address,
                 "company": induction_document.contractor_name,
                 "cscs_expiry": (
@@ -4886,38 +5223,200 @@ def create_site_induction_document(
         )
         document_template.save(output_path)
 
-    induction_document.completed_document_path = str(output_path)
-    repository.save(induction_document)
+
+def update_site_induction_document(
+    repository: DocumentRepository,
+    *,
+    induction_doc_id: str,
+    full_name: str,
+    home_address: str,
+    contact_number: str,
+    company: str,
+    occupation: str,
+    emergency_contact: str,
+    emergency_tel: str,
+    medical: str,
+    cscs_number: str,
+    cscs_expiry: Optional[date] = None,
+    asbestos_cert: bool = False,
+    erect_scaffold: bool = False,
+    cisrs_no: str = "",
+    cisrs_expiry: Optional[date] = None,
+    operate_plant: bool = False,
+    cpcs_no: str = "",
+    cpcs_expiry: Optional[date] = None,
+    client_training_desc: str = "",
+    client_training_date: Optional[date] = None,
+    client_training_expiry: Optional[date] = None,
+    first_aider: bool = False,
+    fire_warden: bool = False,
+    supervisor: bool = False,
+    smsts: bool = False,
+    competency_expiry_date: Optional[date] = None,
+) -> GeneratedInductionDocument:
+    """Update one saved induction record and regenerate its completed DOCX."""
+
+    repository.create_schema()
+    existing_document = repository.get(induction_doc_id)
+    if not isinstance(existing_document, InductionDocument):
+        raise ValidationError("Selected induction record is not a UHSF16.01 entry.")
+
+    updated_induction_document = replace(
+        existing_document,
+        contractor_name=company.strip(),
+        individual_name=full_name.strip(),
+        home_address=home_address.strip(),
+        contact_number=contact_number.strip(),
+        occupation=occupation.strip(),
+        emergency_contact=emergency_contact.strip(),
+        emergency_tel=emergency_tel.strip(),
+        medical=medical.strip(),
+        cscs_number=cscs_number.strip(),
+        cscs_expiry=cscs_expiry,
+        asbestos_cert=bool(asbestos_cert),
+        erect_scaffold=bool(erect_scaffold),
+        cisrs_no=cisrs_no.strip(),
+        cisrs_expiry=cisrs_expiry,
+        operate_plant=bool(operate_plant),
+        cpcs_no=cpcs_no.strip(),
+        cpcs_expiry=cpcs_expiry,
+        client_training_desc=client_training_desc.strip(),
+        client_training_date=client_training_date,
+        client_training_expiry=client_training_expiry,
+        first_aider=bool(first_aider),
+        fire_warden=bool(fire_warden),
+        supervisor=bool(supervisor),
+        smsts=bool(smsts),
+        competency_expiry_date=competency_expiry_date,
+    )
+
+    if not updated_induction_document.individual_name:
+        raise ValidationError("Full Name is required.")
+    if not updated_induction_document.contractor_name:
+        raise ValidationError("Company is required.")
+    if not updated_induction_document.home_address:
+        raise ValidationError("Home Address is required.")
+    if not updated_induction_document.contact_number:
+        raise ValidationError("Contact Number is required.")
+
+    signature_path = Path(updated_induction_document.signature_image_path).expanduser()
+    if not updated_induction_document.signature_image_path or not signature_path.exists():
+        raise ValidationError(
+            "The saved induction signature file is missing, so the induction document cannot be regenerated."
+        )
+
+    output_path = (
+        Path(updated_induction_document.completed_document_path).expanduser()
+        if updated_induction_document.completed_document_path
+        else _build_available_destination(
+            Path(
+                "Induction - "
+                f"{_sanitize_filename_fragment(updated_induction_document.individual_name)} - "
+                f"{_sanitize_filename_fragment(updated_induction_document.contractor_name)} - "
+                f"{updated_induction_document.created_at:%Y-%m-%d}.docx"
+            ),
+            config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+        )
+    )
+    _render_site_induction_docx(
+        updated_induction_document,
+        output_path=output_path,
+        signature_path=signature_path,
+    )
+
+    updated_induction_document.completed_document_path = str(output_path)
+    repository.save(updated_induction_document)
+    repository.index_file(
+        file_name=output_path.name,
+        file_path=output_path,
+        file_category="completed_induction_docx",
+        file_group=FileGroup.FILE_3,
+        site_name=updated_induction_document.site_name,
+        related_doc_id=updated_induction_document.doc_id,
+    )
     repository.index_file(
         file_name=signature_path.name,
         file_path=signature_path,
         file_category="induction_signature_png",
         file_group=FileGroup.FILE_3,
-        site_name=induction_document.site_name,
-        related_doc_id=induction_document.doc_id,
+        site_name=updated_induction_document.site_name,
+        related_doc_id=updated_induction_document.doc_id,
     )
+    for path_text in updated_induction_document.competency_card_paths.split(","):
+        if not path_text.strip():
+            continue
+        competency_path = Path(path_text.strip()).expanduser()
+        if not competency_path.exists():
+            continue
+        repository.index_file(
+            file_name=competency_path.name,
+            file_path=competency_path,
+            file_category="competency_card_upload",
+            file_group=FileGroup.FILE_3,
+            site_name=updated_induction_document.site_name,
+            related_doc_id=updated_induction_document.doc_id,
+        )
+    return GeneratedInductionDocument(
+        induction_document=updated_induction_document,
+        output_path=output_path,
+        signature_path=signature_path,
+    )
+
+
+def add_site_induction_evidence_files(
+    repository: DocumentRepository,
+    *,
+    induction_doc_id: str,
+    competency_files: List[Mapping[str, Any]],
+) -> InductionDocument:
+    """Append extra evidence files onto one saved induction record."""
+
+    repository.create_schema()
+    existing_document = repository.get(induction_doc_id)
+    if not isinstance(existing_document, InductionDocument):
+        raise ValidationError("Selected induction record is not a UHSF16.01 entry.")
+
+    cleaned_competency_files = [
+        uploaded_file
+        for uploaded_file in competency_files
+        if str(uploaded_file.get("name", "") or "").strip()
+        and uploaded_file.get("bytes", b"")
+    ]
+    if not cleaned_competency_files:
+        raise ValidationError("Select at least one evidence file to add.")
+
+    created_at = datetime.now().replace(second=0, microsecond=0)
+    saved_competency_card_paths = _save_induction_competency_cards(
+        competency_files=cleaned_competency_files,
+        full_name=existing_document.individual_name,
+        company=existing_document.contractor_name,
+        created_at=created_at,
+    )
+    if not saved_competency_card_paths:
+        raise ValidationError("No valid evidence files were uploaded.")
+
+    existing_paths = [
+        path_text.strip()
+        for path_text in existing_document.competency_card_paths.split(",")
+        if path_text.strip()
+    ]
+    updated_induction_document = replace(
+        existing_document,
+        competency_card_paths=",".join(
+            [*existing_paths, *[str(path) for path in saved_competency_card_paths]]
+        ),
+    )
+    repository.save(updated_induction_document)
     for competency_card_path in saved_competency_card_paths:
         repository.index_file(
             file_name=competency_card_path.name,
             file_path=competency_card_path,
             file_category="competency_card_upload",
             file_group=FileGroup.FILE_3,
-            site_name=induction_document.site_name,
-            related_doc_id=induction_document.doc_id,
+            site_name=updated_induction_document.site_name,
+            related_doc_id=updated_induction_document.doc_id,
         )
-    repository.index_file(
-        file_name=output_path.name,
-        file_path=output_path,
-        file_category="completed_induction_docx",
-        file_group=FileGroup.FILE_3,
-        site_name=induction_document.site_name,
-        related_doc_id=induction_document.doc_id,
-    )
-    return GeneratedInductionDocument(
-        induction_document=induction_document,
-        output_path=output_path,
-        signature_path=signature_path,
-    )
+    return updated_induction_document
 
 
 def list_daily_attendance_entries(
@@ -5155,7 +5654,13 @@ def launch_messages_sms_broadcast(
     max_recipients_per_chunk: int = 24,
     max_url_length: int = 1800,
 ) -> MessagesDraftLaunchResult:
-    """Open one or more ready-to-send SMS drafts in the local Messages app."""
+    """Open one ready-to-send Messages draft per recipient.
+
+    macOS Messages has proved unreliable when opened with one ``sms:`` deep link
+    containing multiple recipients. In practice that can silently drop all but
+    the first number. For gate-critical broadcasts we prefer a slightly noisier
+    but deterministic path: open one draft per resolved recipient.
+    """
 
     resolved_numbers = _deduplicate_mobile_numbers(mobile_numbers)
     if not resolved_numbers:
@@ -5167,12 +5672,11 @@ def launch_messages_sms_broadcast(
             error_message="No valid mobile numbers were supplied.",
         )
 
-    draft_links = build_site_alert_sms_links(
-        resolved_numbers,
-        message=message,
-        max_recipients_per_chunk=max_recipients_per_chunk,
-        max_url_length=max_url_length,
-    )
+    # Keep one-recipient drafts for launch reliability inside Messages.
+    draft_links = [
+        _build_sms_link([mobile_number], message=message)
+        for mobile_number in resolved_numbers
+    ]
     if not draft_links:
         return MessagesDraftLaunchResult(
             draft_links=[],
@@ -5201,6 +5705,22 @@ def launch_messages_sms_broadcast(
             ),
         )
 
+    if len(resolved_numbers) > 1:
+        grouped_launch_successful, grouped_launch_error = (
+            _launch_messages_group_draft_via_gui_automation(
+                resolved_numbers,
+                message=message,
+            )
+        )
+        if grouped_launch_successful:
+            return MessagesDraftLaunchResult(
+                draft_links=[_build_sms_link(resolved_numbers, message=message)],
+                recipient_count=len(resolved_numbers),
+                chunk_count=1,
+                launched_successfully=True,
+                error_message="Opened one grouped Messages draft for the live audience.",
+            )
+
     launch_error_message = ""
     launched_successfully = True
     for draft_link_index, draft_link in enumerate(draft_links):
@@ -5220,6 +5740,13 @@ def launch_messages_sms_broadcast(
             break
         if draft_link_index < len(draft_links) - 1:
             time_module.sleep(0.25)
+
+    if launched_successfully and len(resolved_numbers) > 1 and grouped_launch_error:
+        launch_error_message = (
+            "Messages group compose was unavailable on this Mac, so the app opened "
+            "one draft per recipient instead. "
+            f"{grouped_launch_error}"
+        )
 
     return MessagesDraftLaunchResult(
         draft_links=draft_links,
@@ -5753,6 +6280,90 @@ def complete_daily_attendance_sign_out(
         attendance_entry=attendance_entry,
         signature_path=signature_path,
     )
+
+
+def _delete_attendance_file_if_present(
+    repository: DocumentRepository,
+    file_path_text: str,
+) -> None:
+    """Delete one attendance-linked file and its index row when it still exists."""
+
+    resolved_path_text = str(file_path_text or "").strip()
+    if not resolved_path_text:
+        return
+
+    resolved_path = Path(resolved_path_text).expanduser().resolve()
+    try:
+        repository.delete_indexed_file(resolved_path)
+    except Exception:
+        pass
+
+    try:
+        if resolved_path.exists():
+            resolved_path.unlink()
+    except OSError:
+        pass
+
+
+def update_daily_attendance_entry(
+    repository: DocumentRepository,
+    *,
+    attendance_doc_id: str,
+    contractor_name: str,
+    vehicle_registration: str = "",
+    distance_travelled: str = "",
+    gate_verification_method: str = "",
+    gate_verification_note: str = "",
+    time_in: datetime,
+    time_out: Optional[datetime] = None,
+) -> DailyAttendanceEntryDocument:
+    """Apply a manager correction to one saved UHSF16.09 attendance entry."""
+
+    repository.create_schema()
+    attendance_entry = repository.get(attendance_doc_id)
+    if not isinstance(attendance_entry, DailyAttendanceEntryDocument):
+        raise ValidationError("Selected attendance record is not a UHSF16.09 entry.")
+
+    resolved_contractor_name = contractor_name.strip()
+    if not resolved_contractor_name:
+        raise ValidationError("Company / contractor name is required.")
+
+    resolved_time_in = time_in.replace(second=0, microsecond=0)
+    resolved_time_out = (
+        time_out.replace(second=0, microsecond=0)
+        if time_out is not None
+        else None
+    )
+    if resolved_time_out is not None and resolved_time_out < resolved_time_in:
+        raise ValidationError("Time out must be on or after time in.")
+
+    attendance_entry.contractor_name = resolved_contractor_name
+    attendance_entry.vehicle_registration = vehicle_registration.strip().upper()
+    attendance_entry.distance_travelled = distance_travelled.strip()
+    attendance_entry.gate_verification_method = gate_verification_method.strip()
+    attendance_entry.gate_verification_note = gate_verification_note.strip()
+    attendance_entry.time_in = resolved_time_in
+
+    if resolved_time_out is None:
+        if attendance_entry.sign_out_signature_path:
+            _delete_attendance_file_if_present(
+                repository,
+                attendance_entry.sign_out_signature_path,
+            )
+        attendance_entry.time_out = None
+        attendance_entry.hours_worked = None
+        attendance_entry.sign_out_signature_path = ""
+        attendance_entry.status = DocumentStatus.ACTIVE
+    else:
+        attendance_entry.time_out = resolved_time_out
+        attendance_entry.hours_worked = round(
+            max((resolved_time_out - resolved_time_in).total_seconds(), 0.0) / 3600.0,
+            2,
+        )
+        attendance_entry.status = DocumentStatus.ARCHIVED
+
+    repository.save(attendance_entry)
+    return attendance_entry
 
 
 def get_daily_contractor_headcount(
@@ -7955,16 +8566,210 @@ def _upsert_waste_transfer_note_document(
     """Create or update a waste transfer note from a synced ticket PDF."""
 
     try:
-        scanned_waste_transfer_note = smart_scan_waste_transfer_note(
+        source_candidate = _build_waste_transfer_note_source_candidate(
             repository,
-            source_path=pdf_path,
+            pdf_path,
         )
     except RuntimeError:
         return None
 
+    return _upsert_waste_transfer_note_document_from_candidate(
+        repository,
+        source_candidate,
+    )
+
+
+def _build_waste_transfer_note_source_candidate(
+    repository: DocumentRepository,
+    pdf_path: Path,
+) -> WasteTransferNoteSourceCandidate:
+    """Scan one physical waste-ticket source file into a comparable candidate."""
+
+    scanned_waste_transfer_note = smart_scan_waste_transfer_note(
+        repository,
+        source_path=pdf_path,
+    )
     normalized_text = _normalize_text(scanned_waste_transfer_note.extracted_text)
+    existing_document = _get_waste_transfer_note_document(
+        repository,
+        scanned_waste_transfer_note.wtn_number,
+        ticket_date=scanned_waste_transfer_note.ticket_date,
+        collection_type=scanned_waste_transfer_note.collection_type,
+    )
+    site_name = (
+        existing_document.site_name
+        if existing_document is not None
+        else _infer_waste_ticket_site_name(normalized_text, repository)
+    )
+    return WasteTransferNoteSourceCandidate(
+        source_path=pdf_path,
+        scanned_note=scanned_waste_transfer_note,
+        site_name=site_name,
+        source_mtime=pdf_path.stat().st_mtime if pdf_path.exists() else 0.0,
+    )
+
+
+def _build_waste_transfer_note_source_snapshot(
+    source_candidate: WasteTransferNoteSourceCandidate,
+) -> WasteTransferNoteSourceSnapshot:
+    """Persist the useful parts of one physical WTN source file."""
+
+    scanned_note = source_candidate.scanned_note
+    return WasteTransferNoteSourceSnapshot(
+        source_path=str(source_candidate.source_path.resolve()),
+        source_file_name=source_candidate.source_path.name,
+        ticket_date=scanned_note.ticket_date,
+        collection_type=scanned_note.collection_type,
+        quantity_tonnes=scanned_note.quantity_tonnes,
+        carrier_name=scanned_note.carrier_name,
+        vehicle_registration=scanned_note.vehicle_registration,
+        waste_description=scanned_note.waste_description,
+        ewc_code=scanned_note.ewc_code,
+        destination_facility=scanned_note.destination_facility,
+    )
+
+
+def _build_waste_transfer_note_source_candidate_from_snapshot(
+    *,
+    waste_note: WasteTransferNoteDocument,
+    source_snapshot: WasteTransferNoteSourceSnapshot,
+) -> Optional[WasteTransferNoteSourceCandidate]:
+    """Rehydrate one WTN source candidate from persisted sync metadata."""
+
+    source_path = Path(source_snapshot.source_path)
+    if not source_path.exists():
+        return None
+
+    scanned_note = SmartScannedWasteTransferNote(
+        source_name=source_snapshot.source_file_name,
+        wtn_number=waste_note.wtn_number,
+        carrier_name=source_snapshot.carrier_name or waste_note.carrier_name,
+        vehicle_registration=(
+            source_snapshot.vehicle_registration or waste_note.vehicle_registration
+        ),
+        collection_type=source_snapshot.collection_type,
+        waste_description=(
+            source_snapshot.waste_description or waste_note.waste_description
+        ),
+        ticket_date=source_snapshot.ticket_date,
+        quantity_tonnes=source_snapshot.quantity_tonnes,
+        ewc_code=source_snapshot.ewc_code or waste_note.ewc_code,
+        destination_facility=(
+            source_snapshot.destination_facility or waste_note.destination_facility
+        ),
+        extracted_text="",
+    )
+    return WasteTransferNoteSourceCandidate(
+        source_path=source_path.resolve(),
+        scanned_note=scanned_note,
+        site_name=waste_note.site_name,
+        source_mtime=source_path.stat().st_mtime if source_path.exists() else 0.0,
+    )
+
+
+def _is_tanker_collection_type(collection_type: str) -> bool:
+    """Return True when the scanned collection type should be treated as a tanker run."""
+
+    normalized_collection_type = collection_type.casefold()
+    return "tanker" in normalized_collection_type
+
+
+def _build_waste_transfer_note_identity_key(
+    *,
+    wtn_number: str,
+    ticket_date: date,
+    collection_type: str = "",
+) -> str:
+    """Return the logical identity key for one waste ticket."""
+
+    if _is_tanker_collection_type(collection_type):
+        return f"{wtn_number}::{ticket_date.isoformat()}"
+    return wtn_number
+
+
+def _build_waste_transfer_note_doc_id(
+    *,
+    wtn_number: str,
+    ticket_date: date,
+    collection_type: str = "",
+) -> str:
+    """Return the persisted doc id for one waste ticket."""
+
+    if _is_tanker_collection_type(collection_type):
+        return f"WTN-{_slugify_identifier(wtn_number)}-{ticket_date.isoformat()}"
+    return f"WTN-{wtn_number}"
+
+
+def _waste_transfer_note_source_candidate_sort_key(
+    source_candidate: WasteTransferNoteSourceCandidate,
+) -> tuple[int, int, int, float, int, str]:
+    """Return a descending sort key for selecting the canonical WTN source."""
+
+    scanned_note = source_candidate.scanned_note
+    extracted_text = _normalize_text(scanned_note.extracted_text)
+    return (
+        1 if (scanned_note.quantity_tonnes or 0.0) > 0 else 0,
+        1 if _is_plausible_vehicle_registration(scanned_note.vehicle_registration) else 0,
+        len(extracted_text),
+        source_candidate.source_mtime,
+        scanned_note.ticket_date.toordinal(),
+        source_candidate.source_path.name.casefold(),
+    )
+
+
+def _select_canonical_waste_transfer_note_source(
+    source_candidates: Iterable[WasteTransferNoteSourceCandidate],
+) -> WasteTransferNoteSourceCandidate:
+    """Choose the single source file that should drive the live WTN record."""
+
+    resolved_candidates = list(source_candidates)
+    if not resolved_candidates:
+        raise ValueError("At least one waste-ticket source candidate is required.")
+    return max(resolved_candidates, key=_waste_transfer_note_source_candidate_sort_key)
+
+
+def _select_effective_waste_transfer_note_source(
+    repository: DocumentRepository,
+    source_candidates: Iterable[WasteTransferNoteSourceCandidate],
+) -> WasteTransferNoteSourceCandidate:
+    """Return the chosen source file, honoring any saved manual override first."""
+
+    resolved_candidates = list(source_candidates)
+    if not resolved_candidates:
+        raise ValueError("At least one waste-ticket source candidate is required.")
+
+    existing_document = _get_waste_transfer_note_document(
+        repository,
+        resolved_candidates[0].scanned_note.wtn_number,
+        ticket_date=resolved_candidates[0].scanned_note.ticket_date,
+        collection_type=resolved_candidates[0].scanned_note.collection_type,
+    )
+    if existing_document is not None and existing_document.source_file_override_path:
+        override_path = Path(existing_document.source_file_override_path).resolve()
+        for source_candidate in resolved_candidates:
+            if source_candidate.source_path.resolve() == override_path:
+                return source_candidate
+
+    return _select_canonical_waste_transfer_note_source(resolved_candidates)
+
+
+def _upsert_waste_transfer_note_document_from_candidate(
+    repository: DocumentRepository,
+    source_candidate: WasteTransferNoteSourceCandidate,
+    *,
+    source_file_override_path: Optional[Path] = None,
+    source_candidate_snapshots: Optional[List[WasteTransferNoteSourceSnapshot]] = None,
+) -> WasteTransferNoteDocument:
+    """Create or update a waste transfer note from one chosen source candidate."""
+
+    scanned_waste_transfer_note = source_candidate.scanned_note
     wtn_number = scanned_waste_transfer_note.wtn_number
-    existing_document = _get_waste_transfer_note_document(repository, wtn_number)
+    existing_document = _get_waste_transfer_note_document(
+        repository,
+        wtn_number,
+        ticket_date=scanned_waste_transfer_note.ticket_date,
+        collection_type=scanned_waste_transfer_note.collection_type,
+    )
     quantity_tonnes = (
         scanned_waste_transfer_note.quantity_tonnes
         if scanned_waste_transfer_note.quantity_tonnes is not None
@@ -7978,12 +8783,16 @@ def _upsert_waste_transfer_note_document(
         doc_id=(
             existing_document.doc_id
             if existing_document is not None
-            else f"WTN-{wtn_number}"
+            else _build_waste_transfer_note_doc_id(
+                wtn_number=wtn_number,
+                ticket_date=scanned_waste_transfer_note.ticket_date,
+                collection_type=scanned_waste_transfer_note.collection_type,
+            )
         ),
         site_name=(
             existing_document.site_name
             if existing_document is not None
-            else _infer_waste_ticket_site_name(normalized_text, repository)
+            else source_candidate.site_name
         ),
         created_at=(
             existing_document.created_at
@@ -8021,9 +8830,265 @@ def _upsert_waste_transfer_note_document(
             )
             else ""
         ),
+        source_file_override_path=(
+            str(source_file_override_path.resolve())
+            if source_file_override_path is not None
+            else (
+                existing_document.source_file_override_path
+                if existing_document is not None
+                else ""
+            )
+        ),
+        canonical_source_path=str(source_candidate.source_path.resolve()),
+        source_conflict_candidates=(
+            list(source_candidate_snapshots)
+            if source_candidate_snapshots is not None
+            else (
+                existing_document.source_conflict_candidates
+                if existing_document is not None
+                else []
+            )
+        ),
     )
     repository.save(document)
     return document
+
+
+def set_waste_transfer_note_source_override(
+    repository: DocumentRepository,
+    *,
+    source_document: WasteTransferNoteDocument,
+    source_path: Path,
+) -> LoggedWasteTransferNote:
+    """Persist a manual source-file override for one WTN and refresh its live row."""
+
+    repository.create_schema()
+    source_candidate = _build_waste_transfer_note_source_candidate(repository, source_path)
+    if source_candidate.scanned_note.wtn_number != source_document.wtn_number:
+        raise ValidationError(
+            "The selected source file does not match the chosen waste transfer note."
+        )
+
+    refreshed_waste_transfer_note = _upsert_waste_transfer_note_document_from_candidate(
+        repository,
+        source_candidate,
+        source_file_override_path=source_candidate.source_path,
+        source_candidate_snapshots=(
+            source_document.source_conflict_candidates
+            if source_document.source_conflict_candidates
+            else [_build_waste_transfer_note_source_snapshot(source_candidate)]
+        ),
+    )
+    register_document = _upsert_site_waste_register(
+        repository,
+        site_name=refreshed_waste_transfer_note.site_name,
+    )
+    return LoggedWasteTransferNote(
+        waste_transfer_note=refreshed_waste_transfer_note,
+        stored_file_path=source_candidate.source_path,
+        register_document=register_document,
+    )
+
+
+def _list_waste_transfer_note_source_candidates(
+    repository: DocumentRepository,
+    *,
+    waste_destination: Path,
+) -> List[WasteTransferNoteSourceCandidate]:
+    """Return all scannable waste-ticket source files currently filed in File 1."""
+
+    source_candidates: List[WasteTransferNoteSourceCandidate] = []
+    for pdf_path in sorted(waste_destination.iterdir(), key=lambda path: path.name.lower()):
+        if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+            continue
+        try:
+            source_candidate = _build_waste_transfer_note_source_candidate(repository, pdf_path)
+        except RuntimeError:
+            continue
+        if not _looks_like_waste_ticket_source(
+            pdf_path,
+            source_candidate.scanned_note.extracted_text,
+        ):
+            continue
+        source_candidates.append(source_candidate)
+    return source_candidates
+
+
+def list_waste_transfer_note_source_conflicts(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    waste_destination: Optional[Path] = None,
+) -> List[WasteTransferNoteSourceConflict]:
+    """Return duplicate-source WTNs that need operator awareness in File 1."""
+
+    resolved_destination = waste_destination or config.WASTE_DESTINATION
+    if not resolved_destination.exists():
+        return []
+
+    grouped_candidates: Dict[tuple[str, str], List[WasteTransferNoteSourceCandidate]] = {}
+    waste_note_lookup = {
+        waste_note.doc_id: waste_note
+        for waste_note in repository.list_documents(
+            document_type=WasteTransferNoteDocument.document_type
+        )
+        if isinstance(waste_note, WasteTransferNoteDocument)
+        and waste_note.site_name.casefold() == site_name.casefold()
+    }
+    persisted_conflicts: List[WasteTransferNoteSourceConflict] = []
+    for waste_note in waste_note_lookup.values():
+        if len(waste_note.source_conflict_candidates) < 2:
+            continue
+        source_candidates = [
+            source_candidate
+            for source_candidate in (
+                _build_waste_transfer_note_source_candidate_from_snapshot(
+                    waste_note=waste_note,
+                    source_snapshot=source_snapshot,
+                )
+                for source_snapshot in waste_note.source_conflict_candidates
+            )
+            if source_candidate is not None
+        ]
+        if len(source_candidates) < 2:
+            continue
+        canonical_source_path = (
+            Path(waste_note.canonical_source_path).resolve()
+            if waste_note.canonical_source_path
+            else None
+        )
+        canonical_source = next(
+            (
+                source_candidate
+                for source_candidate in source_candidates
+                if canonical_source_path is not None
+                and source_candidate.source_path.resolve() == canonical_source_path
+            ),
+            None,
+        )
+        if canonical_source is None:
+            canonical_source = _select_effective_waste_transfer_note_source(
+                repository,
+                source_candidates,
+            )
+        persisted_conflicts.append(
+            WasteTransferNoteSourceConflict(
+                wtn_number=waste_note.wtn_number,
+                site_name=waste_note.site_name,
+                canonical_source=canonical_source,
+                source_candidates=sorted(
+                    source_candidates,
+                    key=_waste_transfer_note_source_candidate_sort_key,
+                    reverse=True,
+                ),
+            )
+        )
+
+    if persisted_conflicts:
+        return sorted(
+            persisted_conflicts,
+            key=lambda conflict: (
+                conflict.canonical_source.scanned_note.ticket_date,
+                conflict.wtn_number,
+            ),
+            reverse=True,
+        )
+
+    indexed_paths_by_group: Dict[tuple[str, str], Dict[str, Path]] = {}
+    for indexed_file in repository.list_indexed_files(file_group=FileGroup.FILE_1):
+        if indexed_file.file_category not in {"abucs_pdf", "waste_ticket_pdf"}:
+            continue
+        if indexed_file.related_doc_id not in waste_note_lookup:
+            continue
+        if indexed_file.site_name.casefold() != site_name.casefold():
+            continue
+        source_path = indexed_file.file_path
+        if not source_path.exists():
+            continue
+
+        linked_waste_note = waste_note_lookup[indexed_file.related_doc_id]
+        group_key = (
+            linked_waste_note.site_name.casefold(),
+            _build_waste_transfer_note_identity_key(
+                wtn_number=linked_waste_note.wtn_number,
+                ticket_date=linked_waste_note.date,
+                collection_type=(
+                    linked_waste_note.source_conflict_candidates[0].collection_type
+                    if linked_waste_note.source_conflict_candidates
+                    else ""
+                ),
+            ),
+        )
+        indexed_paths_by_group.setdefault(group_key, {})[
+            str(source_path.resolve())
+        ] = source_path.resolve()
+
+    if indexed_paths_by_group:
+        for group_key, source_paths_by_key in indexed_paths_by_group.items():
+            if len(source_paths_by_key) < 2:
+                continue
+            source_candidates: List[WasteTransferNoteSourceCandidate] = []
+            for source_path in sorted(
+                source_paths_by_key.values(),
+                key=lambda path: path.name.casefold(),
+            ):
+                try:
+                    source_candidate = _build_waste_transfer_note_source_candidate(
+                        repository,
+                        source_path,
+                    )
+                except RuntimeError:
+                    continue
+                source_candidates.append(source_candidate)
+            if len(source_candidates) >= 2:
+                grouped_candidates[group_key] = source_candidates
+
+    if not grouped_candidates:
+        for source_candidate in _list_waste_transfer_note_source_candidates(
+            repository,
+            waste_destination=resolved_destination,
+        ):
+            group_key = (
+                source_candidate.site_name.casefold(),
+                _build_waste_transfer_note_identity_key(
+                    wtn_number=source_candidate.scanned_note.wtn_number,
+                    ticket_date=source_candidate.scanned_note.ticket_date,
+                    collection_type=source_candidate.scanned_note.collection_type,
+                ),
+            )
+            grouped_candidates.setdefault(group_key, []).append(source_candidate)
+
+    conflicts: List[WasteTransferNoteSourceConflict] = []
+    for (_, _), source_candidates in grouped_candidates.items():
+        candidate_site_name = source_candidates[0].site_name.casefold()
+        wtn_number = source_candidates[0].scanned_note.wtn_number
+        if candidate_site_name != site_name.casefold() or len(source_candidates) < 2:
+            continue
+        canonical_source = _select_effective_waste_transfer_note_source(
+            repository,
+            source_candidates,
+        )
+        conflicts.append(
+            WasteTransferNoteSourceConflict(
+                wtn_number=wtn_number,
+                site_name=canonical_source.site_name,
+                canonical_source=canonical_source,
+                source_candidates=sorted(
+                    source_candidates,
+                    key=_waste_transfer_note_source_candidate_sort_key,
+                    reverse=True,
+                ),
+            )
+        )
+
+    return sorted(
+        conflicts,
+        key=lambda conflict: (
+            conflict.canonical_source.scanned_note.ticket_date,
+            conflict.wtn_number,
+        ),
+        reverse=True,
+    )
 
 
 def _sync_existing_waste_transfer_notes(
@@ -8033,31 +9098,125 @@ def _sync_existing_waste_transfer_notes(
     """Backfill WTN documents from already-filed waste tickets."""
 
     synced_site_names = set()
-    for pdf_path in sorted(waste_destination.iterdir(), key=lambda path: path.name.lower()):
-        if not pdf_path.is_file() or not ABUCS_PDF_PATTERN.match(pdf_path.name):
-            continue
-        waste_transfer_note = _upsert_waste_transfer_note_document(repository, pdf_path)
-        if waste_transfer_note is not None:
-            synced_site_names.add(waste_transfer_note.site_name)
-        repository.index_file(
-            file_name=pdf_path.name,
-            file_path=pdf_path,
-            file_category="abucs_pdf",
-            file_group=FileGroup.FILE_1,
-            site_name=(
-                waste_transfer_note.site_name
-                if waste_transfer_note is not None
-                else None
+    valid_doc_ids_by_site: Dict[str, set[str]] = {}
+    source_candidates = _list_waste_transfer_note_source_candidates(
+        repository,
+        waste_destination=waste_destination,
+    )
+    source_candidates_by_wtn: Dict[tuple[str, str], List[WasteTransferNoteSourceCandidate]] = {}
+    for source_candidate in source_candidates:
+        group_key = (
+            source_candidate.site_name.casefold(),
+            _build_waste_transfer_note_identity_key(
+                wtn_number=source_candidate.scanned_note.wtn_number,
+                ticket_date=source_candidate.scanned_note.ticket_date,
+                collection_type=source_candidate.scanned_note.collection_type,
             ),
-            related_doc_id=(
-                waste_transfer_note.doc_id
-                if waste_transfer_note is not None
-                else None
-            ),
+        )
+        source_candidates_by_wtn.setdefault(group_key, []).append(source_candidate)
+
+    for source_candidates in source_candidates_by_wtn.values():
+        canonical_source = _select_effective_waste_transfer_note_source(
+            repository,
+            source_candidates,
+        )
+        waste_transfer_note = _upsert_waste_transfer_note_document_from_candidate(
+            repository,
+            canonical_source,
+            source_candidate_snapshots=[
+                _build_waste_transfer_note_source_snapshot(source_candidate)
+                for source_candidate in source_candidates
+            ],
+        )
+        synced_site_names.add(waste_transfer_note.site_name)
+        valid_doc_ids_by_site.setdefault(waste_transfer_note.site_name, set()).add(
+            waste_transfer_note.doc_id
+        )
+
+        for source_candidate in source_candidates:
+            repository.index_file(
+                file_name=source_candidate.source_path.name,
+                file_path=source_candidate.source_path,
+                file_category=_classify_waste_ticket_file(source_candidate.source_path),
+                file_group=FileGroup.FILE_1,
+                site_name=waste_transfer_note.site_name,
+                related_doc_id=waste_transfer_note.doc_id,
+            )
+
+    site_names_to_reconcile = {
+        document.site_name
+        for document in repository.list_documents(
+            document_type=WasteTransferNoteDocument.document_type
+        )
+        if isinstance(document, WasteTransferNoteDocument)
+        and document.status != DocumentStatus.ARCHIVED
+    } | set(valid_doc_ids_by_site)
+
+    for site_name in site_names_to_reconcile:
+        _archive_stale_waste_transfer_note_documents(
+            repository,
+            site_name=site_name,
+            valid_doc_ids=valid_doc_ids_by_site.get(site_name, set()),
         )
 
     for site_name in sorted(synced_site_names):
         _upsert_site_waste_register(repository, site_name=site_name)
+
+
+def _archive_stale_waste_transfer_note_documents(
+    repository: DocumentRepository,
+    *,
+    site_name: str,
+    valid_doc_ids: set[str],
+) -> None:
+    """Archive active WTNs that no longer have a valid ticket source in File 1."""
+
+    active_waste_transfer_notes = [
+        document
+        for document in repository.list_documents(
+            document_type=WasteTransferNoteDocument.document_type,
+            site_name=site_name,
+        )
+        if isinstance(document, WasteTransferNoteDocument)
+        and document.status != DocumentStatus.ARCHIVED
+    ]
+    for waste_transfer_note in active_waste_transfer_notes:
+        if waste_transfer_note.doc_id in valid_doc_ids:
+            continue
+        if valid_doc_ids:
+            repository.save(
+                replace(
+                    waste_transfer_note,
+                    status=DocumentStatus.ARCHIVED,
+                )
+            )
+            continue
+        indexed_files = repository.list_indexed_files(related_doc_id=waste_transfer_note.doc_id)
+        still_has_valid_source = False
+        for indexed_file in indexed_files:
+            if indexed_file.file_group != FileGroup.FILE_1 or not indexed_file.file_path.exists():
+                continue
+            try:
+                scanned_note = smart_scan_waste_transfer_note(
+                    repository,
+                    source_path=indexed_file.file_path,
+                )
+            except RuntimeError:
+                continue
+            if _looks_like_waste_ticket_source(
+                indexed_file.file_path,
+                scanned_note.extracted_text,
+            ):
+                still_has_valid_source = True
+                break
+        if still_has_valid_source:
+            continue
+        repository.save(
+            replace(
+                waste_transfer_note,
+                status=DocumentStatus.ARCHIVED,
+            )
+        )
 
 
 def _list_site_plant_assets(
@@ -8102,11 +9261,8 @@ def _list_site_waste_transfer_notes(
         if isinstance(document, WasteTransferNoteDocument)
         and document.status != DocumentStatus.ARCHIVED
     ]
-    notes_by_reference: Dict[str, WasteTransferNoteDocument] = {}
-    for waste_transfer_note in waste_transfer_notes:
-        notes_by_reference[waste_transfer_note.wtn_number] = waste_transfer_note
     return sorted(
-        notes_by_reference.values(),
+        waste_transfer_notes,
         key=lambda note: (note.date, note.created_at, note.wtn_number),
     )
 
@@ -8156,6 +9312,9 @@ def _upsert_site_waste_register(
 def _get_waste_transfer_note_document(
     repository: DocumentRepository,
     wtn_number: str,
+    *,
+    ticket_date: Optional[date] = None,
+    collection_type: str = "",
 ) -> Optional[WasteTransferNoteDocument]:
     """Return an existing WTN document by ticket number."""
 
@@ -8169,6 +9328,14 @@ def _get_waste_transfer_note_document(
     ]
     if not matching_documents:
         return None
+
+    if ticket_date is not None and _is_tanker_collection_type(collection_type):
+        tanker_date_matches = [
+            document for document in matching_documents if document.date == ticket_date
+        ]
+        if not tanker_date_matches:
+            return None
+        matching_documents = tanker_date_matches
 
     matching_documents.sort(
         key=lambda document: (
@@ -8187,10 +9354,29 @@ def _get_waste_transfer_note_source_path(
 ) -> Optional[Path]:
     """Return the filed PDF path linked to one waste transfer note when available."""
 
-    indexed_files = repository.list_indexed_files(related_doc_id=waste_transfer_note.doc_id)
-    for indexed_file in indexed_files:
-        if indexed_file.file_group == FileGroup.FILE_1 and indexed_file.file_path.exists():
-            return indexed_file.file_path
+    indexed_files = [
+        indexed_file
+        for indexed_file in repository.list_indexed_files(related_doc_id=waste_transfer_note.doc_id)
+        if indexed_file.file_group == FileGroup.FILE_1 and indexed_file.file_path.exists()
+    ]
+    if indexed_files:
+        source_candidates: List[WasteTransferNoteSourceCandidate] = []
+        for indexed_file in indexed_files:
+            try:
+                source_candidates.append(
+                    _build_waste_transfer_note_source_candidate(
+                        repository,
+                        indexed_file.file_path,
+                    )
+                )
+            except RuntimeError:
+                continue
+        if source_candidates:
+            return _select_effective_waste_transfer_note_source(
+                repository,
+                source_candidates,
+            ).source_path
+        return indexed_files[0].file_path
     candidate_path = config.WASTE_DESTINATION / f"{waste_transfer_note.wtn_number}.pdf"
     if candidate_path.exists():
         return candidate_path
@@ -8419,10 +9605,22 @@ def _extract_waste_description(normalized_text: str) -> str:
 
     match = WASTE_TYPE_PATTERN.search(normalized_text)
     if not match:
+        if _is_foul_waste_ticket_text(normalized_text):
+            return DEFAULT_FOUL_WASTE_DESCRIPTION
         return DEFAULT_WASTE_DESCRIPTION
 
     description = " ".join(match.group("description").split())
     return description or DEFAULT_WASTE_DESCRIPTION
+
+
+def _extract_waste_collection_type(normalized_text: str) -> str:
+    """Return the skip / collection type shown on the ticket when present."""
+
+    match = WASTE_COLLECTION_TYPE_PATTERN.search(normalized_text)
+    if not match:
+        return ""
+    collection_type = " ".join(match.group("value").split())
+    return collection_type.strip(" -:")
 
 
 def _extract_ewc_code(normalized_text: str) -> str:
@@ -8439,7 +9637,67 @@ def _extract_ewc_code(normalized_text: str) -> str:
         )
         if normalized_code in COMMON_CONSTRUCTION_EWC_CODES:
             return normalized_code
+    if _is_foul_waste_ticket_text(normalized_text):
+        return DEFAULT_FOUL_WASTE_EWC_CODE
     return DEFAULT_EWC_CODE
+
+
+def _is_foul_waste_ticket_text(normalized_text: str) -> bool:
+    """Return True when the ticket text reads like cess/septic/foul waste."""
+
+    lowered_text = normalized_text.casefold()
+    return any(keyword in lowered_text for keyword in FOUL_WASTE_KEYWORDS)
+
+
+def _looks_like_waste_ticket_source(source_path: Path, source_text: str) -> bool:
+    """Return True when a non-standard PDF still looks like a waste ticket."""
+
+    if source_path.suffix.lower() != ".pdf":
+        return False
+    if ABUCS_PDF_PATTERN.match(source_path.name):
+        return True
+
+    normalized_text = _normalize_text(source_text)
+    lowered_text = normalized_text.casefold()
+    if not normalized_text:
+        return False
+
+    foul_keyword_hit = _is_foul_waste_ticket_text(normalized_text)
+    ticket_anchor_keywords = (
+        "ticket no",
+        "ticket number",
+        "transfer note",
+        "skip type",
+        "order number",
+        "waste type",
+    )
+    has_ticket_anchor = any(keyword in lowered_text for keyword in ticket_anchor_keywords)
+    has_ticket_date = _extract_waste_ticket_date(normalized_text) is not None
+    return foul_keyword_hit or (has_ticket_anchor and has_ticket_date)
+
+
+def _looks_like_waste_support_document(source_text: str) -> bool:
+    """Return True when a Word document looks like a waste workbook/support file."""
+
+    lowered_text = source_text.casefold()
+    waste_keywords = (
+        "waste register",
+        "waste removal",
+        "waste transfer",
+        "wtn",
+        "ewc",
+        "carrier",
+        "waste report",
+    )
+    return sum(1 for keyword in waste_keywords if keyword in lowered_text) >= 2
+
+
+def _classify_waste_ticket_file(source_path: Path) -> str:
+    """Return the indexed file category for one filed waste-ticket source."""
+
+    if ABUCS_PDF_PATTERN.match(source_path.name):
+        return "abucs_pdf"
+    return "waste_ticket_pdf"
 
 
 def _infer_waste_ticket_site_name(

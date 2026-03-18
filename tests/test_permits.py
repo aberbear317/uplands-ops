@@ -64,6 +64,7 @@ from uplands_site_command_centre.workspace import (
     build_site_gate_access_code,
     build_pending_toolbox_talk_contacts,
     build_toolbox_talk_sms_message,
+    build_toolbox_talk_document_view_url,
     build_toolbox_talk_url,
     calculate_haversine_distance_meters,
     check_site_inductions,
@@ -71,6 +72,7 @@ from uplands_site_command_centre.workspace import (
     create_daily_attendance_sign_in,
     create_ladder_permit_draft,
     create_site_induction_document,
+    add_site_induction_evidence_files,
     create_site_check_checklist_draft,
     create_weekly_site_check_checklist_draft,
     detect_public_tunnel_url_from_log,
@@ -106,6 +108,8 @@ from uplands_site_command_centre.workspace import (
     sync_file_4_permit_records,
     launch_messages_sms_broadcast,
     log_broadcast_dispatch,
+    update_daily_attendance_entry,
+    update_site_induction_document,
     validate_site_gate_access_code,
 )
 
@@ -3917,6 +3921,11 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                             "label": "CSCS Card",
                             "name": "cscs-front.jpg",
                             "bytes": b"front-card-binary",
+                        },
+                        {
+                            "label": "Manual Handling Certificate",
+                            "name": "manual-handling.pdf",
+                            "bytes": b"manual-handling-binary",
                         }
                     ],
                     signature_image_data=signature_image_data,
@@ -3953,10 +3962,19 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                 for path_text in induction_document.competency_card_paths.split(",")
                 if path_text
             ]
-            self.assertEqual(len(saved_competency_paths), 1)
-            self.assertTrue(saved_competency_paths[0].exists())
-            self.assertEqual(saved_competency_paths[0].parent, competency_cards_directory)
-            self.assertIn("cscs card", saved_competency_paths[0].name.casefold())
+            self.assertEqual(len(saved_competency_paths), 2)
+            for saved_path in saved_competency_paths:
+                self.assertTrue(saved_path.exists())
+                self.assertEqual(saved_path.parent, competency_cards_directory)
+            self.assertTrue(
+                any("cscs card" in saved_path.name.casefold() for saved_path in saved_competency_paths)
+            )
+            self.assertTrue(
+                any(
+                    "manual handling certificate" in saved_path.name.casefold()
+                    for saved_path in saved_competency_paths
+                )
+            )
             self.assertEqual(
                 Path(induction_document.completed_document_path),
                 generated_document.output_path,
@@ -3976,6 +3994,365 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             self.assertIn("Ceri Edwards", rendered_text)
             self.assertIn("Site Manager", rendered_text)
             self.assertIn(generated_document.induction_document.created_at.strftime("%d/%m/%Y"), rendered_text)
+
+    def test_update_site_induction_document_regenerates_saved_docx(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            signatures_directory = workspace_root / "FILE_3_Safety" / "Signatures"
+            completed_directory = workspace_root / "FILE_3_Safety" / "Completed_Inductions"
+            competency_cards_directory = (
+                workspace_root / "FILE_3_Safety" / "Competency_Cards"
+            )
+            database_path = workspace_root / "documents.sqlite3"
+            template_path = Path(temp_dir) / "site_induction_template.docx"
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                app_config.FILE_3_SIGNATURES_DIR,
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                app_config.DATABASE_PATH,
+            )
+
+            self._build_site_induction_template(template_path)
+
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["site_induction"] = template_path
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.FILE_3_COMPETENCY_CARDS_DIR = competency_cards_directory
+                app_config.FILE_3_SIGNATURES_DIR = signatures_directory
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR = completed_directory
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                generated_document = create_site_induction_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    full_name="Sean Carter",
+                    home_address="1 Test Street",
+                    contact_number="07123 456789",
+                    company="A. Archer Electrical",
+                    occupation="Electrician",
+                    emergency_contact="Jane Carter",
+                    emergency_tel="07999 888777",
+                    medical="None declared",
+                    cscs_number="CSCS-1234",
+                    cscs_expiry=date(2027, 3, 1),
+                    asbestos_cert=True,
+                    erect_scaffold=False,
+                    operate_plant=False,
+                    client_training_desc="Original training note",
+                    first_aider=False,
+                    fire_warden=False,
+                    supervisor=False,
+                    smsts=False,
+                    competency_files=[
+                        {
+                            "label": "Manual Handling Certificate",
+                            "name": "manual-handling.pdf",
+                            "bytes": b"manual-handling-binary",
+                        }
+                    ],
+                    signature_image_data=signature_image_data,
+                )
+
+                updated_document = update_site_induction_document(
+                    repository,
+                    induction_doc_id=generated_document.induction_document.doc_id,
+                    full_name="Sean Carter",
+                    home_address="22 Updated Street",
+                    contact_number="07000 111222",
+                    company="A. Archer Electrical",
+                    occupation="Chargehand",
+                    emergency_contact="Janet Carter",
+                    emergency_tel="07000 333444",
+                    medical="No changes",
+                    cscs_number="CSCS-9876",
+                    cscs_expiry=date(2028, 1, 15),
+                    asbestos_cert=True,
+                    erect_scaffold=False,
+                    operate_plant=False,
+                    client_training_desc="Updated training note",
+                    client_training_date=date(2026, 3, 14),
+                    client_training_expiry=date(2027, 3, 14),
+                    first_aider=True,
+                    fire_warden=True,
+                    supervisor=False,
+                    smsts=False,
+                    competency_expiry_date=date(2028, 2, 1),
+                )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                    app_config.FILE_3_SIGNATURES_DIR,
+                    app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                    app_config.DATABASE_PATH,
+                ) = original_config
+
+            self.assertEqual(
+                updated_document.output_path,
+                generated_document.output_path,
+            )
+            self.assertTrue(updated_document.output_path.exists())
+            persisted_document = repository.get(generated_document.induction_document.doc_id)
+            self.assertIsInstance(persisted_document, InductionDocument)
+            self.assertEqual(persisted_document.contact_number, "07000 111222")
+            self.assertEqual(persisted_document.home_address, "22 Updated Street")
+            self.assertTrue(persisted_document.first_aider)
+            self.assertTrue(persisted_document.fire_warden)
+
+            rendered_document = Document(updated_document.output_path)
+            rendered_text = "\n".join(
+                paragraph.text for paragraph in rendered_document.paragraphs
+            )
+            self.assertIn("22 Updated Street", rendered_text)
+            self.assertIn("07000 111222", rendered_text)
+            self.assertIn("Updated training note", rendered_text)
+
+    def test_add_site_induction_evidence_files_appends_extra_saved_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            signatures_directory = workspace_root / "FILE_3_Safety" / "Signatures"
+            completed_directory = workspace_root / "FILE_3_Safety" / "Completed_Inductions"
+            competency_cards_directory = (
+                workspace_root / "FILE_3_Safety" / "Competency_Cards"
+            )
+            database_path = workspace_root / "documents.sqlite3"
+            template_path = Path(temp_dir) / "site_induction_template.docx"
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                app_config.FILE_3_SIGNATURES_DIR,
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                app_config.DATABASE_PATH,
+            )
+
+            self._build_site_induction_template(template_path)
+
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["site_induction"] = template_path
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.FILE_3_COMPETENCY_CARDS_DIR = competency_cards_directory
+                app_config.FILE_3_SIGNATURES_DIR = signatures_directory
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR = completed_directory
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                generated_document = create_site_induction_document(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                    full_name="Sean Carter",
+                    home_address="1 Test Street",
+                    contact_number="07123 456789",
+                    company="A. Archer Electrical",
+                    occupation="Electrician",
+                    emergency_contact="Jane Carter",
+                    emergency_tel="07999 888777",
+                    medical="None declared",
+                    cscs_number="CSCS-1234",
+                    first_aider=False,
+                    fire_warden=False,
+                    supervisor=False,
+                    smsts=False,
+                    competency_files=[
+                        {
+                            "label": "Manual Handling Certificate",
+                            "name": "manual-handling.pdf",
+                            "bytes": b"manual-handling-binary",
+                        }
+                    ],
+                    signature_image_data=signature_image_data,
+                )
+
+                updated_document = add_site_induction_evidence_files(
+                    repository,
+                    induction_doc_id=generated_document.induction_document.doc_id,
+                    competency_files=[
+                        {
+                            "label": "First Aid Certificate",
+                            "name": "first-aid-cert.pdf",
+                            "bytes": b"first-aid-binary",
+                        },
+                        {
+                            "label": "Face Fit Certificate",
+                            "name": "face-fit.pdf",
+                            "bytes": b"face-fit-binary",
+                        },
+                    ],
+                )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                    app_config.FILE_3_SIGNATURES_DIR,
+                    app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                    app_config.DATABASE_PATH,
+                ) = original_config
+
+            saved_competency_paths = [
+                Path(path_text)
+                for path_text in updated_document.competency_card_paths.split(",")
+                if path_text
+            ]
+            self.assertEqual(len(saved_competency_paths), 3)
+            self.assertTrue(
+                any("manual handling certificate" in saved_path.name.casefold() for saved_path in saved_competency_paths)
+            )
+            self.assertTrue(
+                any("first aid certificate" in saved_path.name.casefold() for saved_path in saved_competency_paths)
+            )
+            self.assertTrue(
+                any("face fit certificate" in saved_path.name.casefold() for saved_path in saved_competency_paths)
+            )
+
+    def test_create_site_induction_document_requires_home_address_and_contact_number(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            signatures_directory = workspace_root / "FILE_3_Safety" / "Signatures"
+            completed_directory = workspace_root / "FILE_3_Safety" / "Completed_Inductions"
+            competency_cards_directory = (
+                workspace_root / "FILE_3_Safety" / "Competency_Cards"
+            )
+            database_path = workspace_root / "documents.sqlite3"
+            template_path = Path(temp_dir) / "site_induction_template.docx"
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                app_config.FILE_3_SIGNATURES_DIR,
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                app_config.DATABASE_PATH,
+            )
+
+            self._build_site_induction_template(template_path)
+
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["site_induction"] = template_path
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.FILE_3_COMPETENCY_CARDS_DIR = competency_cards_directory
+                app_config.FILE_3_SIGNATURES_DIR = signatures_directory
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR = completed_directory
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                with self.assertRaises(ValidationError) as error_context:
+                    create_site_induction_document(
+                        repository,
+                        site_name="NG Lovedean Substation",
+                        full_name="Sean Carter",
+                        home_address="",
+                        contact_number="",
+                        company="A. Archer Electrical",
+                        occupation="Electrician",
+                        emergency_contact="Jane Carter",
+                        emergency_tel="07999 888777",
+                        medical="None declared",
+                        cscs_number="CSCS-1234",
+                        first_aider=False,
+                        fire_warden=False,
+                        supervisor=False,
+                        smsts=False,
+                        signature_image_data=signature_image_data,
+                    )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                    app_config.FILE_3_SIGNATURES_DIR,
+                    app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                    app_config.DATABASE_PATH,
+                ) = original_config
+
+            self.assertIn("Home Address is required", str(error_context.exception))
+
+    def test_create_site_induction_document_requires_manual_handling_certificate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            signatures_directory = workspace_root / "FILE_3_Safety" / "Signatures"
+            completed_directory = workspace_root / "FILE_3_Safety" / "Completed_Inductions"
+            competency_cards_directory = (
+                workspace_root / "FILE_3_Safety" / "Competency_Cards"
+            )
+            database_path = workspace_root / "documents.sqlite3"
+            template_path = Path(temp_dir) / "site_induction_template.docx"
+            original_registry = dict(TemplateRegistry.TEMPLATE_PATHS)
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                app_config.FILE_3_SIGNATURES_DIR,
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                app_config.DATABASE_PATH,
+            )
+
+            self._build_site_induction_template(template_path)
+
+            try:
+                TemplateRegistry.TEMPLATE_PATHS["site_induction"] = template_path
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.FILE_3_COMPETENCY_CARDS_DIR = competency_cards_directory
+                app_config.FILE_3_SIGNATURES_DIR = signatures_directory
+                app_config.FILE_3_COMPLETED_INDUCTIONS_DIR = completed_directory
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                repository.create_schema()
+                signature_image_data = np.full((200, 420, 4), 255, dtype=np.uint8)
+                signature_image_data[92:98, 40:220, :3] = 0
+
+                with self.assertRaises(ValidationError) as error_context:
+                    create_site_induction_document(
+                        repository,
+                        site_name="NG Lovedean Substation",
+                        full_name="Sean Carter",
+                        home_address="1 Test Street",
+                        contact_number="07123 456789",
+                        company="A. Archer Electrical",
+                        occupation="Electrician",
+                        emergency_contact="Jane Carter",
+                        emergency_tel="07999 888777",
+                        medical="None declared",
+                        cscs_number="CSCS-1234",
+                        first_aider=False,
+                        fire_warden=False,
+                        supervisor=False,
+                        smsts=False,
+                        signature_image_data=signature_image_data,
+                    )
+            finally:
+                TemplateRegistry.TEMPLATE_PATHS = original_registry
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.FILE_3_COMPETENCY_CARDS_DIR,
+                    app_config.FILE_3_SIGNATURES_DIR,
+                    app_config.FILE_3_COMPLETED_INDUCTIONS_DIR,
+                    app_config.DATABASE_PATH,
+                ) = original_config
+
+            self.assertIn(
+                "Manual Handling Certificate upload is required",
+                str(error_context.exception),
+            )
 
     def test_daily_attendance_entry_document_flags_live_status_and_uplands_company(
         self,
@@ -4176,6 +4553,105 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                     active_only=True,
                 )
             )
+
+    def test_update_daily_attendance_entry_reopens_signed_out_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            attendance_signatures_directory = (
+                workspace_root / "FILE_2_Registers" / "Attendance" / "Signatures"
+            )
+            attendance_signatures_directory.mkdir(parents=True, exist_ok=True)
+            database_path = workspace_root / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            sign_out_signature_path = attendance_signatures_directory / "sign-out.png"
+            sign_out_signature_path.write_bytes(b"fake-signout")
+
+            attendance_entry = DailyAttendanceEntryDocument(
+                doc_id="ATT-20260313-1",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 30),
+                status=DocumentStatus.ARCHIVED,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                vehicle_registration="AB12 CDE",
+                distance_travelled="14 miles",
+                gate_verification_method="gps",
+                time_in=datetime(2026, 3, 13, 7, 30),
+                time_out=datetime(2026, 3, 13, 15, 0),
+                hours_worked=7.5,
+                sign_out_signature_path=str(sign_out_signature_path),
+            )
+            repository.save(attendance_entry)
+            repository.index_file(
+                file_name=sign_out_signature_path.name,
+                file_path=sign_out_signature_path,
+                file_category="attendance_sign_out_signature_png",
+                file_group=FileGroup.FILE_2,
+                site_name=attendance_entry.site_name,
+                related_doc_id=attendance_entry.doc_id,
+            )
+
+            updated_entry = update_daily_attendance_entry(
+                repository,
+                attendance_doc_id=attendance_entry.doc_id,
+                contractor_name="One Fifty Enterprises",
+                vehicle_registration="xy34 zzz",
+                distance_travelled="22 miles",
+                gate_verification_method="manager_correction",
+                gate_verification_note="Reopened after accidental sign-out",
+                time_in=datetime(2026, 3, 13, 7, 25),
+                time_out=None,
+            )
+
+            self.assertEqual(updated_entry.status, DocumentStatus.ACTIVE)
+            self.assertIsNone(updated_entry.time_out)
+            self.assertIsNone(updated_entry.hours_worked)
+            self.assertEqual(updated_entry.sign_out_signature_path, "")
+            self.assertEqual(updated_entry.contractor_name, "One Fifty Enterprises")
+            self.assertEqual(updated_entry.vehicle_registration, "XY34 ZZZ")
+            self.assertEqual(updated_entry.distance_travelled, "22 miles")
+            self.assertFalse(sign_out_signature_path.exists())
+
+    def test_update_daily_attendance_entry_recalculates_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            attendance_entry = DailyAttendanceEntryDocument(
+                doc_id="ATT-20260313-2",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 13, 7, 30),
+                status=DocumentStatus.ACTIVE,
+                linked_induction_doc_id="IND-001",
+                individual_name="Sean Carter",
+                contractor_name="A. Archer Electrical",
+                vehicle_registration="AB12 CDE",
+                distance_travelled="14 miles",
+                time_in=datetime(2026, 3, 13, 7, 30),
+            )
+            repository.save(attendance_entry)
+
+            updated_entry = update_daily_attendance_entry(
+                repository,
+                attendance_doc_id=attendance_entry.doc_id,
+                contractor_name="150",
+                vehicle_registration="ab12 cde",
+                distance_travelled="18 miles",
+                gate_verification_method="gate_code",
+                gate_verification_note="Manager gate recovery",
+                time_in=datetime(2026, 3, 13, 7, 15),
+                time_out=datetime(2026, 3, 13, 16, 0),
+            )
+
+            self.assertEqual(updated_entry.status, DocumentStatus.ARCHIVED)
+            self.assertEqual(updated_entry.contractor_name, "150")
+            self.assertEqual(updated_entry.vehicle_registration, "AB12 CDE")
+            self.assertEqual(updated_entry.distance_travelled, "18 miles")
+            self.assertEqual(updated_entry.gate_verification_method, "gate_code")
+            self.assertAlmostEqual(updated_entry.hours_worked, 8.75)
 
     def test_attendance_helper_returns_latest_vehicle_registration_for_induction(
         self,
@@ -4823,6 +5299,49 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             "https://uplands-site-induction.omegaleague.win?station=tbt&topic=Working+in+high+winds",
         )
 
+    def test_build_toolbox_talk_url_recovers_base_url_from_component_iframe_link(self) -> None:
+        self.assertEqual(
+            build_toolbox_talk_url(
+                "Working in high winds",
+                public_url=(
+                    "https://uplands-site-induction.omegaleague.win/"
+                    "component/streamlit_js_eval.streamlit_js_eval/index.html"
+                    "?streamlitUrl=https%3A%2F%2Fuplands-site-induction.omegaleague.win%2F"
+                ),
+            ),
+            "https://uplands-site-induction.omegaleague.win?station=tbt&topic=Working+in+high+winds",
+        )
+
+    def test_build_toolbox_talk_document_view_url_uses_public_gps_route(self) -> None:
+        self.assertEqual(
+            build_toolbox_talk_document_view_url(
+                "TBTDOC-123",
+                public_url="https://uplands-site-induction.omegaleague.win",
+            ),
+            "https://uplands-site-induction.omegaleague.win/gps/tbt-preview?doc_id=TBTDOC-123",
+        )
+
+    def test_save_app_settings_normalizes_component_iframe_public_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_settings_path = app_config.SETTINGS_PATH
+            try:
+                app_config.SETTINGS_PATH = Path(temp_dir) / "settings.json"
+                save_app_settings(
+                    public_tunnel_url=(
+                        "https://uplands-site-induction.omegaleague.win/"
+                        "component/streamlit_js_eval.streamlit_js_eval/index.html"
+                        "?streamlitUrl=https%3A%2F%2Fuplands-site-induction.omegaleague.win%2F"
+                    )
+                )
+                loaded_settings = load_app_settings()
+            finally:
+                app_config.SETTINGS_PATH = original_settings_path
+
+        self.assertEqual(
+            loaded_settings["public_tunnel_url"],
+            "https://uplands-site-induction.omegaleague.win",
+        )
+
     def test_calculate_haversine_distance_meters_matches_expected_site_scale(self) -> None:
         self.assertEqual(
             calculate_haversine_distance_meters(50.917, -1.036, 50.917, -1.036),
@@ -4966,7 +5485,55 @@ class PlantRegisterAutomationTests(unittest.TestCase):
     def test_launch_messages_sms_broadcast_opens_messages_drafts(self) -> None:
         mobile_numbers = [f"+44770011{index:04d}" for index in range(25)]
 
-        with patch.object(workspace_module.time_module, "sleep") as mocked_sleep:
+        with patch.object(
+            workspace_module,
+            "_launch_messages_group_draft_via_gui_automation",
+            return_value=(False, "Accessibility not enabled."),
+        ):
+            with patch.object(workspace_module.time_module, "sleep") as mocked_sleep:
+                with patch.object(workspace_module.subprocess, "run") as mocked_run:
+                    mocked_run.side_effect = [
+                        workspace_module.subprocess.CompletedProcess(
+                            ["open", "-Ra", "Messages"],
+                            0,
+                            "",
+                            "",
+                        )
+                    ] + [
+                        workspace_module.subprocess.CompletedProcess(
+                            ["open", "-a", "Messages", f"sms:+44770011{index:04d}"],
+                            0,
+                            "",
+                            "",
+                        )
+                        for index in range(25)
+                    ]
+
+                    launch_result = launch_messages_sms_broadcast(
+                        mobile_numbers,
+                        message="Toolbox talk in ten minutes",
+                        max_recipients_per_chunk=20,
+                    )
+
+        self.assertTrue(launch_result.launched_successfully)
+        self.assertEqual(launch_result.recipient_count, 25)
+        self.assertEqual(launch_result.chunk_count, 25)
+        self.assertEqual(mocked_run.call_count, 26)
+        self.assertEqual(
+            mocked_run.call_args_list[1].args[0][:3],
+            ["open", "-a", "Messages"],
+        )
+        self.assertIn("one draft per recipient", launch_result.error_message)
+        self.assertEqual(mocked_sleep.call_count, 24)
+
+    def test_launch_messages_sms_broadcast_prefers_grouped_messages_draft(self) -> None:
+        mobile_numbers = ["+447700110001", "+447700110002"]
+
+        with patch.object(
+            workspace_module,
+            "_launch_messages_group_draft_via_gui_automation",
+            return_value=(True, ""),
+        ) as mocked_group_launch:
             with patch.object(workspace_module.subprocess, "run") as mocked_run:
                 mocked_run.side_effect = [
                     workspace_module.subprocess.CompletedProcess(
@@ -4974,36 +5541,23 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                         0,
                         "",
                         "",
-                    ),
-                    workspace_module.subprocess.CompletedProcess(
-                        ["open", "-a", "Messages", "sms:chunk-1"],
-                        0,
-                        "",
-                        "",
-                    ),
-                    workspace_module.subprocess.CompletedProcess(
-                        ["open", "-a", "Messages", "sms:chunk-2"],
-                        0,
-                        "",
-                        "",
-                    ),
+                    )
                 ]
 
                 launch_result = launch_messages_sms_broadcast(
                     mobile_numbers,
                     message="Toolbox talk in ten minutes",
-                    max_recipients_per_chunk=20,
                 )
 
         self.assertTrue(launch_result.launched_successfully)
-        self.assertEqual(launch_result.recipient_count, 25)
-        self.assertEqual(launch_result.chunk_count, 2)
-        self.assertEqual(mocked_run.call_count, 3)
+        self.assertEqual(launch_result.recipient_count, 2)
+        self.assertEqual(launch_result.chunk_count, 1)
+        self.assertEqual(mocked_run.call_count, 1)
+        mocked_group_launch.assert_called_once()
         self.assertEqual(
-            mocked_run.call_args_list[1].args[0][:3],
-            ["open", "-a", "Messages"],
+            launch_result.error_message,
+            "Opened one grouped Messages draft for the live audience.",
         )
-        mocked_sleep.assert_called_once()
 
     def test_log_broadcast_dispatch_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5347,6 +5901,72 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             self.assertEqual(scanned.quantity_tonnes, 2.4)
             self.assertEqual(scanned.ewc_code, "17 09 04")
 
+    def test_smart_scan_waste_transfer_note_recognises_foul_waste_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            pdf_path = Path(temp_dir) / "foul-ticket.pdf"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            pdf_document = fitz.open()
+            pdf_page = pdf_document.new_page()
+            pdf_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "Carrier: Acme Tankers Ltd",
+                        "Ticket No: FP-101",
+                        "Cess Pit Emptying",
+                        "Foul Water Collection",
+                        "Date: 16/03/2026",
+                    ]
+                ),
+            )
+            pdf_document.save(pdf_path)
+            pdf_document.close()
+
+            scanned = smart_scan_waste_transfer_note(
+                repository,
+                source_path=pdf_path,
+            )
+
+            self.assertEqual(scanned.collection_type, "")
+            self.assertEqual(scanned.waste_description, "Cess Pit / Foul Waste")
+            self.assertEqual(scanned.ewc_code, "20 03 04")
+
+    def test_smart_scan_waste_transfer_note_extracts_collection_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            pdf_path = Path(temp_dir) / "30879-1.PDF"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            pdf_document = fitz.open()
+            pdf_page = pdf_document.new_page()
+            pdf_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "Ticket No.",
+                        "16/03/2026",
+                        "30879",
+                        "Vehicle Skip Type Tanker-Municipal W WasteTruck Notes Movement Type",
+                        "Waste Type:Mixed Construction",
+                        "17 09 04",
+                    ]
+                ),
+            )
+            pdf_document.save(pdf_path)
+            pdf_document.close()
+
+            scanned = smart_scan_waste_transfer_note(
+                repository,
+                source_path=pdf_path,
+            )
+
+            self.assertEqual(scanned.wtn_number, "30879")
+            self.assertEqual(scanned.collection_type, "Tanker-Municipal W")
+
     def test_file_and_index_all_backfills_weightless_abacus_ticket_into_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_root = Path(temp_dir) / "Uplands_Workspace"
@@ -5435,6 +6055,186 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             self.assertEqual(waste_transfer_notes[0].vehicle_registration, "")
             self.assertEqual(waste_transfer_notes[0].quantity_tonnes, 0.0)
 
+    def test_file_and_index_all_routes_foul_waste_pdf_into_file_1(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            waste_destination = workspace_root / "FILE_1_Environment" / "Waste_Notes"
+            carrier_docs_destination = workspace_root / "FILE_1_Environment" / "Carrier_Docs"
+            waste_reports_destination = workspace_root / "FILE_1_Environment" / "Waste_Reports"
+            attendance_destination = workspace_root / "FILE_2_Registers" / "Attendance"
+            induction_directory = workspace_root / "FILE_3_Inductions"
+            inbox = workspace_root / "ingest"
+            database_path = workspace_root / "documents.sqlite3"
+
+            for directory in (
+                waste_destination,
+                carrier_docs_destination,
+                waste_reports_destination,
+                attendance_destination,
+                induction_directory,
+                inbox,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            pdf_path = inbox / "cess-pit-ticket.pdf"
+            document = fitz.open()
+            page = document.new_page()
+            page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "Carrier: Acme Tankers Ltd",
+                        "Ticket No: FP-101",
+                        "Cess Pit Emptying",
+                        "Foul Water Collection",
+                        "Date: 16/03/2026",
+                    ]
+                ),
+            )
+            document.save(pdf_path)
+            document.close()
+
+            original_base_data_dir = app_config.BASE_DATA_DIR
+            original_inbox = app_config.INBOX
+            original_waste_destination = app_config.WASTE_DESTINATION
+            original_carrier_docs_destination = app_config.CARRIER_DOCS_DESTINATION
+            original_waste_reports_destination = app_config.WASTE_REPORTS_DESTINATION
+            original_attendance_destination = app_config.ATTENDANCE_DESTINATION
+            original_plant_hire_directory = app_config.PLANT_HIRE_REGISTER_DIR
+            original_induction_directory = app_config.INDUCTION_DIR
+            original_review_directory = app_config.FILE_3_REVIEW_DIR
+            original_database_path = app_config.DATABASE_PATH
+
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.INBOX = inbox
+                app_config.WASTE_DESTINATION = waste_destination
+                app_config.CARRIER_DOCS_DESTINATION = carrier_docs_destination
+                app_config.WASTE_REPORTS_DESTINATION = waste_reports_destination
+                app_config.ATTENDANCE_DESTINATION = attendance_destination
+                app_config.PLANT_HIRE_REGISTER_DIR = workspace_root / "FILE_2_Registers" / "Plant_Hire_Register"
+                app_config.INDUCTION_DIR = induction_directory
+                app_config.FILE_3_REVIEW_DIR = induction_directory / "Needs_Review"
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                file_and_index_all(repository)
+                waste_transfer_notes = repository.list_documents(
+                    document_type=WasteTransferNoteDocument.document_type,
+                )
+                indexed_files = repository.list_indexed_files(file_group=FileGroup.FILE_1)
+            finally:
+                app_config.BASE_DATA_DIR = original_base_data_dir
+                app_config.INBOX = original_inbox
+                app_config.WASTE_DESTINATION = original_waste_destination
+                app_config.CARRIER_DOCS_DESTINATION = original_carrier_docs_destination
+                app_config.WASTE_REPORTS_DESTINATION = original_waste_reports_destination
+                app_config.ATTENDANCE_DESTINATION = original_attendance_destination
+                app_config.PLANT_HIRE_REGISTER_DIR = original_plant_hire_directory
+                app_config.INDUCTION_DIR = original_induction_directory
+                app_config.FILE_3_REVIEW_DIR = original_review_directory
+                app_config.DATABASE_PATH = original_database_path
+
+            self.assertEqual(len(waste_transfer_notes), 1)
+            self.assertEqual(waste_transfer_notes[0].waste_description, "Cess Pit / Foul Waste")
+            self.assertEqual(waste_transfer_notes[0].ewc_code, "20 03 04")
+            self.assertEqual(indexed_files[0].file_category, "waste_ticket_pdf")
+
+    def test_sync_existing_waste_transfer_notes_ignores_support_pdf_in_waste_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waste_destination = Path(temp_dir) / "Waste_Notes"
+            waste_destination.mkdir(parents=True, exist_ok=True)
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            pdf_path = waste_destination / "KE2428 datasheet.pdf"
+            pdf_document = fitz.open()
+            pdf_page = pdf_document.new_page()
+            pdf_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "Rapid PVC/CV, Lino and Carpet Adhesive",
+                        "MAIN APPLICATION FIELD",
+                        "Ready to use, water based dispersion adhesive.",
+                    ]
+                ),
+            )
+            pdf_document.save(pdf_path)
+            pdf_document.close()
+
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+
+            waste_transfer_notes = repository.list_documents(
+                document_type=WasteTransferNoteDocument.document_type,
+            )
+            self.assertEqual(len(waste_transfer_notes), 0)
+
+    def test_sync_existing_waste_transfer_notes_archives_stale_support_doc_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waste_destination = Path(temp_dir) / "Waste_Notes"
+            waste_destination.mkdir(parents=True, exist_ok=True)
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            pdf_path = waste_destination / "KE2428 datasheet.pdf"
+            pdf_document = fitz.open()
+            pdf_page = pdf_document.new_page()
+            pdf_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "Rapid PVC/CV, Lino and Carpet Adhesive",
+                        "MAIN APPLICATION FIELD",
+                        "Ready to use, water based dispersion adhesive.",
+                    ]
+                ),
+            )
+            pdf_document.save(pdf_path)
+            pdf_document.close()
+
+            stale_document = WasteTransferNoteDocument(
+                doc_id="WTN-KE2428",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 17, 8, 0),
+                status=DocumentStatus.ACTIVE,
+                wtn_number="KE2428 datasheet",
+                date=date(2026, 3, 17),
+                waste_description="Mixed Construction",
+                ewc_code="17 09 04",
+                quantity_tonnes=0.0,
+                carrier_name="Ke2428 Datasheet",
+                destination_facility="Not captured from ticket PDF",
+                vehicle_registration="",
+            )
+            repository.save(stale_document)
+            repository.index_file(
+                file_name=pdf_path.name,
+                file_path=pdf_path,
+                file_category="waste_ticket_pdf",
+                file_group=FileGroup.FILE_1,
+                site_name=stale_document.site_name,
+                related_doc_id=stale_document.doc_id,
+            )
+
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+
+            refreshed_document = next(
+                document
+                for document in repository.list_documents(
+                    document_type=WasteTransferNoteDocument.document_type,
+                    site_name=stale_document.site_name,
+                )
+                if document.doc_id == stale_document.doc_id
+            )
+            self.assertEqual(refreshed_document.status, DocumentStatus.ARCHIVED)
+
     def test_log_uploaded_waste_transfer_note_moves_file_and_updates_register(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_root = Path(temp_dir) / "Uplands_Workspace"
@@ -5468,6 +6268,294 @@ class WasteRegisterAutomationTests(unittest.TestCase):
             self.assertEqual(logged.waste_transfer_note.vehicle_registration, "AB12 CDE")
             self.assertIsNotNone(logged.register_document)
             self.assertEqual(len(logged.register_document.waste_transfer_notes), 1)
+
+    def test_sync_existing_waste_transfer_notes_prefers_stronger_duplicate_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waste_destination = Path(temp_dir) / "Waste_Notes"
+            waste_destination.mkdir(parents=True, exist_ok=True)
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            first_pdf_path = waste_destination / "30879.PDF"
+            first_document = fitz.open()
+            first_page = first_document.new_page()
+            first_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "ABACUS BRISTOL LTD",
+                        "Ticket No.",
+                        "10/03/2026",
+                        "30879",
+                        "Vehicle",
+                        "Waste Type:Mixed Construction",
+                        "17 09 04",
+                    ]
+                ),
+            )
+            first_document.save(first_pdf_path)
+            first_document.close()
+
+            second_pdf_path = waste_destination / "30879-1.PDF"
+            second_document = fitz.open()
+            second_page = second_document.new_page()
+            second_page.insert_text(
+                (72, 72),
+                "\n".join(
+                    [
+                        "ABACUS BRISTOL LTD",
+                        "Ticket No.",
+                        "16/03/2026",
+                        "30879",
+                        "Vehicle Reg: AB12 CDE",
+                        "Waste Type:Mixed Construction",
+                        "Net Weight: 3200 kg",
+                        "17 09 04",
+                    ]
+                ),
+            )
+            second_document.save(second_pdf_path)
+            second_document.close()
+
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+
+            waste_transfer_notes = repository.list_documents(
+                document_type=WasteTransferNoteDocument.document_type,
+            )
+            self.assertEqual(len(waste_transfer_notes), 1)
+            self.assertEqual(waste_transfer_notes[0].wtn_number, "30879")
+            self.assertEqual(waste_transfer_notes[0].date, date(2026, 3, 16))
+            self.assertEqual(waste_transfer_notes[0].quantity_tonnes, 3.2)
+            self.assertEqual(waste_transfer_notes[0].vehicle_registration, "AB12 CDE")
+            self.assertEqual(
+                Path(waste_transfer_notes[0].canonical_source_path).name,
+                "30879-1.PDF",
+            )
+            self.assertEqual(len(waste_transfer_notes[0].source_conflict_candidates), 2)
+
+            indexed_files = repository.list_indexed_files(
+                related_doc_id=waste_transfer_notes[0].doc_id
+            )
+            self.assertEqual(len(indexed_files), 2)
+
+            conflicts = workspace_module.list_waste_transfer_note_source_conflicts(
+                repository,
+                site_name=waste_transfer_notes[0].site_name,
+                waste_destination=waste_destination,
+            )
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0].wtn_number, "30879")
+            self.assertEqual(
+                conflicts[0].canonical_source.source_path.name,
+                "30879-1.PDF",
+            )
+
+    def test_set_waste_transfer_note_source_override_persists_manual_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waste_destination = Path(temp_dir) / "Waste_Notes"
+            waste_destination.mkdir(parents=True, exist_ok=True)
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            for file_name, ticket_date in (
+                ("30879.PDF", "10/03/2026"),
+                ("30879-1.PDF", "16/03/2026"),
+            ):
+                pdf_path = waste_destination / file_name
+                pdf_document = fitz.open()
+                pdf_page = pdf_document.new_page()
+                pdf_page.insert_text(
+                    (72, 72),
+                    "\n".join(
+                        [
+                            "ABACUS BRISTOL LTD",
+                            "Ticket No.",
+                            ticket_date,
+                            "30879",
+                            "Waste Type:Mixed Construction",
+                            "17 09 04",
+                        ]
+                    ),
+                )
+                pdf_document.save(pdf_path)
+                pdf_document.close()
+
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+            waste_transfer_note = repository.list_documents(
+                document_type=WasteTransferNoteDocument.document_type,
+            )[0]
+            self.assertEqual(waste_transfer_note.date, date(2026, 3, 16))
+
+            workspace_module.set_waste_transfer_note_source_override(
+                repository,
+                source_document=waste_transfer_note,
+                source_path=waste_destination / "30879.PDF",
+            )
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+
+            refreshed_note = repository.list_documents(
+                document_type=WasteTransferNoteDocument.document_type,
+            )[0]
+            self.assertEqual(refreshed_note.date, date(2026, 3, 10))
+            self.assertEqual(
+                Path(refreshed_note.source_file_override_path).name,
+                "30879.PDF",
+            )
+            self.assertEqual(
+                Path(refreshed_note.canonical_source_path).name,
+                "30879.PDF",
+            )
+            self.assertEqual(len(refreshed_note.source_conflict_candidates), 2)
+
+    def test_sync_existing_waste_transfer_notes_splits_tanker_runs_by_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            waste_destination = Path(temp_dir) / "Waste_Notes"
+            waste_destination.mkdir(parents=True, exist_ok=True)
+            repository = DocumentRepository(Path(temp_dir) / "documents.sqlite3")
+            repository.create_schema()
+
+            for file_name, ticket_date in (
+                ("30879.PDF", "10/03/2026"),
+                ("30879-2.PDF", "10/03/2026"),
+                ("30879-1.PDF", "16/03/2026"),
+            ):
+                pdf_path = waste_destination / file_name
+                pdf_document = fitz.open()
+                pdf_page = pdf_document.new_page()
+                pdf_page.insert_text(
+                    (72, 72),
+                    "\n".join(
+                        [
+                            "ABACUS BRISTOL LTD",
+                            "Ticket No.",
+                            ticket_date,
+                            "30879",
+                            "Skip Type Tanker-Municipal W",
+                            "Waste Type:Mixed Construction",
+                            "17 09 04",
+                        ]
+                    ),
+                )
+                pdf_document.save(pdf_path)
+                pdf_document.close()
+
+            workspace_module._sync_existing_waste_transfer_notes(
+                repository,
+                waste_destination,
+            )
+
+            waste_transfer_notes = sorted(
+                repository.list_documents(
+                    document_type=WasteTransferNoteDocument.document_type,
+                ),
+                key=lambda note: note.date,
+            )
+            self.assertEqual(len(waste_transfer_notes), 2)
+            self.assertEqual(
+                [waste_transfer_note.date for waste_transfer_note in waste_transfer_notes],
+                [date(2026, 3, 10), date(2026, 3, 16)],
+            )
+            self.assertEqual(len(waste_transfer_notes[0].source_conflict_candidates), 2)
+            self.assertEqual(len(waste_transfer_notes[1].source_conflict_candidates), 1)
+
+            conflicts = workspace_module.list_waste_transfer_note_source_conflicts(
+                repository,
+                site_name=waste_transfer_notes[0].site_name,
+                waste_destination=waste_destination,
+            )
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0].wtn_number, "30879")
+            self.assertEqual(
+                conflicts[0].canonical_source.scanned_note.ticket_date,
+                date(2026, 3, 10),
+            )
+
+    def test_build_live_waste_register_rows_flags_only_real_waste_qa_issues(self) -> None:
+        ready_note = WasteTransferNoteDocument(
+            doc_id="WTN-READY",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 0),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="31420",
+            date=date(2026, 3, 12),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=1.42,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+        )
+        missing_tonnage_note = WasteTransferNoteDocument(
+            doc_id="WTN-MISSING",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 5),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="30649",
+            date=date(2026, 1, 19),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=0.0,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+        )
+        register_rows = app_module._build_live_waste_register_rows(
+            [ready_note, missing_tonnage_note],
+            waste_source_conflict_lookup={"31420": object()},
+        )
+
+        rows_by_ticket = {row["Ticket No"]: row for row in register_rows}
+        self.assertEqual(rows_by_ticket["31420"]["QA"], "Source Conflict")
+        self.assertEqual(rows_by_ticket["31420"]["Tonnes"], "1.42")
+        self.assertEqual(rows_by_ticket["30649"]["QA"], "Needs Review")
+        self.assertEqual(rows_by_ticket["30649"]["Tonnes"], "Needs review")
+
+    def test_build_file_1_waste_review_queue_rows_only_returns_unresolved_tickets(self) -> None:
+        ready_note = WasteTransferNoteDocument(
+            doc_id="WTN-READY",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 0),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="31420",
+            date=date(2026, 3, 12),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=1.42,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+        )
+        unresolved_note = WasteTransferNoteDocument(
+            doc_id="WTN-UNRESOLVED",
+            site_name="NG Lovedean Substation",
+            created_at=datetime(2026, 3, 17, 8, 5),
+            status=DocumentStatus.ACTIVE,
+            wtn_number="30649",
+            date=date(2026, 1, 19),
+            waste_description="Mixed Construction",
+            ewc_code="17 09 04",
+            quantity_tonnes=0.0,
+            carrier_name="Abucs",
+            destination_facility="Not captured from ticket PDF",
+            vehicle_registration="",
+        )
+        queue_rows = app_module._build_file_1_waste_review_queue_rows(
+            [ready_note, unresolved_note],
+            waste_source_conflict_lookup={},
+        )
+
+        self.assertEqual(len(queue_rows), 1)
+        self.assertEqual(queue_rows[0]["WTN"], "30649")
+        self.assertEqual(queue_rows[0]["Issue"], "Needs Review")
 
     def test_generate_waste_register_document_renders_and_indexes_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6257,6 +7345,32 @@ class SiteDiaryDictationTests(unittest.TestCase):
 
 
 class SiteInductionPrintPackTests(unittest.TestCase):
+    def test_build_induction_evidence_rows_labels_manual_handling_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            manual_handling_pdf = temp_root / "2026-03-16_sean_arter_manual_handling_certificate_manual-handling.pdf"
+            cscs_pdf = temp_root / "2026-03-16_sean_arter_cscs_card_cscs-front.pdf"
+            manual_handling_pdf.write_bytes(b"pdf")
+            cscs_pdf.write_bytes(b"pdf")
+
+            induction = InductionDocument(
+                doc_id="induction-1",
+                site_name="NG Lovedean Substation",
+                created_at=datetime(2026, 3, 16, 8, 0),
+                status=DocumentStatus.ACTIVE,
+                contractor_name="150",
+                individual_name="Sean Carter",
+                competency_card_paths=",".join([str(manual_handling_pdf), str(cscs_pdf)]),
+            )
+
+            evidence_rows = app_module._build_induction_evidence_rows(induction)
+
+            self.assertEqual(evidence_rows[0]["Evidence"], "CSCS Card")
+            self.assertEqual(
+                evidence_rows[1]["Evidence"],
+                "Manual Handling Certificate",
+            )
+
     def test_build_induction_print_pack_paths_groups_docx_and_preview_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
