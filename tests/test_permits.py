@@ -2798,6 +2798,20 @@ class WorkspaceFileIndexingTests(unittest.TestCase):
             self.assertIn("LADD-002", table_text)
             self.assertIn("S. Carter | Abucs", table_text)
             self.assertIn("J. Evans | Abucs", table_text)
+            register_table = next(
+                table
+                for table in rendered_document.tables
+                if table.rows
+                and table.cell(0, 0).text.strip()
+                in {"Permit Reference Number", "Ref"}
+            )
+            first_data_row = register_table.rows[1]
+            permit_ref_run = first_data_row.cells[0].paragraphs[0].runs[0]
+            issued_to_run = first_data_row.cells[3].paragraphs[0].runs[0]
+            self.assertEqual(permit_ref_run.font.name, "Arial")
+            self.assertAlmostEqual(permit_ref_run.font.size.pt, 9.0)
+            self.assertEqual(issued_to_run.font.name, "Arial")
+            self.assertAlmostEqual(issued_to_run.font.size.pt, 9.0)
 
             indexed_files = repository.list_indexed_files(
                 file_category="permit_register_docx"

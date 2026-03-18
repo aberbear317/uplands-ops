@@ -4973,6 +4973,50 @@ def _normalise_plant_register_table_rows(output_path: Path) -> None:
     document.save(output_path)
 
 
+def _normalise_permit_register_table_rows(output_path: Path) -> None:
+    """Normalize the rendered permit register rows so the body matches the template scale."""
+
+    from docx.shared import Pt
+
+    document = Document(output_path)
+    target_table = None
+    for table in document.tables:
+        if not table.rows or len(table.columns) < 7:
+            continue
+        header_values = [table.cell(0, index).text.strip() for index in range(3)]
+        if header_values in (
+            [
+                "Permit Reference Number",
+                "Date (dd/mm/yy)",
+                "Permit\nType \n(HW, RW Etc)",
+            ],
+            ["Ref", "Date", "Type"],
+        ):
+            target_table = table
+            break
+
+    if target_table is None or len(target_table.rows) <= 1:
+        document.save(output_path)
+        return
+
+    for row_index in range(1, len(target_table.rows)):
+        for column_index in range(len(target_table.columns)):
+            cell = target_table.cell(row_index, column_index)
+            for paragraph in cell.paragraphs:
+                if not paragraph.runs and paragraph.text:
+                    paragraph.add_run(paragraph.text)
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1
+                for run in paragraph.runs:
+                    run.font.name = "Arial"
+                    run.font.size = Pt(9)
+                    run.bold = False
+                    run.italic = False
+
+    document.save(output_path)
+
+
 def create_weekly_site_check_checklist_draft(
     repository: DocumentRepository,
     *,
@@ -7185,6 +7229,7 @@ def generate_rams_register_document(
             autoescape=False,
         )
         document_template.save(output_path)
+        _normalise_permit_register_table_rows(output_path)
 
     repository.index_file(
         file_name=output_path.name,
@@ -7270,6 +7315,7 @@ def generate_coshh_register_document(
             autoescape=False,
         )
         document_template.save(output_path)
+        _normalise_permit_register_table_rows(output_path)
 
     repository.index_file(
         file_name=output_path.name,
@@ -7563,6 +7609,7 @@ def generate_permit_register_document(
             autoescape=False,
         )
         document_template.save(output_path)
+        _normalise_permit_register_table_rows(output_path)
 
     repository.index_file(
         file_name=output_path.name,

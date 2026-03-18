@@ -169,6 +169,8 @@ MANDATORY_MANUAL_HANDLING_LABEL = "Manual Handling Certificate"
 OTHER_INDUCTION_EVIDENCE_OPTION = "🗂️ Other Evidence (Type Below)"
 FILE_4_NEW_WORKER_OPTION = "👷 Add New Worker (Type Below)"
 FILE_4_NEW_COMPANY_OPTION = "🏢 Add New Company (Type Below)"
+FILE_4_WORKER_MODE_KNOWN = "Select Known Worker"
+FILE_4_WORKER_MODE_MANUAL = "Add New Worker"
 INDUCTION_EVIDENCE_LABEL_ORDER = (
     "CSCS Card",
     MANDATORY_MANUAL_HANDLING_LABEL,
@@ -1325,6 +1327,8 @@ def _synchronise_public_tunnel_settings(project_setup: ProjectSetup) -> ProjectS
 def _reset_ladder_permit_form_state() -> None:
     """Reset the File 4 permit helper fields back to their default values."""
 
+    st.session_state.pop("ladder_permit_worker_selection", None)
+    st.session_state.pop("ladder_permit_worker_mode", None)
     st.session_state["ladder_permit_company_context_worker"] = ""
     st.session_state["ladder_permit_company_selection"] = ""
     st.session_state["ladder_permit_worker_company_override"] = ""
@@ -4222,73 +4226,104 @@ def _render_sidebar_tools(
                 "No workers were found from the live roster yet. You can still issue a permit by adding the operative manually below."
             )
 
-        worker_labels = [*list(worker_options), FILE_4_NEW_WORKER_OPTION]
+        worker_selection_key = "ladder_permit_worker_selection"
+        worker_labels = list(worker_options)
+        worker_mode_key = "ladder_permit_worker_mode"
+        available_worker_modes = (
+            [FILE_4_WORKER_MODE_KNOWN, FILE_4_WORKER_MODE_MANUAL]
+            if worker_labels
+            else [FILE_4_WORKER_MODE_MANUAL]
+        )
+        current_worker_mode = st.session_state.get(worker_mode_key)
+        if current_worker_mode not in available_worker_modes:
+            st.session_state[worker_mode_key] = available_worker_modes[0]
 
-        with st.form("ladder_permit_form", clear_on_submit=False):
+        st.caption(
+            "Choose a known operative from the site roster, or switch to manual entry to add someone new."
+        )
+        selected_worker_mode = st.radio(
+            "Operative Entry Mode",
+            options=available_worker_modes,
+            key=worker_mode_key,
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        if selected_worker_mode == FILE_4_WORKER_MODE_MANUAL:
+            st.info(
+                "Manual worker entry is active. Type the operative name below, then select or add the company."
+            )
+            manual_worker_name = st.text_input(
+                "New Operative Name",
+                value=st.session_state.get("ladder_permit_manual_worker_name", ""),
+                key="ladder_permit_manual_worker_name",
+                placeholder="Enter operative name",
+            )
+            selected_worker_label = FILE_4_NEW_WORKER_OPTION
+            selected_worker = None
+            selected_worker_company = ""
+            company_context_value = FILE_4_NEW_WORKER_OPTION
+            company_options = _build_file_4_company_options(
+                repository,
+                site_name=project_setup.current_site_name,
+                worker_name="",
+                default_company="",
+            )
+        else:
+            current_worker_selection = st.session_state.get(worker_selection_key)
+            if current_worker_selection not in worker_labels:
+                st.session_state[worker_selection_key] = worker_labels[0]
             selected_worker_label = st.selectbox(
                 "Operative",
                 options=worker_labels,
+                key=worker_selection_key,
             )
-            is_manual_worker = selected_worker_label == FILE_4_NEW_WORKER_OPTION
-            if is_manual_worker:
-                manual_worker_name = st.text_input(
-                    "New Operative Name",
-                    value=st.session_state.get("ladder_permit_manual_worker_name", ""),
-                    key="ladder_permit_manual_worker_name",
-                    placeholder="Enter operative name",
-                )
-                selected_worker = None
-                selected_worker_company = ""
-                company_context_value = FILE_4_NEW_WORKER_OPTION
-                company_options = _build_file_4_company_options(
-                    repository,
-                    site_name=project_setup.current_site_name,
-                    worker_name="",
-                    default_company="",
-                )
-            else:
-                selected_worker, _ = worker_options[selected_worker_label]
-                manual_worker_name = ""
-                selected_worker_company = selected_worker.company.strip()
-                company_context_value = selected_worker_label
-                company_options = _build_file_4_company_options(
-                    repository,
-                    site_name=project_setup.current_site_name,
-                    worker_name=selected_worker.worker_name,
-                    default_company=selected_worker.company,
-                )
-            company_context_key = "ladder_permit_company_context_worker"
-            company_selection_key = "ladder_permit_company_selection"
-            company_override_key = "ladder_permit_worker_company_override"
-            if st.session_state.get(company_context_key) != company_context_value:
-                st.session_state[company_selection_key] = (
-                    selected_worker_company
-                    if selected_worker_company in company_options
+            selected_worker, _ = worker_options[selected_worker_label]
+            manual_worker_name = ""
+            selected_worker_company = selected_worker.company.strip()
+            company_context_value = selected_worker_label
+            company_options = _build_file_4_company_options(
+                repository,
+                site_name=project_setup.current_site_name,
+                worker_name=selected_worker.worker_name,
+                default_company=selected_worker.company,
+            )
+
+        is_manual_worker = selected_worker_mode == FILE_4_WORKER_MODE_MANUAL
+        company_context_key = "ladder_permit_company_context_worker"
+        company_selection_key = "ladder_permit_company_selection"
+        company_override_key = "ladder_permit_worker_company_override"
+        if st.session_state.get(company_context_key) != company_context_value:
+            st.session_state[company_selection_key] = (
+                selected_worker_company
+                if selected_worker_company in company_options
+                else (
+                    FILE_4_NEW_COMPANY_OPTION
+                    if is_manual_worker and FILE_4_NEW_COMPANY_OPTION in company_options
                     else (
-                        FILE_4_NEW_COMPANY_OPTION
-                        if is_manual_worker and FILE_4_NEW_COMPANY_OPTION in company_options
-                        else (
-                            company_options[0]
-                            if company_options
-                            else FILE_4_NEW_COMPANY_OPTION
-                        )
+                        company_options[0]
+                        if company_options
+                        else FILE_4_NEW_COMPANY_OPTION
                     )
                 )
-                st.session_state[company_override_key] = ""
-                st.session_state[company_context_key] = company_context_value
-            selected_company_option = st.selectbox(
-                "Company",
-                options=company_options,
-                key=company_selection_key,
             )
-            if selected_company_option == FILE_4_NEW_COMPANY_OPTION:
-                resolved_worker_company = st.text_input(
-                    "Enter Company Name",
-                    key=company_override_key,
-                    placeholder="Enter contractor name",
-                )
-            else:
-                resolved_worker_company = selected_company_option
+            st.session_state[company_override_key] = ""
+            st.session_state[company_context_key] = company_context_value
+        selected_company_option = st.selectbox(
+            "Company",
+            options=company_options,
+            key=company_selection_key,
+        )
+        if selected_company_option == FILE_4_NEW_COMPANY_OPTION:
+            resolved_worker_company = st.text_input(
+                "Enter Company Name",
+                key=company_override_key,
+                placeholder="Enter contractor name",
+            )
+        else:
+            resolved_worker_company = selected_company_option
+
+        with st.form("ladder_permit_form", clear_on_submit=False):
             description_of_work = st.text_input(
                 "Description of Work",
                 value=st.session_state.get(
