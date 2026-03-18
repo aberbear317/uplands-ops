@@ -4458,7 +4458,72 @@ class PlantRegisterAutomationTests(unittest.TestCase):
 
             self.assertIn("150", company_options)
             self.assertIn("A. Archer Electrical", company_options)
-            self.assertEqual(company_options[-1], "🏢 Other Company (Type Below)")
+            self.assertEqual(company_options[-1], app_module.FILE_4_NEW_COMPANY_OPTION)
+
+    def test_build_file_4_manual_worker_context_returns_synthetic_worker_and_record(
+        self,
+    ) -> None:
+        worker, attendance_record = app_module._build_file_4_manual_worker_context(
+            worker_name="Jamie Stone",
+            company_name="One Fifty Enterprises",
+        )
+
+        self.assertEqual(worker.worker_name, "Jamie Stone")
+        self.assertEqual(worker.company, "One Fifty Enterprises")
+        self.assertEqual(attendance_record.workerName, "Jamie Stone")
+        self.assertEqual(attendance_record.company, "One Fifty Enterprises")
+        self.assertEqual(attendance_record.totalHours, 0.0)
+
+    def test_file_4_worker_options_include_permit_history_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "documents.sqlite3"
+            repository = DocumentRepository(database_path)
+            repository.create_schema()
+
+            repository.save(
+                LadderPermit(
+                    doc_id="LP-001",
+                    site_name="NG Lovedean Substation",
+                    created_at=datetime(2026, 3, 13, 7, 30),
+                    status=DocumentStatus.DRAFT,
+                    permit_number="UHSF21.09-001",
+                    project_name="NG Lovedean Substation",
+                    project_number="81888",
+                    location_of_work="Switch room",
+                    description_of_work="Fire alarm sensor replacement",
+                    valid_from_date=date(2026, 3, 13),
+                    valid_from_time=time(7, 30),
+                    valid_to_date=date(2026, 3, 13),
+                    valid_to_time=time(15, 30),
+                    safer_alternative_eliminated=True,
+                    task_specific_rams_prepared_and_approved=True,
+                    personnel_briefed_and_understand_task=True,
+                    competent_supervisor_appointed=True,
+                    competent_supervisor_name="Ceri Edwards",
+                    operatives_suitably_trained=True,
+                    ladder_length_suitable=True,
+                    conforms_to_bs_class_a=True,
+                    three_points_of_contact_maintained=True,
+                    harness_worn_and_secured_above_head_height=False,
+                    ladder_stabilisation_method=LadderStabilisationMethod.FOOTED,
+                    equipment_inspected_for_defects=True,
+                    ladder_stabilisation_confirmed=True,
+                    worker_name="Jamie Stone",
+                    worker_company="One Fifty Enterprises",
+                    briefing_name="Ceri Edwards",
+                    manager_name="Ceri Edwards",
+                    manager_position="Project Manager",
+                    issued_date=date(2026, 3, 13),
+                )
+            )
+
+            with patch.object(app_module, "build_site_worker_roster", return_value=[]):
+                worker_options = app_module._build_file_4_worker_options(
+                    repository,
+                    site_name="NG Lovedean Substation",
+                )
+
+            self.assertIn("Jamie Stone (One Fifty Enterprises)", worker_options)
 
     def test_daily_attendance_sign_in_and_sign_out_round_trip(self) -> None:
         class SignInDateTime(datetime):

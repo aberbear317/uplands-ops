@@ -167,6 +167,8 @@ GEOFENCE_RADIUS_METERS = 500
 SITE_GATE_CODE_SLOT_MINUTES = 30
 MANDATORY_MANUAL_HANDLING_LABEL = "Manual Handling Certificate"
 OTHER_INDUCTION_EVIDENCE_OPTION = "🗂️ Other Evidence (Type Below)"
+FILE_4_NEW_WORKER_OPTION = "👷 Add New Worker (Type Below)"
+FILE_4_NEW_COMPANY_OPTION = "🏢 Add New Company (Type Below)"
 INDUCTION_EVIDENCE_LABEL_ORDER = (
     "CSCS Card",
     MANDATORY_MANUAL_HANDLING_LABEL,
@@ -1326,6 +1328,7 @@ def _reset_ladder_permit_form_state() -> None:
     st.session_state["ladder_permit_company_context_worker"] = ""
     st.session_state["ladder_permit_company_selection"] = ""
     st.session_state["ladder_permit_worker_company_override"] = ""
+    st.session_state["ladder_permit_manual_worker_name"] = ""
     st.session_state["ladder_permit_description_of_work"] = ""
     st.session_state["ladder_permit_location_of_work"] = ""
     st.session_state["ladder_permit_supervisor_name"] = SITE_MANAGER_NAME
@@ -4214,46 +4217,71 @@ def _render_sidebar_tools(
             site_name=project_setup.current_site_name,
         )
 
-        if not roster or not worker_options:
-            st.info("No workers found in the live contractor roster.")
-            return
+        if not worker_options:
+            st.info(
+                "No workers were found from the live roster yet. You can still issue a permit by adding the operative manually below."
+            )
 
-        worker_labels = list(worker_options)
+        worker_labels = [*list(worker_options), FILE_4_NEW_WORKER_OPTION]
 
         with st.form("ladder_permit_form", clear_on_submit=False):
             selected_worker_label = st.selectbox(
                 "Operative",
                 options=worker_labels,
             )
-            selected_worker, _ = worker_options[selected_worker_label]
+            is_manual_worker = selected_worker_label == FILE_4_NEW_WORKER_OPTION
+            if is_manual_worker:
+                manual_worker_name = st.text_input(
+                    "New Operative Name",
+                    value=st.session_state.get("ladder_permit_manual_worker_name", ""),
+                    key="ladder_permit_manual_worker_name",
+                    placeholder="Enter operative name",
+                )
+                selected_worker = None
+                selected_worker_company = ""
+                company_context_value = FILE_4_NEW_WORKER_OPTION
+                company_options = _build_file_4_company_options(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    worker_name="",
+                    default_company="",
+                )
+            else:
+                selected_worker, _ = worker_options[selected_worker_label]
+                manual_worker_name = ""
+                selected_worker_company = selected_worker.company.strip()
+                company_context_value = selected_worker_label
+                company_options = _build_file_4_company_options(
+                    repository,
+                    site_name=project_setup.current_site_name,
+                    worker_name=selected_worker.worker_name,
+                    default_company=selected_worker.company,
+                )
             company_context_key = "ladder_permit_company_context_worker"
             company_selection_key = "ladder_permit_company_selection"
             company_override_key = "ladder_permit_worker_company_override"
-            company_options = _build_file_4_company_options(
-                repository,
-                site_name=project_setup.current_site_name,
-                worker_name=selected_worker.worker_name,
-                default_company=selected_worker.company,
-            )
-            selected_worker_company = selected_worker.company.strip()
-            if st.session_state.get(company_context_key) != selected_worker_label:
+            if st.session_state.get(company_context_key) != company_context_value:
                 st.session_state[company_selection_key] = (
                     selected_worker_company
                     if selected_worker_company in company_options
                     else (
-                        company_options[0]
-                        if company_options
-                        else "🏢 Other Company (Type Below)"
+                        FILE_4_NEW_COMPANY_OPTION
+                        if is_manual_worker and FILE_4_NEW_COMPANY_OPTION in company_options
+                        else (
+                            company_options[0]
+                            if company_options
+                            else FILE_4_NEW_COMPANY_OPTION
+                        )
                     )
                 )
                 st.session_state[company_override_key] = ""
-                st.session_state[company_context_key] = selected_worker_label
+                st.session_state[company_context_key] = company_context_value
             selected_company_option = st.selectbox(
                 "Company",
                 options=company_options,
                 key=company_selection_key,
             )
-            if selected_company_option == "🏢 Other Company (Type Below)":
+            if selected_company_option == FILE_4_NEW_COMPANY_OPTION:
                 resolved_worker_company = st.text_input(
                     "Enter Company Name",
                     key=company_override_key,
@@ -4367,12 +4395,18 @@ def _render_sidebar_tools(
         if not submitted:
             return
 
-        _, selected_record = worker_options[selected_worker_label]
         try:
             if not str(resolved_worker_company or "").strip():
                 raise ValidationError(
                     "Enter the correct contractor name before issuing the permit."
                 )
+            if is_manual_worker:
+                selected_worker, selected_record = _build_file_4_manual_worker_context(
+                    worker_name=manual_worker_name,
+                    company_name=resolved_worker_company,
+                )
+            else:
+                _, selected_record = worker_options[selected_worker_label]
             generated_permit = create_ladder_permit_draft(
                 repository,
                 attendance_record=selected_record,
@@ -11259,7 +11293,7 @@ def _render_file_4_station(
             title="Roster Workers",
             icon="⚡",
             value=str(len(worker_options)),
-            caption="Workers available to the permit helper from the live JSON roster.",
+            caption="Workers available to the permit helper from live data and saved permit history.",
             body_html=(
                 "<div class='data-card-subtext'>"
                 f"Issued today: <strong>{len(todays_permits)}</strong>"
@@ -11282,8 +11316,8 @@ def _render_file_4_station(
         _render_metric_card(
             title="Permit Gate",
             icon="🔐",
-            value="READY" if worker_options else "NO DATA",
-            caption="Permit helper is driven by the live contractor roster feed.",
+            value="READY" if worker_options else "MANUAL",
+            caption="Permit helper can use the live roster or a manual operative entry.",
             body_html=(
                 "<div class='data-card-subtext'>"
                 f"Roster workers: <strong>{len(roster)}</strong>"
@@ -11302,10 +11336,10 @@ def _render_file_4_station(
             _render_file_list_panel(
                 heading="Permit Control",
                 title="UHSF21.09 Helper",
-                caption="Use the File 4 quick action in the sidebar to issue a ladder permit against the live contractor roster.",
+                caption="Use the File 4 quick action in the sidebar to issue a ladder permit from live worker data or add a new operative manually when needed.",
                 items=[
-                    "Worker is selected from the live JSON-driven contractor roster.",
-                    "Company is auto-filled from the selected roster entry.",
+                    "Worker can be selected from the live roster or added manually.",
+                    "Company can be selected from known site companies or typed fresh.",
                     "The official registered template is used as the only output source.",
                 ],
                 empty_message="No permit controls are configured.",
@@ -13557,7 +13591,71 @@ def _build_file_4_worker_options(
                 f"{option_label} - {worker.last_on_site_date.strftime('%d/%m/%Y')}"
             )
         worker_options[option_label] = (worker, attendance_record)
+
+    for permit in repository.list_documents(
+        document_type=LadderPermit.document_type,
+        site_name=site_name,
+    ):
+        if not isinstance(permit, LadderPermit):
+            continue
+        worker_name = permit.worker_name.strip()
+        worker_company = permit.worker_company.strip()
+        if not worker_name or not worker_company:
+            continue
+        option_label = f"{worker_name} ({worker_company})"
+        if option_label in worker_options:
+            continue
+        reference_datetime = permit.created_at.replace(second=0, microsecond=0)
+        worker_options[option_label] = (
+            SiteWorker(
+                company=worker_company,
+                worker_name=worker_name,
+                last_on_site_date=reference_datetime.date(),
+                induction_status="Permit History",
+            ),
+            SiteAttendanceRecord(
+                date=reference_datetime.date(),
+                company=worker_company,
+                workerName=worker_name,
+                timeIn=reference_datetime.time(),
+                timeOut=reference_datetime.time(),
+                totalHours=0.0,
+            ),
+        )
     return worker_options
+
+
+def _build_file_4_manual_worker_context(
+    *,
+    worker_name: str,
+    company_name: str,
+) -> tuple[SiteWorker, SiteAttendanceRecord]:
+    """Return a synthetic worker/attendance pair for one manual File 4 permit entry."""
+
+    cleaned_worker_name = worker_name.strip()
+    cleaned_company_name = company_name.strip()
+    if not cleaned_worker_name:
+        raise ValidationError("Enter the operative name before issuing the permit.")
+    if not cleaned_company_name:
+        raise ValidationError("Enter the correct contractor name before issuing the permit.")
+
+    reference_datetime = datetime.now().replace(second=0, microsecond=0)
+    return (
+        SiteWorker(
+            company=cleaned_company_name,
+            worker_name=cleaned_worker_name,
+            last_on_site_date=reference_datetime.date(),
+            induction_status="Manual File 4 Entry",
+        ),
+        SiteAttendanceRecord(
+            date=reference_datetime.date(),
+            company=cleaned_company_name,
+            workerName=cleaned_worker_name,
+            timeIn=reference_datetime.time(),
+            timeOut=reference_datetime.time(),
+            totalHours=0.0,
+        ),
+    )
 
 
 def _build_file_4_company_options(
@@ -13616,6 +13714,17 @@ def _build_file_4_company_options(
         ):
             _remember_company(attendance_entry.contractor_name)
 
+    for permit in repository.list_documents(
+        document_type=LadderPermit.document_type,
+        site_name=site_name,
+    ):
+        if not isinstance(permit, LadderPermit):
+            continue
+        if permit.worker_company.strip():
+            _remember_company(permit.worker_company)
+        if worker_name.strip() and permit.worker_name.casefold() == worker_name.casefold():
+            _remember_company(permit.worker_company)
+
     for global_company_name in _build_induction_company_options(
         repository,
         site_name=site_name,
@@ -13633,7 +13742,7 @@ def _build_file_4_company_options(
         _remember_company(global_company_name)
 
     sorted_companies = sorted(company_names_by_key.values(), key=str.casefold)
-    return [*sorted_companies, "🏢 Other Company (Type Below)"]
+    return [*sorted_companies, FILE_4_NEW_COMPANY_OPTION]
 
 
 def _build_live_permit_register_rows(
