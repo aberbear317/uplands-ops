@@ -4488,6 +4488,75 @@ class PlantRegisterAutomationTests(unittest.TestCase):
         self.assertEqual(attendance_record.company, "One Fifty Enterprises")
         self.assertEqual(attendance_record.totalHours, 0.0)
 
+    def test_build_site_induction_readiness_snapshot_tracks_required_fields(self) -> None:
+        readiness_snapshot = app_module._build_site_induction_readiness_snapshot(
+            full_name="Jamie Stone",
+            company="One Fifty Enterprises",
+            home_address="1 Test Street",
+            contact_number="07700111222",
+            occupation="Electrician",
+            emergency_contact="Jane Stone",
+            emergency_tel="07700999888",
+            cscs_number="CSCS-123",
+            manual_handling_uploaded=True,
+            signature_ready=True,
+            asbestos_cert=False,
+            asbestos_evidence_uploaded=False,
+            erect_scaffold=False,
+            cisrs_evidence_uploaded=False,
+            first_aider=False,
+            first_aider_evidence_uploaded=False,
+            fire_warden=False,
+            fire_warden_evidence_uploaded=False,
+            supervisor=False,
+            supervisor_evidence_uploaded=False,
+            smsts=False,
+            smsts_evidence_uploaded=False,
+            operate_plant=False,
+            cpcs_evidence_uploaded=False,
+        )
+
+        self.assertTrue(readiness_snapshot["ready_to_submit"])
+        self.assertEqual(readiness_snapshot["required_complete_count"], 6)
+        self.assertEqual(readiness_snapshot["missing_required_labels"], [])
+
+    def test_build_site_induction_readiness_snapshot_flags_selected_role_evidence(
+        self,
+    ) -> None:
+        readiness_snapshot = app_module._build_site_induction_readiness_snapshot(
+            full_name="Jamie Stone",
+            company="One Fifty Enterprises",
+            home_address="1 Test Street",
+            contact_number="07700111222",
+            occupation="",
+            emergency_contact="",
+            emergency_tel="",
+            cscs_number="",
+            manual_handling_uploaded=True,
+            signature_ready=False,
+            asbestos_cert=True,
+            asbestos_evidence_uploaded=False,
+            erect_scaffold=True,
+            cisrs_evidence_uploaded=False,
+            first_aider=True,
+            first_aider_evidence_uploaded=False,
+            fire_warden=False,
+            fire_warden_evidence_uploaded=False,
+            supervisor=False,
+            supervisor_evidence_uploaded=False,
+            smsts=False,
+            smsts_evidence_uploaded=False,
+            operate_plant=True,
+            cpcs_evidence_uploaded=False,
+        )
+
+        self.assertFalse(readiness_snapshot["ready_to_submit"])
+        self.assertIn("Operative Signature", readiness_snapshot["missing_required_labels"])
+        self.assertIn("Asbestos Certificate", readiness_snapshot["missing_recommended_labels"])
+        self.assertIn("CISRS Card", readiness_snapshot["missing_recommended_labels"])
+        self.assertIn("First Aid Certificate", readiness_snapshot["missing_recommended_labels"])
+        self.assertIn("CPCS Card", readiness_snapshot["missing_recommended_labels"])
+
     def test_file_4_worker_options_include_permit_history_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "documents.sqlite3"

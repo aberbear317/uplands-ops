@@ -383,6 +383,18 @@ FILE_2_VIEW_LABELS: Dict[str, str] = {
     key: label for key, label in FILE_2_VIEW_OPTIONS
 }
 FILE_2_VIEW_KEYS: set[str] = {key for key, _ in FILE_2_VIEW_OPTIONS}
+ATTENDANCE_MANAGER_VIEW_OPTIONS: List[tuple[str, str]] = [
+    ("register", "Daily Register"),
+    ("export", "Print & Export"),
+    ("manual_induction", "Manual Induction"),
+    ("recent_inductions", "Recent Inductions"),
+]
+ATTENDANCE_MANAGER_VIEW_LABELS: Dict[str, str] = {
+    key: label for key, label in ATTENDANCE_MANAGER_VIEW_OPTIONS
+}
+ATTENDANCE_MANAGER_VIEW_KEYS: set[str] = {
+    key for key, _ in ATTENDANCE_MANAGER_VIEW_OPTIONS
+}
 WEEKLY_SITE_CHECK_MODE_LABELS: Dict[str, str] = {
     "daily": "Daily Check",
     "weekly": "End of Week / Weekly Checks",
@@ -1599,6 +1611,25 @@ def _sync_file_2_view_query_param(view_key: str) -> None:
         st.query_params["file2_view"] = view_key
     elif "file2_view" in st.query_params:
         del st.query_params["file2_view"]
+
+
+def _get_attendance_manager_view_from_query_params() -> str:
+    """Return the requested attendance manager subview from the current URL, if valid."""
+
+    raw_attendance_view = st.query_params.get("attendance_view")
+    if not raw_attendance_view:
+        return ""
+    resolved_view = str(raw_attendance_view).strip().casefold()
+    return resolved_view if resolved_view in ATTENDANCE_MANAGER_VIEW_KEYS else ""
+
+
+def _sync_attendance_manager_view_query_param(view_key: str) -> None:
+    """Persist the active attendance manager subview into the current URL."""
+
+    if view_key in ATTENDANCE_MANAGER_VIEW_KEYS:
+        st.query_params["attendance_view"] = view_key
+    elif "attendance_view" in st.query_params:
+        del st.query_params["attendance_view"]
 
 
 def _sync_manager_station_query_params(station_label: str) -> None:
@@ -10063,6 +10094,108 @@ def _render_toolbox_talk_kiosk(
                 st.rerun()
 
 
+def _canvas_image_has_signature_content(canvas_image_data: Any) -> bool:
+    """Return True when one drawable canvas contains enough non-background pixels."""
+
+    if canvas_image_data is None:
+        return False
+    non_background_pixels = 0
+    try:
+        for row in canvas_image_data:
+            for pixel in row:
+                if pixel is None:
+                    continue
+                resolved_pixel = list(pixel)
+                if len(resolved_pixel) < 3:
+                    continue
+                red, green, blue = (
+                    int(resolved_pixel[0]),
+                    int(resolved_pixel[1]),
+                    int(resolved_pixel[2]),
+                )
+                alpha = int(resolved_pixel[3]) if len(resolved_pixel) > 3 else 255
+                if alpha > 0 and (red < 245 or green < 245 or blue < 245):
+                    non_background_pixels += 1
+                    if non_background_pixels > 64:
+                        return True
+    except Exception:
+        return False
+    return False
+
+
+def _build_site_induction_readiness_snapshot(
+    *,
+    full_name: str,
+    company: str,
+    home_address: str,
+    contact_number: str,
+    occupation: str,
+    emergency_contact: str,
+    emergency_tel: str,
+    cscs_number: str,
+    manual_handling_uploaded: bool,
+    signature_ready: bool,
+    asbestos_cert: bool,
+    asbestos_evidence_uploaded: bool,
+    erect_scaffold: bool,
+    cisrs_evidence_uploaded: bool,
+    first_aider: bool,
+    first_aider_evidence_uploaded: bool,
+    fire_warden: bool,
+    fire_warden_evidence_uploaded: bool,
+    supervisor: bool,
+    supervisor_evidence_uploaded: bool,
+    smsts: bool,
+    smsts_evidence_uploaded: bool,
+    operate_plant: bool,
+    cpcs_evidence_uploaded: bool,
+) -> Dict[str, Any]:
+    """Return required and recommended induction readiness checks for one capture flow."""
+
+    required_checks = [
+        ("Full Name", bool(full_name.strip())),
+        ("Company", bool(company.strip())),
+        ("Home Address", bool(home_address.strip())),
+        ("Contact Number", bool(contact_number.strip())),
+        (MANDATORY_MANUAL_HANDLING_LABEL, bool(manual_handling_uploaded)),
+        ("Operative Signature", bool(signature_ready)),
+    ]
+    recommended_checks = [
+        ("Occupation", bool(occupation.strip())),
+        ("Emergency Contact", bool(emergency_contact.strip())),
+        ("Emergency Tel", bool(emergency_tel.strip())),
+        ("CSCS No.", bool(cscs_number.strip())),
+    ]
+    if asbestos_cert:
+        recommended_checks.append(("Asbestos Certificate", asbestos_evidence_uploaded))
+    if erect_scaffold:
+        recommended_checks.append(("CISRS Card", cisrs_evidence_uploaded))
+    if first_aider:
+        recommended_checks.append(("First Aid Certificate", first_aider_evidence_uploaded))
+    if fire_warden:
+        recommended_checks.append(("Fire Warden Certificate", fire_warden_evidence_uploaded))
+    if supervisor:
+        recommended_checks.append(("Supervisor Certificate", supervisor_evidence_uploaded))
+    if smsts:
+        recommended_checks.append(("SMSTS Certificate", smsts_evidence_uploaded))
+    if operate_plant:
+        recommended_checks.append(("CPCS Card", cpcs_evidence_uploaded))
+
+    required_missing = [label for label, ready in required_checks if not ready]
+    recommended_missing = [label for label, ready in recommended_checks if not ready]
+    return {
+        "required_checks": required_checks,
+        "recommended_checks": recommended_checks,
+        "required_complete_count": sum(1 for _, ready in required_checks if ready),
+        "recommended_complete_count": sum(1 for _, ready in recommended_checks if ready),
+        "required_total": len(required_checks),
+        "recommended_total": len(recommended_checks),
+        "missing_required_labels": required_missing,
+        "missing_recommended_labels": recommended_missing,
+        "ready_to_submit": not required_missing,
+    }
+
+
 def _render_site_induction_capture_form(
     repository: DocumentRepository,
     project_setup: ProjectSetup,
@@ -10430,6 +10563,85 @@ def _render_site_induction_capture_form(
         drawing_mode="freedraw",
         display_toolbar=False,
     )
+    readiness_snapshot = _build_site_induction_readiness_snapshot(
+        full_name=full_name,
+        company=(
+            company.strip()
+            if selected_company_option != "-- Select Company --"
+            else ""
+        ),
+        home_address=home_address,
+        contact_number=contact_number,
+        occupation=occupation,
+        emergency_contact=emergency_contact,
+        emergency_tel=emergency_tel,
+        cscs_number=cscs_number,
+        manual_handling_uploaded=manual_handling_card_upload is not None,
+        signature_ready=_canvas_image_has_signature_content(canvas_result.image_data),
+        asbestos_cert=asbestos_cert,
+        asbestos_evidence_uploaded=asbestos_card_upload is not None,
+        erect_scaffold=erect_scaffold,
+        cisrs_evidence_uploaded=cisrs_card_upload is not None,
+        first_aider=first_aider,
+        first_aider_evidence_uploaded=first_aider_upload is not None,
+        fire_warden=fire_warden,
+        fire_warden_evidence_uploaded=fire_warden_upload is not None,
+        supervisor=supervisor,
+        supervisor_evidence_uploaded=supervisor_upload is not None,
+        smsts=smsts,
+        smsts_evidence_uploaded=smsts_upload is not None,
+        operate_plant=operate_plant,
+        cpcs_evidence_uploaded=cpcs_card_upload is not None,
+    )
+    st.markdown(
+        "<div class='file-2-section-heading'>Submission Readiness</div>",
+        unsafe_allow_html=True,
+    )
+    readiness_columns = st.columns(4, gap="medium")
+    with readiness_columns[0]:
+        _render_inline_metric(
+            "Required Ready",
+            (
+                f"{readiness_snapshot['required_complete_count']}/"
+                f"{readiness_snapshot['required_total']}"
+            ),
+            icon="✅",
+        )
+    with readiness_columns[1]:
+        _render_inline_metric(
+            "Recommended Ready",
+            (
+                f"{readiness_snapshot['recommended_complete_count']}/"
+                f"{readiness_snapshot['recommended_total']}"
+            ),
+            icon="🧭",
+        )
+    with readiness_columns[2]:
+        _render_inline_metric(
+            "Evidence Files",
+            str(uploaded_evidence_count),
+            icon="📎",
+        )
+    with readiness_columns[3]:
+        _render_inline_metric(
+            "Submit Status",
+            "Ready" if readiness_snapshot["ready_to_submit"] else "Needs Info",
+            icon="🚦",
+        )
+    if readiness_snapshot["missing_required_labels"]:
+        st.warning(
+            "Still needed before submit: "
+            + ", ".join(readiness_snapshot["missing_required_labels"])
+        )
+    else:
+        st.success(
+            "Required induction items are complete. You can now submit the induction once the signature looks correct."
+        )
+    if readiness_snapshot["missing_recommended_labels"]:
+        st.caption(
+            "Recommended to complete now: "
+            + ", ".join(readiness_snapshot["missing_recommended_labels"])
+        )
 
     action_columns = (
         st.columns([0.28, 0.32, 0.40], gap="medium")
@@ -10458,7 +10670,11 @@ def _render_site_induction_capture_form(
             st.session_state.pop("site_induction_kiosk_complete_at", None)
             st.rerun()
     with action_columns[2]:
-        if st.button("✅ Submit Induction", width="stretch"):
+        if st.button(
+            "✅ Submit Induction",
+            width="stretch",
+            disabled=not readiness_snapshot["ready_to_submit"],
+        ):
             try:
                 if selected_company_option == "-- Select Company --":
                     raise ValidationError(
@@ -11178,10 +11394,39 @@ def _render_site_induction_station(
                 ),
             )
 
-        manager_tabs = st.tabs(
-            ["Daily Register", "Print & Export", "Manual Induction", "Recent Inductions"]
+        selected_attendance_manager_view = str(
+            st.session_state.get(
+                "attendance_manager_active_view",
+                _get_attendance_manager_view_from_query_params() or "register",
+            )
+        ).strip().casefold()
+        if selected_attendance_manager_view not in ATTENDANCE_MANAGER_VIEW_KEYS:
+            selected_attendance_manager_view = "register"
+        st.session_state["attendance_manager_active_view"] = (
+            selected_attendance_manager_view
         )
-        with manager_tabs[0]:
+
+        st.divider()
+        _render_workspace_zone_heading(
+            "Workspace View",
+            "Move between the live gate, print tools, manual inductions, and saved induction records without losing your place on reruns.",
+        )
+        selected_attendance_manager_view = str(
+            st.radio(
+                "Attendance Workspace View",
+                options=[view_key for view_key, _ in ATTENDANCE_MANAGER_VIEW_OPTIONS],
+                format_func=lambda view_key: ATTENDANCE_MANAGER_VIEW_LABELS.get(
+                    view_key,
+                    view_key,
+                ),
+                key="attendance_manager_active_view",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+        ).strip().casefold()
+        _sync_attendance_manager_view_query_param(selected_attendance_manager_view)
+
+        if selected_attendance_manager_view == "register":
             _render_manager_attendance_register_tab(
                 repository,
                 project_setup,
@@ -11189,9 +11434,9 @@ def _render_site_induction_station(
                 active_attendance_entries=active_attendance_entries,
                 todays_attendance_entries=todays_attendance_entries,
             )
-        with manager_tabs[1]:
+        elif selected_attendance_manager_view == "export":
             _render_manager_attendance_export_tab(repository, project_setup)
-        with manager_tabs[2]:
+        elif selected_attendance_manager_view == "manual_induction":
             _render_workspace_zone_heading(
                 "UHSF16.01 Induction Capture",
                 "Use this builder when a new operative needs their first induction before they can appear in the daily sign-in roster.",
@@ -11255,7 +11500,7 @@ def _render_site_induction_station(
                     is_kiosk=False,
                     st_canvas=st_canvas,
                 )
-        with manager_tabs[3]:
+        elif selected_attendance_manager_view == "recent_inductions":
             _render_workspace_zone_heading(
                 "Completed Inductions",
                 "Open a richer saved-record view, print the full induction pack, or correct the filed details without leaving the app.",
