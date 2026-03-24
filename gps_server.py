@@ -29,6 +29,9 @@ class _HelperPageRequestHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed_path = urlparse(self.path)
+        if parsed_path.path == "/health":
+            self._handle_health_request(send_body=True)
+            return
         if parsed_path.path == "/gps/tbt-preview":
             self._handle_toolbox_talk_preview_request(parsed_path, send_body=True)
             return
@@ -39,6 +42,9 @@ class _HelperPageRequestHandler(SimpleHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         parsed_path = urlparse(self.path)
+        if parsed_path.path == "/health":
+            self._handle_health_request(send_body=False)
+            return
         if parsed_path.path == "/gps/tbt-preview":
             self._handle_toolbox_talk_preview_request(parsed_path, send_body=False)
             return
@@ -68,6 +74,15 @@ class _HelperPageRequestHandler(SimpleHTTPRequestHandler):
         if path.endswith(".css"):
             return "text/css; charset=utf-8"
         return super().guess_type(path)
+
+    def _handle_health_request(self, *, send_body: bool) -> None:
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
 
     def _handle_toolbox_talk_document_request(
         self,
