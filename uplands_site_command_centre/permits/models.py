@@ -1986,6 +1986,7 @@ class PlantAssetDocument(BaseDocument):
     phone: str
     on_hire: date
     hired_by: str
+    off_hire: date | None = None
     serial: str = ""
     stock_code: str = ""
     inspection_type: PlantInspectionType = PlantInspectionType.OTHER
@@ -2016,6 +2017,11 @@ class PlantAssetDocument(BaseDocument):
         self.company = _require_text(self.company, "company")
         self.phone = _normalise_optional_text(self.phone, "phone")
         self.on_hire = _coerce_date(self.on_hire, "on_hire")
+        self.off_hire = (
+            _coerce_date(self.off_hire, "off_hire")
+            if self.off_hire not in (None, "")
+            else None
+        )
         self.hired_by = _require_text(self.hired_by, "hired_by")
         self.serial = _normalise_optional_text(self.serial, "serial")
         self.stock_code = _normalise_optional_text(self.stock_code, "stock_code")
@@ -2103,6 +2109,11 @@ class PlantAssetDocument(BaseDocument):
 
         payload = cls._deserialize_base_fields(data)
         payload["on_hire"] = _coerce_date(payload["on_hire"], "on_hire")
+        payload["off_hire"] = (
+            _coerce_date(payload["off_hire"], "off_hire")
+            if payload.get("off_hire") not in (None, "")
+            else None
+        )
         payload["stock_code"] = payload.get("stock_code", "")
         payload["inspection_type"] = payload.get("inspection_type", "")
         return cls(**payload)

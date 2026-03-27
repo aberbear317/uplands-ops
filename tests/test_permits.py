@@ -4,6 +4,7 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import tempfile
+from typing import List, Optional
 import unittest
 from unittest.mock import patch
 
@@ -3623,6 +3624,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
         order_ref: str = "H-3YXFCBWH",
         purchase_order: str = "81888",
         description: str = "DUST EXTRACTOR M CLASS 110V",
+        stock_code: str = "52538",
         start_date: str = "26/01/2026",
         end_date: str = "01/02/2026",
         quantity: int = 1,
@@ -3649,7 +3651,7 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                     "National Grid",
                     "Sub Station",
                     description,
-                    "52538",
+                    stock_code,
                     f"{start_date} {end_date}*4dw",
                     "£25.00",
                     str(quantity),
@@ -3658,6 +3660,86 @@ class PlantRegisterAutomationTests(unittest.TestCase):
                 ]
             ),
         )
+        document.save(pdf_path)
+        document.close()
+
+    def _build_plant_collection_pdf(
+        self,
+        pdf_path: Path,
+        *,
+        contract_ref: str = "5538-02105",
+        collection_code: str = "5538-06878",
+        description: str = "FIRE POINT WIRELESS SUBSIDIARY",
+        stock_code: str = "50767",
+        on_hire: str = "12/01/2026",
+        off_hire: str = "27/03/2026",
+        collection_date: str = "27/03/2026",
+        actual_quantity: int = 4,
+        serials: Optional[List[str]] = None,
+    ) -> None:
+        serial_values = serials or ["HOWY3155", "HOWY3331", "HOW2168", "645X9643"]
+        lines = [
+            "Proof of collection",
+            "Contract:",
+            contract_ref,
+            "Collection Code:",
+            collection_code,
+            "Customer Name:UPLANDS RETAIL LTD",
+            "Site:",
+            "NATIONAL GRID",
+            "BROADWAY LA",
+            "LOVEDEAN, WATERLOOVILLE",
+            "PO8 0SJ",
+            "On Hire:",
+            on_hire,
+            "Off Hire:",
+            off_hire,
+            "Collection:",
+            collection_date,
+            "Comm Code",
+            "Description",
+            "E/Code",
+            "O/S Qty",
+            "Advised Qty",
+            "Actual Qty",
+            "Damage Qty",
+            "Dirty Qty",
+            stock_code,
+            description,
+            "0",
+            str(actual_quantity),
+            str(actual_quantity),
+            "0",
+            "0",
+        ]
+        for serial_value in serial_values:
+            lines.extend(
+                [
+                    stock_code,
+                    description,
+                    serial_value,
+                    "0",
+                    "0",
+                    "1",
+                    "0",
+                    "0",
+                ]
+            )
+        lines.extend(
+            [
+                "Collection Slot:",
+                "08:00 to 17:30",
+                "Driver Name:",
+                "PAUL BRYANT",
+                "Vehicle Registration:",
+                "BF24YNS",
+                f"Date: {collection_date}",
+            ]
+        )
+
+        document = fitz.open()
+        page = document.new_page(width=595, height=1200)
+        page.insert_text((72, 72), "\n".join(lines), fontsize=10)
         document.save(pdf_path)
         document.close()
 
@@ -3876,6 +3958,109 @@ class PlantRegisterAutomationTests(unittest.TestCase):
             data_run = rendered.tables[0].cell(1, 0).paragraphs[0].runs[0]
             self.assertEqual(data_run.font.name, "Arial")
             self.assertEqual(data_run.font.size.pt, 10.0)
+
+    def test_file_and_index_all_archives_matching_plant_asset_from_collection_note(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir) / "Uplands_Workspace"
+            waste_destination = workspace_root / "FILE_1_Environment" / "Waste_Notes"
+            carrier_docs_destination = workspace_root / "FILE_1_Environment" / "Carrier_Docs"
+            waste_reports_destination = workspace_root / "FILE_1_Environment" / "Waste_Reports"
+            attendance_destination = workspace_root / "FILE_2_Registers" / "Attendance"
+            plant_hire_directory = workspace_root / "FILE_2_Registers" / "Plant_Hire_Register"
+            induction_directory = workspace_root / "FILE_3_Inductions"
+            inbox = workspace_root / "ingest"
+            database_path = workspace_root / "documents.sqlite3"
+
+            for directory in (
+                waste_destination,
+                carrier_docs_destination,
+                waste_reports_destination,
+                attendance_destination,
+                plant_hire_directory,
+                induction_directory,
+                inbox,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            (workspace_root / "project_setup.json").write_text(
+                json.dumps(
+                    {
+                        "current_site_name": "NG Lovedean Substation",
+                        "job_number": "81888",
+                        "site_address": "Broadway Lane",
+                        "client_name": "National Grid",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            contract_path = inbox / "Contract-H-ZSR77G3B.pdf"
+            self._build_hss_order_confirmation_pdf(
+                contract_path,
+                order_ref="H-ZSR77G3B",
+                description="FIRE POINT WIRELESS SUBSIDIARY",
+                stock_code="50767",
+                start_date="12/01/2026",
+                end_date="19/01/2026",
+                quantity=4,
+            )
+            collection_path = inbox / "5538-02105.pdf"
+            self._build_plant_collection_pdf(collection_path)
+
+            original_config = (
+                app_config.BASE_DATA_DIR,
+                app_config.INBOX,
+                app_config.WASTE_DESTINATION,
+                app_config.CARRIER_DOCS_DESTINATION,
+                app_config.WASTE_REPORTS_DESTINATION,
+                app_config.ATTENDANCE_DESTINATION,
+                app_config.PLANT_HIRE_REGISTER_DIR,
+                app_config.INDUCTION_DIR,
+                app_config.FILE_3_REVIEW_DIR,
+                app_config.DATABASE_PATH,
+            )
+
+            try:
+                app_config.BASE_DATA_DIR = workspace_root
+                app_config.INBOX = inbox
+                app_config.WASTE_DESTINATION = waste_destination
+                app_config.CARRIER_DOCS_DESTINATION = carrier_docs_destination
+                app_config.WASTE_REPORTS_DESTINATION = waste_reports_destination
+                app_config.ATTENDANCE_DESTINATION = attendance_destination
+                app_config.PLANT_HIRE_REGISTER_DIR = plant_hire_directory
+                app_config.INDUCTION_DIR = induction_directory
+                app_config.FILE_3_REVIEW_DIR = induction_directory / "Needs_Review"
+                app_config.DATABASE_PATH = database_path
+
+                repository = DocumentRepository(database_path)
+                file_and_index_all(repository)
+                plant_assets = repository.list_documents(
+                    document_type=PlantAssetDocument.document_type,
+                )
+            finally:
+                (
+                    app_config.BASE_DATA_DIR,
+                    app_config.INBOX,
+                    app_config.WASTE_DESTINATION,
+                    app_config.CARRIER_DOCS_DESTINATION,
+                    app_config.WASTE_REPORTS_DESTINATION,
+                    app_config.ATTENDANCE_DESTINATION,
+                    app_config.PLANT_HIRE_REGISTER_DIR,
+                    app_config.INDUCTION_DIR,
+                    app_config.FILE_3_REVIEW_DIR,
+                    app_config.DATABASE_PATH,
+                ) = original_config
+
+            self.assertEqual(len(plant_assets), 1)
+            plant_asset = plant_assets[0]
+            self.assertEqual(plant_asset.description, "FIRE POINT WIRELESS SUBSIDIARY (x4)")
+            self.assertEqual(plant_asset.stock_code, "50767")
+            self.assertEqual(plant_asset.status, DocumentStatus.ARCHIVED)
+            self.assertEqual(plant_asset.off_hire, date(2026, 3, 27))
+            self.assertEqual(
+                plant_asset.serial,
+                "HOWY3155, HOWY3331, HOW2168, 645X9643",
+            )
 
     def test_create_site_induction_document_renders_signature_and_logs_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

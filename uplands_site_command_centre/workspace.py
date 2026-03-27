@@ -2288,6 +2288,44 @@ def file_and_index_all(repository: DocumentRepository) -> List[FiledAsset]:
             continue
 
         if ABUCS_PDF_PATTERN.match(source_path.name):
+            source_text = _safe_extract_pdf_text(source_path)
+            if _is_plant_hire_pdf(source_path, source_text):
+                destination_path = _move_file(source_path, plant_hire_destination)
+                plant_assets = _upsert_plant_assets_from_pdf(
+                    repository,
+                    destination_path,
+                    pdf_text=source_text,
+                )
+                file_category = _classify_plant_hire_pdf(
+                    destination_path,
+                    source_text,
+                )
+                repository.index_file(
+                    file_name=destination_path.name,
+                    file_path=destination_path,
+                    file_category=file_category,
+                    file_group=FileGroup.FILE_2,
+                    site_name=(
+                        plant_assets[0].site_name
+                        if plant_assets
+                        else _load_workspace_project_setup().get("current_site_name")
+                    ),
+                    related_doc_id=plant_assets[0].doc_id if len(plant_assets) == 1 else None,
+                )
+                filed_assets.append(
+                    FiledAsset(
+                        original_path=source_path,
+                        destination_path=destination_path,
+                        file_category=file_category,
+                        related_doc_id=(
+                            plant_assets[0].doc_id
+                            if len(plant_assets) == 1
+                            else None
+                        ),
+                    )
+                )
+                continue
+
             destination_path = _move_file(source_path, waste_destination)
             waste_transfer_note = _upsert_waste_transfer_note_document(
                 repository,
@@ -4085,6 +4123,7 @@ def _is_plant_hire_pdf(source_path: Path, pdf_text: str = "") -> bool:
             lowered_name.startswith("quote-h-"),
             "order confirmation" in lowered_text,
             "proof of delivery" in lowered_text,
+            "proof of collection" in lowered_text,
             "hss proservice" in lowered_text,
             "prohire" in lowered_text,
             "the hire service company" in lowered_text,
@@ -4106,6 +4145,20 @@ def _is_hss_order_confirmation_pdf(source_path: Path, pdf_text: str) -> bool:
     )
 
 
+def _is_plant_collection_note_pdf(source_path: Path, pdf_text: str) -> bool:
+    """Return True when one PDF is a plant proof-of-collection / off-hire note."""
+
+    lowered_name = source_path.name.casefold()
+    lowered_text = pdf_text.casefold()
+    return any(
+        (
+            "proof of collection" in lowered_text,
+            "off hire:" in lowered_text and "collection:" in lowered_text,
+            lowered_name.startswith("proof-of-collection"),
+        )
+    )
+
+
 def _classify_plant_hire_pdf(source_path: Path, pdf_text: str) -> str:
     """Return a stable file-category label for one plant PDF."""
 
@@ -4115,6 +4168,8 @@ def _classify_plant_hire_pdf(source_path: Path, pdf_text: str) -> str:
         return "plant_hire_quote_pdf"
     if _is_hss_order_confirmation_pdf(source_path, pdf_text):
         return "plant_hire_order_pdf"
+    if _is_plant_collection_note_pdf(source_path, pdf_text):
+        return "plant_hire_collection_pdf"
     if "proof of delivery" in lowered_text:
         return "plant_hire_delivery_pdf"
     return "plant_hire_pdf"
@@ -4156,6 +4211,21 @@ def _clean_plant_description(description: str) -> str:
     cleaned_description = re.sub(r"\(\s*UP\s*$", "", cleaned_description, flags=re.IGNORECASE)
     cleaned_description = cleaned_description.rstrip(" -(")
     return cleaned_description
+
+
+def _plant_description_match_key(description: str) -> str:
+    """Return a stable comparison key for one plant description."""
+
+    cleaned_description = _clean_plant_description(description)
+    cleaned_description = re.sub(r"\s*\(x\d+\)\s*$", "", cleaned_description, flags=re.IGNORECASE)
+    return cleaned_description.casefold()
+
+
+def _extract_plant_description_quantity(description: str) -> int:
+    """Return the quantity suffix embedded in one plant description."""
+
+    match = re.search(r"\(x(\d+)\)\s*$", description, flags=re.IGNORECASE)
+    return int(match.group(1)) if match is not None else 1
 
 
 def _extract_hss_company_phone(pdf_text: str) -> str:
@@ -4327,6 +4397,154 @@ def _parse_hss_order_confirmation(pdf_text: str) -> Dict[str, Any]:
     }
 
 
+def _extract_collection_note_header_value(lines: List[str], label: str) -> str:
+    """Return one label value from a proof-of-collection PDF line list."""
+
+    label_prefix = f"{label.casefold()}:"
+    for index, line in enumerate(lines):
+        lowered_line = line.casefold()
+        if lowered_line == label_prefix and index + 1 < len(lines):
+            return lines[index + 1].strip()
+        if lowered_line.startswith(label_prefix):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _looks_like_plant_collection_serial(token: str) -> bool:
+    """Return True when one token looks like an item-level returned serial/reference."""
+
+    cleaned_token = token.strip().upper()
+    if not cleaned_token:
+        return False
+    if re.fullmatch(r"\d+", cleaned_token):
+        return False
+    if PHONE_PATTERN.search(cleaned_token) or EMAIL_PATTERN.search(cleaned_token):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9-]{4,}", cleaned_token)) and any(
+        character.isalpha() for character in cleaned_token
+    )
+
+
+def _parse_plant_collection_product_lines(pdf_text: str) -> List[Dict[str, Any]]:
+    """Return aggregated returned line items from one proof-of-collection PDF."""
+
+    lines = [
+        " ".join(line.split()).strip()
+        for line in pdf_text.splitlines()
+        if line and line.strip()
+    ]
+    ignored_description_lines = {
+        "comm code",
+        "description",
+        "e/code",
+        "o/s qty",
+        "advised qty",
+        "actual qty",
+        "damage qty",
+        "dirty qty",
+    }
+    stop_prefixes = (
+        "collection slot:",
+        "driver instruction:",
+        "customer name:",
+        "damage waiver option",
+        "returned equipment is subject",
+        "customer signature",
+        "job photo",
+        "gps location",
+        "gps latitude:",
+        "gps longitude:",
+        "click here for google map",
+        "driver name:",
+        "vehicle registration:",
+        "date:",
+    )
+
+    aggregated: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    index = 0
+    while index + 1 < len(lines):
+        stock_code = lines[index]
+        description = lines[index + 1]
+        description_key = description.casefold()
+        if not re.fullmatch(r"\d{4,6}", stock_code):
+            index += 1
+            continue
+        if description_key in ignored_description_lines or not re.search(r"[A-Za-z]", description):
+            index += 1
+            continue
+
+        next_index = index + 2
+        quantities: List[int] = []
+        serials: List[str] = []
+        while next_index < len(lines):
+            token = lines[next_index]
+            lowered_token = token.casefold()
+            if any(lowered_token.startswith(prefix) for prefix in stop_prefixes):
+                break
+            if (
+                re.fullmatch(r"\d{4,6}", token)
+                and next_index + 1 < len(lines)
+                and re.search(r"[A-Za-z]", lines[next_index + 1])
+                and lines[next_index + 1].casefold() not in ignored_description_lines
+            ):
+                break
+            if re.fullmatch(r"\d+", token):
+                quantities.append(int(token))
+            elif _looks_like_plant_collection_serial(token):
+                serials.append(token)
+            next_index += 1
+
+        match_key = (stock_code, _plant_description_match_key(description))
+        existing_entry = aggregated.setdefault(
+            match_key,
+            {
+                "stock_code": stock_code,
+                "description": _clean_plant_description(description),
+                "actual_quantity": 0,
+                "serials": [],
+            },
+        )
+        if len(quantities) >= 3:
+            existing_entry["actual_quantity"] = max(
+                int(existing_entry["actual_quantity"]),
+                quantities[2],
+            )
+        existing_entry["serials"].extend(serials)
+        index = next_index
+
+    product_lines: List[Dict[str, Any]] = []
+    for entry in aggregated.values():
+        unique_serials = list(dict.fromkeys(entry["serials"]))
+        actual_quantity = int(entry["actual_quantity"]) or len(unique_serials) or 1
+        product_lines.append(
+            {
+                "stock_code": str(entry["stock_code"]),
+                "description": str(entry["description"]),
+                "actual_quantity": actual_quantity,
+                "serials": unique_serials,
+            }
+        )
+    return product_lines
+
+
+def _parse_plant_collection_note(pdf_text: str) -> Dict[str, Any]:
+    """Extract collection-level metadata and returned line items from one PDF."""
+
+    lines = [
+        " ".join(line.split()).strip()
+        for line in pdf_text.splitlines()
+        if line and line.strip()
+    ]
+    return {
+        "contract_ref": _extract_collection_note_header_value(lines, "Contract"),
+        "customer_name": _extract_collection_note_header_value(lines, "Customer Name"),
+        "on_hire": _coerce_date_or_none(_extract_collection_note_header_value(lines, "On Hire")),
+        "off_hire": _coerce_date_or_none(_extract_collection_note_header_value(lines, "Off Hire")),
+        "collection_date": _coerce_date_or_none(_extract_collection_note_header_value(lines, "Collection")),
+        "product_lines": _parse_plant_collection_product_lines(pdf_text),
+    }
+
+
 def _coerce_date_or_none(value: str) -> Optional[date]:
     """Parse one date string when present, returning None on failure."""
 
@@ -4402,6 +4620,12 @@ def _upsert_plant_assets_from_pdf(
     """Create or update pending plant assets from one synced contract PDF."""
 
     resolved_pdf_text = pdf_text if pdf_text is not None else _safe_extract_pdf_text(pdf_path)
+    if _is_plant_collection_note_pdf(pdf_path, resolved_pdf_text):
+        return _apply_plant_collection_note_pdf(
+            repository,
+            pdf_path,
+            pdf_text=resolved_pdf_text,
+        )
     if not _is_hss_order_confirmation_pdf(pdf_path, resolved_pdf_text):
         return []
 
@@ -4510,6 +4734,11 @@ def _upsert_plant_assets_from_pdf(
             company=str(product_line["company"]),
             phone=str(product_line["phone"]),
             on_hire=product_line["on_hire"],
+            off_hire=(
+                existing_document.off_hire
+                if existing_document is not None
+                else None
+            ),
             hired_by=resolved_hired_by,
             serial=resolved_serial,
             stock_code=resolved_stock_code,
@@ -4528,17 +4757,160 @@ def _upsert_plant_assets_from_pdf(
     return plant_assets
 
 
+def _apply_plant_collection_note_pdf(
+    repository: DocumentRepository,
+    pdf_path: Path,
+    *,
+    pdf_text: Optional[str] = None,
+) -> List[PlantAssetDocument]:
+    """Archive matching plant assets when a proof-of-collection PDF is filed."""
+
+    resolved_pdf_text = pdf_text if pdf_text is not None else _safe_extract_pdf_text(pdf_path)
+    parsed_collection = _parse_plant_collection_note(resolved_pdf_text)
+    product_lines = list(parsed_collection.get("product_lines") or [])
+    if not product_lines:
+        return []
+
+    project_setup = _load_workspace_project_setup()
+    site_name = (
+        project_setup.get("current_site_name")
+        or _infer_default_site_name(repository)
+    )
+    active_assets = [
+        document
+        for document in repository.list_documents(
+            document_type=PlantAssetDocument.document_type,
+            site_name=site_name,
+        )
+        if isinstance(document, PlantAssetDocument)
+        and document.status != DocumentStatus.ARCHIVED
+    ]
+    archived_assets: List[PlantAssetDocument] = []
+    off_hire_date = (
+        parsed_collection.get("off_hire")
+        or parsed_collection.get("collection_date")
+    )
+
+    for product_line in product_lines:
+        product_stock_code = str(product_line.get("stock_code") or "").strip()
+        product_description_key = _plant_description_match_key(
+            str(product_line.get("description") or "")
+        )
+        quantity_to_archive = max(int(product_line.get("actual_quantity") or 0), 1)
+        returned_serials = list(dict.fromkeys(product_line.get("serials") or []))
+
+        candidate_assets = sorted(
+            (
+                asset
+                for asset in active_assets
+                if (
+                    (product_stock_code and asset.stock_code == product_stock_code)
+                    or _plant_description_match_key(asset.description) == product_description_key
+                )
+            ),
+            key=lambda asset: (
+                asset.stock_code != product_stock_code,
+                _plant_description_match_key(asset.description) != product_description_key,
+                asset.on_hire,
+                asset.hire_num,
+            ),
+        )
+        if not candidate_assets:
+            continue
+
+        exact_quantity_asset = next(
+            (
+                asset
+                for asset in candidate_assets
+                if _extract_plant_description_quantity(asset.description) == quantity_to_archive
+            ),
+            None,
+        )
+        if exact_quantity_asset is not None:
+            assets_to_archive = [exact_quantity_asset]
+        else:
+            assets_to_archive = []
+            running_quantity = 0
+            for candidate_asset in candidate_assets:
+                candidate_quantity = _extract_plant_description_quantity(candidate_asset.description)
+                if running_quantity + candidate_quantity > quantity_to_archive:
+                    if running_quantity == 0:
+                        assets_to_archive = []
+                    break
+                assets_to_archive.append(candidate_asset)
+                running_quantity += candidate_quantity
+                if running_quantity == quantity_to_archive:
+                    break
+            if running_quantity != quantity_to_archive:
+                continue
+
+        for asset_index, candidate_asset in enumerate(assets_to_archive):
+            if candidate_asset not in active_assets:
+                continue
+            updated_serial = candidate_asset.serial
+            asset_quantity = _extract_plant_description_quantity(candidate_asset.description)
+            if returned_serials:
+                if asset_quantity == len(returned_serials):
+                    updated_serial = ", ".join(returned_serials)
+                elif asset_quantity == 1 and asset_index < len(returned_serials):
+                    updated_serial = returned_serials[asset_index]
+
+            archived_asset = replace(
+                candidate_asset,
+                status=DocumentStatus.ARCHIVED,
+                serial=updated_serial,
+                off_hire=off_hire_date,
+            )
+            repository.save(archived_asset)
+            archived_assets.append(archived_asset)
+            active_assets.remove(candidate_asset)
+
+    return archived_assets
+
+
 def _sync_existing_plant_hire_pdfs(
     repository: DocumentRepository,
     plant_hire_destination: Path,
 ) -> None:
     """Backfill plant assets from already-filed plant hire PDFs."""
 
-    for pdf_path in sorted(plant_hire_destination.iterdir(), key=lambda path: path.name.lower()):
+    pdf_paths = [
+        pdf_path
+        for pdf_path in sorted(plant_hire_destination.iterdir(), key=lambda path: path.name.lower())
+        if pdf_path.is_file() and pdf_path.suffix.lower() == ".pdf"
+    ]
+
+    for pdf_path in pdf_paths:
+        pdf_text = _safe_extract_pdf_text(pdf_path)
+        if not _is_plant_hire_pdf(pdf_path, pdf_text):
+            continue
+        if _is_plant_collection_note_pdf(pdf_path, pdf_text):
+            continue
+        plant_assets = _upsert_plant_assets_from_pdf(
+            repository,
+            pdf_path,
+            pdf_text=pdf_text,
+        )
+        repository.index_file(
+            file_name=pdf_path.name,
+            file_path=pdf_path,
+            file_category=_classify_plant_hire_pdf(pdf_path, pdf_text),
+            file_group=FileGroup.FILE_2,
+            site_name=(
+                plant_assets[0].site_name
+                if plant_assets
+                else _load_workspace_project_setup().get("current_site_name")
+            ),
+            related_doc_id=plant_assets[0].doc_id if len(plant_assets) == 1 else None,
+        )
+
+    for pdf_path in pdf_paths:
         if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
             continue
         pdf_text = _safe_extract_pdf_text(pdf_path)
         if not _is_plant_hire_pdf(pdf_path, pdf_text):
+            continue
+        if not _is_plant_collection_note_pdf(pdf_path, pdf_text):
             continue
         plant_assets = _upsert_plant_assets_from_pdf(
             repository,
